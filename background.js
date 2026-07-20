@@ -671,13 +671,20 @@ async function watchPositions() {
       const pd = await getPoolData(pool);
       const feeRate = (pd && pd.ok) ? pd.feeRate1h : 0;
       const name = (pd && pd.ok) ? pd.pool.name : pool.slice(0, 8);
+      const ofi1h = (pd && pd.ok) ? pd.ofi1h : null;
+      const pc1h = (pd && pd.ok) ? pd.pc1h : null;
       for (const pos of pr.json.positions) {
         const key = pool + ':' + (pos.positionAddress || '');
         seen[key] = true;
         // rolling snapshot so a close (from ANY device) can be journaled with last-seen PnL
         if (!st.mqlLastPos) st.mqlLastPos = {};
+        const prevSnap = st.mqlLastPos[key];
+        const entryFeeRate = (prevSnap && prevSnap.entryFeeRate != null) ? prevSnap.entryFeeRate : feeRate;
+        let belowCount = (prevSnap && prevSnap.belowCount) || 0;
+        if (entryFeeRate > 2 && feeRate < 0.5 * entryFeeRate) belowCount++; else belowCount = 0;
         st.mqlLastPos[key] = { pool, name, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
-          firstSeen: (st.mqlLastPos[key] && st.mqlLastPos[key].firstSeen) || Date.now() };
+          firstSeen: (prevSnap && prevSnap.firstSeen) || Date.now(),
+          entryFeeRate, belowCount };
         const pnl = Number(pos.pnlSolPctChange);
         const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice), cur = Number(pos.poolActivePrice);
         const mid = (minP + maxP) / 2;
@@ -691,13 +698,17 @@ async function watchPositions() {
         cond.NEAR_TP = !cond.HIT_TP && pnl >= 0.8 * tp;
         cond.HIT_SL = pnl <= -sl;
         cond.NEAR_SL = !cond.HIT_SL && pnl <= -0.8 * sl;
+        cond.DECAY = belowCount >= 2;  // fee engine died: 1h rate < 50% of entry, two reads
+        cond.FLOW = ofi1h != null && ofi1h > 3 && pc1h != null && pc1h < -15;  // organic distribution
         const msgs = {
           OOR_DOWN: '🔻 OUT OF RANGE (below): ' + name + ' — price ' + cur.toExponential(3) + ' under your band. Holding 100% token, earning nothing. PnL ' + pnl.toFixed(1) + '%',
           OOR_UP: '🔺 OUT OF RANGE (above): ' + name + ' — fully converted to quote. PnL ' + pnl.toFixed(1) + '%. Consider closing to lock + stop rent.',
           HIT_TP: '🟢 TP HIT: ' + name + ' at ' + pnl.toFixed(1) + '% (target +' + tp + '%). Take it.',
           NEAR_TP: '🎯 Approaching TP: ' + name + ' at ' + pnl.toFixed(1) + '% of +' + tp + '% target.',
           HIT_SL: '🔴 SL HIT: ' + name + ' at ' + pnl.toFixed(1) + '% (stop -' + sl + '%). Cut it.',
-          NEAR_SL: '⚠️ Approaching SL: ' + name + ' at ' + pnl.toFixed(1) + '% vs -' + sl + '% stop.'
+          NEAR_SL: '⚠️ Approaching SL: ' + name + ' at ' + pnl.toFixed(1) + '% vs -' + sl + '% stop.',
+          DECAY: '📉 FEE ENGINE DYING: ' + name + ' — 1h fee rate ' + feeRate.toFixed(1) + '%/d, ~' + Math.round((1 - feeRate / entryFeeRate) * 100) + '% below your entry (' + entryFeeRate.toFixed(1) + '%/d). The fees WERE the trade — exit even if price looks fine. PnL ' + pnl.toFixed(1) + '%',
+          FLOW: '🩸 DISTRIBUTION: ' + name + ' — organic sellers ' + (ofi1h != null ? ofi1h.toFixed(1) : '?') + ':1 while price ' + (pc1h != null ? pc1h.toFixed(1) : '?') + '%/1h. Real wallets are exiting through you. Cut it. PnL ' + pnl.toFixed(1) + '%'
         };
         for (const k of Object.keys(cond)) {
           const skey = key + ':' + k;
