@@ -810,6 +810,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg.type === 'getMyPosition') {
+    (async () => {
+      try {
+        const cfg = await chrome.storage.sync.get({ walletAddress: '' });
+        if (!cfg.walletAddress || !msg.pool) { sendResponse({ ok: true, has: false }); return; }
+        const r = await fetchJson(DATAPI + '/positions/' + msg.pool + '/pnl?user=' + cfg.walletAddress.trim() + '&status=open');
+        if (!r.ok || !r.json.positions || !r.json.positions.length) { sendResponse({ ok: true, has: false }); return; }
+        const pp = r.json.positions[0];
+        const minP = Number(pp.minPrice), maxP = Number(pp.maxPrice), mid = (minP + maxP) / 2;
+        const W = mid > 0 ? ((maxP - minP) / 2 / mid) * 100 : 20;
+        sendResponse({ ok: true, has: true, pnlPct: Number(pp.pnlSolPctChange), poolActivePrice: Number(pp.poolActivePrice), widthPct: Math.round(W), count: r.json.positions.length });
+      } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+    })();
+    return true;
+  }
   if (msg.type === 'getPoolData') {
     (async () => {
       try {

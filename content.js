@@ -110,7 +110,7 @@
       if (resp && resp.ok) {
         state.data = resp;
         state.lastFetchTs = Date.now();
-        renderHUD(); renderPosWatch();
+        renderHUD(); renderPosWatch(); pollMyPosition();
         (function pwRetry(n) {
           if (n <= 0) return;
           setTimeout(safe(function () {
@@ -167,7 +167,7 @@
     } else {
       return false;
     }
-    renderHUD(); renderPosWatch();
+    renderHUD(); renderPosWatch(); pollMyPosition();
         (function pwRetry(n) {
           if (n <= 0) return;
           setTimeout(safe(function () {
@@ -279,6 +279,7 @@
   // ---- POSITION WATCH: exit intelligence when you hold a position in this pool ----
   function hasOpenPosition() {
     try {
+      if (state.apiPos && state.apiPos.has) return true;  // saved-wallet API: shows even if desktop wallet not connected
       if (!document.querySelector('[data-sentry-component="PositionItem"]')) return false;
       var noLiq = [...document.querySelectorAll("h3")].some(function (h) { return /No Liquidity Positions/i.test(h.textContent || ""); });
       return !noLiq;
@@ -321,6 +322,16 @@
       }
     }
   });
+
+  function pollMyPosition() {
+    try {
+      chrome.runtime.sendMessage({ type: "getMyPosition", pool: state.pool }, function (r) {
+        if (chrome.runtime.lastError) return;
+        state.apiPos = (r && r.ok && r.has) ? r : null;
+        renderPosWatch();
+      });
+    } catch (e) {}
+  }
 
   var renderPosWatch = safe(function renderPosWatch() {
     document.documentElement.setAttribute("data-mql-pw", "entered");
@@ -393,7 +404,7 @@
       try {
         var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
         // real position width: parse the range prices from the position row (handles 0.0\u2084426-style subscripts)
-        var Wp = 20;
+        var Wp = (state.apiPos && state.apiPos.widthPct) ? state.apiPos.widthPct : 20;
         try {
           var rowN = document.querySelector('[data-sentry-component="PositionItem"]');
           if (rowN) {
@@ -412,7 +423,7 @@
         } catch (e) {}
         var tpB = Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
         var slB = Math.round(clampN(0.75 * Wp + 2, 8, 20));
-        var pnlNow = null;
+        var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;
         var rowEl = document.querySelector('[data-sentry-component="PositionItem"]');
         if (rowEl) {
           var mPnl = (rowEl.textContent || "").match(/([+\-]\d+(?:\.\d+)?)%/g);
