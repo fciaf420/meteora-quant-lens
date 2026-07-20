@@ -610,7 +610,7 @@
       var rec = d.recommendation;
       var recWrap = el("div", "mql-rec");
       var recHead = el("div", "mql-rec-head");
-      var actCls = rec.action === "SCALP" ? "mql-rec-scalp" : rec.action === "REVERSION" ? "mql-rec-rev" : rec.action === "CARRY" ? "mql-rec-carry" : "mql-rec-wait";
+      var actCls = rec.action === "SCALP" ? "mql-rec-scalp" : rec.action === "REVERSION" ? "mql-rec-rev" : rec.action === "CARRY" ? "mql-rec-carry" : rec.action === "SQUEEZE" ? "mql-rec-squeeze" : "mql-rec-wait";
       recHead.appendChild(el("span", "mql-rec-pill " + actCls, rec.action === "WAIT" ? "⏸ WAIT" : "▶ " + rec.action));
       recWrap.appendChild(recHead);
       if (rec.headline) recWrap.appendChild(el("div", "mql-rec-headline", rec.headline));

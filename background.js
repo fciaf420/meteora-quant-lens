@@ -226,6 +226,16 @@ function buildRecommendation(s) {
       'Exit when the fee rate falls below 50% of today\'s ' + (s.feeRate1h || 0).toFixed(1) + '%/day',
       'No re-centering — carries ride'
     ];
+  } else if (s.verdict && s.verdict.class === 'SQUEEZE') {
+    const Wq = s.squeezeW || 20;
+    r.params = { strategy: 'Bid Ask', minPct: -Wq, maxPct: Wq, mode: 'two' };
+    r.action = 'SQUEEZE'; r.headline = 'Vol coiled to ' + (s.sigmaRatio ? Math.round(s.sigmaRatio*100) + '%' : '<60%') + ' of its norm \u2014 bet on range expansion, either direction.';
+    r.steps = [
+      'Two-sided BID-ASK, width \u00b1' + Wq + '% (edges loaded, center thin \u2014 pays on the breakout)',
+      'Brackets: TP +' + Math.round(Wq/3 + (s.feeRate1h||0)*0.5) + '% / SL -' + Math.round(0.7*Wq+2) + '%',
+      'Time-stop: if unresolved in ~24h, take capital back (dead coil)',
+      'This is the LONG-vol play \u2014 opposite book to Spot classes; it loses to endless chop, wins on the rip'
+    ];
   } else {
     // WAIT: find the closest class and say what would flip it
     const flips = [];
@@ -487,7 +497,39 @@ async function buildPoolData(address, settings) {
     feeRate1h, tvl, sigma, mintAuthorityDisabled, freezeAuthorityDisabled
   });
 
-  const recommendation = buildRecommendation({ verdict, edge, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl });
+  // ---- delta history + squeeze detection (data-gated) ----
+  let sigmaTrail = null, sigmaRatio = null;
+  try {
+    const hs = await chrome.storage.local.get({ mqlHistory: {} });
+    const H = hs.mqlHistory || {};
+    const arr = H[address] || [];
+    const last = arr[arr.length - 1];
+    if (!last || Date.now() - last.ts > 50e3) {
+      arr.push({ ts: Date.now(), sigma: Math.round(sigma * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100 });
+      H[address] = arr.slice(-60);
+      // prune stale pools
+      for (const k of Object.keys(H)) { const a = H[k]; if (!a.length || Date.now() - a[a.length-1].ts > 24*3600e3) delete H[k]; }
+      chrome.storage.local.set({ mqlHistory: H });
+    }
+    const prior = arr.slice(0, -1).map((x) => x.sigma).filter((x) => x > 0);
+    const spanMin = arr.length >= 2 ? (arr[arr.length-1].ts - arr[0].ts) / 60e3 : 0;
+    if (prior.length >= 6 && spanMin >= 45) {
+      const srt = [...prior].sort((a, b) => a - b);
+      sigmaTrail = srt[Math.floor(srt.length / 2)];
+      sigmaRatio = sigma / Math.max(sigmaTrail, 0.001);
+    }
+  } catch (e) {}
+  let squeezeW = null;
+  if (verdict.class === 'NONE' && sigmaRatio != null && sigmaRatio <= 0.6 && path === 'CHOP'
+      && (rangePos == null || (rangePos >= 0.35 && rangePos <= 0.65))
+      && ofi1h != null && ofi1h >= 0.5 && ofi1h <= 2 && organicScore >= 60 && ageH >= 24
+      && tvl >= 80000 && feeRate1h >= 1) {
+    squeezeW = Math.min(30, Math.max(15, Math.round(sigmaTrail / 4)));
+    verdict.class = 'SQUEEZE';
+    verdict.reasons = ['\u2713 \u03c3 compressed to ' + Math.round(sigmaRatio * 100) + '% of trailing median (' + Math.round(sigmaTrail) + ' \u2192 ' + Math.round(sigma) + ')',
+      '\u2713 CHOP mid-range, balanced organic flow', '\u2713 data-gated: ' + '6+ readings over 45+ min'];
+  }
+  const recommendation = buildRecommendation({ verdict, squeezeW, sigmaTrail, sigmaRatio, edge, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl });
 
   const data = {
     ok: true,
@@ -498,6 +540,7 @@ async function buildPoolData(address, settings) {
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
     path, ddHigh, rangePos, dayLow,
     pc1h: pc1, pc5m: pc5,
+    sigmaTrail, sigmaRatio,
     verdict,
     recommendation,
     ts: Date.now()
