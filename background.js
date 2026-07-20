@@ -674,6 +674,10 @@ async function watchPositions() {
       for (const pos of pr.json.positions) {
         const key = pool + ':' + (pos.positionAddress || '');
         seen[key] = true;
+        // rolling snapshot so a close (from ANY device) can be journaled with last-seen PnL
+        if (!st.mqlLastPos) st.mqlLastPos = {};
+        st.mqlLastPos[key] = { pool, name, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
+          firstSeen: (st.mqlLastPos[key] && st.mqlLastPos[key].firstSeen) || Date.now() };
         const pnl = Number(pos.pnlSolPctChange);
         const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice), cur = Number(pos.poolActivePrice);
         const mid = (minP + maxP) / 2;
@@ -708,9 +712,30 @@ async function watchPositions() {
       }
     } catch (e) {}
   }
+  // detect closes (any device): journal round trip + clean up
+  try {
+    const lp = st.mqlLastPos || {};
+    const closed = Object.keys(lp).filter((k) => !seen[k]);
+    if (closed.length) {
+      const jr = await chrome.storage.local.get({ mqlTradeLog: [] });
+      const logArr = jr.mqlTradeLog || [];
+      const bl = await chrome.storage.local.get({ mqlPosBaseline: {} });
+      for (const k of closed) {
+        const rec = lp[k];
+        logArr.push({ pool: rec.pool, name: rec.name, lastSeenPnlPct: rec.pnl,
+          openedFirstSeen: rec.firstSeen, closedDetected: Date.now(),
+          holdMinutes: Math.round((Date.now() - rec.firstSeen) / 60e3) });
+        delete lp[k];
+        if (bl.mqlPosBaseline && bl.mqlPosBaseline[rec.pool]) delete bl.mqlPosBaseline[rec.pool];
+        await postDiscord(cfg.webhookUrl, '**Meteora Lens** \u00b7 \ud83d\udccb Position closed: ' + rec.name + ' \u2014 last seen PnL ' + (rec.pnl >= 0 ? '+' : '') + rec.pnl.toFixed(1) + '% after ~' + Math.round((Date.now() - rec.firstSeen) / 60e3) + 'min. Journaled.');
+      }
+      await chrome.storage.local.set({ mqlTradeLog: logArr.slice(-200), mqlPosBaseline: bl.mqlPosBaseline || {} });
+    }
+    st.mqlLastPos = lp;
+  } catch (e) {}
   // prune states for positions no longer open
   for (const k of Object.keys(states)) { const base = k.split(':').slice(0, 2).join(':'); if (!seen[base]) delete states[k]; }
-  await chrome.storage.local.set({ mqlAlertStates: states });
+  await chrome.storage.local.set({ mqlAlertStates: states, mqlLastPos: st.mqlLastPos || {} });
 }
 chrome.alarms.create('mql-watch', { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') watchPositions(); });
