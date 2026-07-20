@@ -36,6 +36,13 @@
       <input type="text" id="walletAddress" placeholder="your Solana wallet (positions watched via API, no tab needed)" />
       <p class="hint">Background checks every minute while Chrome runs: out-of-range, approaching/hit TP & SL.</p>
     </div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="radarAlerts" style="width:auto" />
+        Ping Discord when a pool passes ALL gates (🔥 radar signal)
+      </label>
+      <p class="hint">Fires while Chrome is open, even with no Meteora tab. 2h cooldown per pool. Requires the webhook above.</p>
+    </div>
     <button id="testWebhook" type="button">Send test alert</button>
 
     <button id="saveBtn" type="submit">Save</button>

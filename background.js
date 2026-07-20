@@ -627,7 +627,7 @@ async function getRadar() {
       const d = await getPoolData(p.address);
       if (!d || !d.ok) continue;
       if (d.verdict && d.verdict.class !== 'NONE') {
-        items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: d.verdict.class, edge: d.edge, feeRate1h: d.feeRate1h, kind: 'FULL' });
+        items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: d.verdict.class, edge: d.edge, feeRate1h: d.feeRate1h, kind: 'FULL', rec: d.recommendation });
       } else if (d.path !== 'FREEFALL') {
         const fails = [];
         if (d.edge < 1.0) fails.push('edge ' + (Math.round(d.edge * 100) / 100));
@@ -737,8 +737,33 @@ async function watchPositions() {
   for (const k of Object.keys(states)) { const base = k.split(':').slice(0, 2).join(':'); if (!seen[base]) delete states[k]; }
   await chrome.storage.local.set({ mqlAlertStates: states, mqlLastPos: st.mqlLastPos || {} });
 }
+
+// ---- RADAR ALERTS: ping Discord when a pool passes ALL gates (a 🔥 full signal) ----
+async function radarAlertScan() {
+  const cfg = await chrome.storage.sync.get({ radarAlerts: false, webhookUrl: '' });
+  if (!cfg.radarAlerts || !cfg.webhookUrl) return;
+  let r; try { r = await getRadar(); } catch (e) { return; }
+  if (!r || !r.ok || !r.items) return;
+  const stx = await chrome.storage.local.get({ mqlRadarAlerted: {} });
+  const alerted = stx.mqlRadarAlerted || {};
+  const now = Date.now();
+  for (const it of r.items) {
+    if (it.kind !== 'FULL') continue;
+    if (alerted[it.address] && now - alerted[it.address] < 2 * 3600e3) continue; // 2h cooldown per pool
+    const rec = it.rec || {};
+    const recipe = (rec.steps && rec.steps.length) ? rec.steps.slice(0, 2).join(' · ') : (rec.headline || '');
+    const bs = it.binStep ? it.binStep + 'bps ' : '';
+    const msg = '🔥 **Meteora Lens — signal** · ' + it.name + ' ' + bs + '· ' + it.cls + ' · edge ' + (Math.round(it.edge * 100) / 100) + '\n' + recipe + '\nhttps://www.meteora.ag/dlmm/' + it.address;
+    await postDiscord(cfg.webhookUrl, msg);
+    try { chrome.notifications.create('mqlr-' + now + '-' + it.address.slice(0,4), { type: 'basic', iconUrl: 'icon128.png', title: '🔥 ' + it.cls + ' signal', message: it.name + ' · edge ' + (Math.round(it.edge * 100) / 100), priority: 2 }); } catch (e) {}
+    alerted[it.address] = now;
+  }
+  for (const k of Object.keys(alerted)) if (now - alerted[k] > 24 * 3600e3) delete alerted[k];
+  await chrome.storage.local.set({ mqlRadarAlerted: alerted });
+}
+
 chrome.alarms.create('mql-watch', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') watchPositions(); });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions(); radarAlertScan(); } });
 chrome.runtime.onInstalled.addListener(() => chrome.alarms.create('mql-watch', { periodInMinutes: 1 }));
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

@@ -12,13 +12,14 @@ function showToast(text, isError) {
 
 function load() {
   try {
-    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '' }, (items) => {
+    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '', radarAlerts: false }, (items) => {
       if (chrome.runtime.lastError) return;
       $('jupApiKey').value = (items && items.jupApiKey) ? items.jupApiKey : '';
       const w = (items && items.mqlWidthPct != null) ? items.mqlWidthPct : 20;
       $('mqlWidthPct').value = w;
       if ($('webhookUrl')) $('webhookUrl').value = items.webhookUrl || '';
       if ($('walletAddress')) $('walletAddress').value = items.walletAddress || '';
+      if ($('radarAlerts')) $('radarAlerts').checked = !!items.radarAlerts;
     });
   } catch (e) {
     showToast('Could not read settings', true);
@@ -30,10 +31,11 @@ function save(e) {
   const jupApiKey = $('jupApiKey').value.trim();
   const webhookUrl = $('webhookUrl') ? $('webhookUrl').value.trim() : '';
   const walletAddress = $('walletAddress') ? $('walletAddress').value.trim() : '';
+  const radarAlerts = $('radarAlerts') ? $('radarAlerts').checked : false;
   let mqlWidthPct = parseFloat($('mqlWidthPct').value);
   if (!isFinite(mqlWidthPct) || mqlWidthPct <= 0) mqlWidthPct = 20;
   try {
-    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress }, () => {
+    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress, radarAlerts }, () => {
       if (chrome.runtime.lastError) {
         showToast('Save failed: ' + chrome.runtime.lastError.message, true);
       } else {
