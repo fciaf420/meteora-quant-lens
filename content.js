@@ -392,7 +392,24 @@
       // live sigma-scaled brackets + distance from current PnL (parsed from the position row)
       try {
         var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
-        var Wp = 20; // display default; matches typical deploy width
+        // real position width: parse the range prices from the position row (handles 0.0\u2084426-style subscripts)
+        var Wp = 20;
+        try {
+          var rowN = document.querySelector('[data-sentry-component="PositionItem"]');
+          if (rowN) {
+            var subMap = { "\u2080":0,"\u2081":1,"\u2082":2,"\u2083":3,"\u2084":4,"\u2085":5,"\u2086":6,"\u2087":7,"\u2088":8,"\u2089":9 };
+            var decode = function (s) {
+              var m = s.match(/0\.0([\u2080-\u2089])(\d+)/);
+              if (m) return parseFloat("0." + "0".repeat(subMap[m[1]]) + m[2]);
+              var f = parseFloat(s); return isNaN(f) ? null : f;
+            };
+            var nums = (rowN.textContent || "").match(/0\.0[\u2080-\u2089]\d+|0\.\d{3,}/g);
+            if (nums && nums.length >= 2) {
+              var lo = decode(nums[0]), hi = decode(nums[1]);
+              if (lo && hi && hi > lo) { var mid = (lo + hi) / 2; Wp = Math.round(((hi - lo) / 2 / mid) * 100); }
+            }
+          }
+        } catch (e) {}
         var tpB = Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
         var slB = Math.round(clampN(0.75 * Wp + 2, 8, 20));
         var pnlNow = null;
@@ -401,7 +418,7 @@
           var mPnl = (rowEl.textContent || "").match(/([+\-]\d+(?:\.\d+)?)%/g);
           if (mPnl && mPnl.length) pnlNow = parseFloat(mPnl[mPnl.length - 1]);
         }
-        var btxt = "Brackets (\u03c3-scaled): TP +" + tpB + "% / SL -" + slB + "%";
+        var btxt = "Brackets (\u00b1" + Wp + "% band): TP +" + tpB + "% / SL -" + slB + "%";
         if (pnlNow != null && !isNaN(pnlNow)) {
           btxt += "  \u00b7  now " + (pnlNow >= 0 ? "+" : "") + pnlNow.toFixed(1) + "%  (TP " + (tpB - pnlNow).toFixed(1) + " away, SL " + (pnlNow + slB).toFixed(1) + " of cushion)";
         }
