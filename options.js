@@ -12,11 +12,13 @@ function showToast(text, isError) {
 
 function load() {
   try {
-    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20 }, (items) => {
+    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '' }, (items) => {
       if (chrome.runtime.lastError) return;
       $('jupApiKey').value = (items && items.jupApiKey) ? items.jupApiKey : '';
       const w = (items && items.mqlWidthPct != null) ? items.mqlWidthPct : 20;
       $('mqlWidthPct').value = w;
+      if ($('webhookUrl')) $('webhookUrl').value = items.webhookUrl || '';
+      if ($('walletAddress')) $('walletAddress').value = items.walletAddress || '';
     });
   } catch (e) {
     showToast('Could not read settings', true);
@@ -26,10 +28,12 @@ function load() {
 function save(e) {
   if (e) e.preventDefault();
   const jupApiKey = $('jupApiKey').value.trim();
+  const webhookUrl = $('webhookUrl') ? $('webhookUrl').value.trim() : '';
+  const walletAddress = $('walletAddress') ? $('walletAddress').value.trim() : '';
   let mqlWidthPct = parseFloat($('mqlWidthPct').value);
   if (!isFinite(mqlWidthPct) || mqlWidthPct <= 0) mqlWidthPct = 20;
   try {
-    chrome.storage.sync.set({ jupApiKey, mqlWidthPct }, () => {
+    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress }, () => {
       if (chrome.runtime.lastError) {
         showToast('Save failed: ' + chrome.runtime.lastError.message, true);
       } else {
@@ -45,4 +49,14 @@ document.addEventListener('DOMContentLoaded', () => {
   load();
   const form = $('mql-form');
   if (form) form.addEventListener('submit', save);
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+  const t = $('testWebhook');
+  if (t) t.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'testWebhook' }, (r) => {
+      t.textContent = (r && r.ok) ? '\u2713 sent — check Discord' : ('\u2717 ' + ((r && r.error) || 'failed — save the URL first'));
+      setTimeout(() => { t.textContent = 'Send test alert'; }, 4000);
+    });
+  });
 });

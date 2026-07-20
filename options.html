@@ -25,7 +25,20 @@
       </label>
 
       <div class="actions">
-        <button id="saveBtn" type="submit">Save</button>
+        
+    <div class="field">
+      <label for="webhookUrl">Discord webhook URL (remote alerts)</label>
+      <input type="password" id="webhookUrl" placeholder="https://discord.com/api/webhooks/..." />
+      <p class="hint">Channel → ⚙ Edit Channel → Integrations → Webhooks → New Webhook → Copy URL. Discord mobile app pushes these to your phone.</p>
+    </div>
+    <div class="field">
+      <label for="walletAddress">Wallet address to watch</label>
+      <input type="text" id="walletAddress" placeholder="your Solana wallet (positions watched via API, no tab needed)" />
+      <p class="hint">Background checks every minute while Chrome runs: out-of-range, approaching/hit TP & SL.</p>
+    </div>
+    <button id="testWebhook" type="button">Send test alert</button>
+
+    <button id="saveBtn" type="submit">Save</button>
         <span id="toast" class="toast" role="status" aria-live="polite"></span>
       </div>
     </form>

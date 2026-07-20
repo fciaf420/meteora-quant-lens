@@ -602,12 +602,103 @@ async function getRadar() {
   return out;
 }
 
+
+// ---- REMOTE ALERTS: wallet watcher -> Discord webhook (works without any Meteora tab open) ----
+async function postDiscord(url, content) {
+  try { await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: content.slice(0, 1900) }) }); } catch (e) {}
+}
+function clampB(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+async function watchPositions() {
+  const cfg = await chrome.storage.sync.get({ webhookUrl: '', walletAddress: '' });
+  if (!cfg.webhookUrl || !cfg.walletAddress) return;
+  const st = await chrome.storage.local.get({ mqlAlertStates: {} });
+  const states = st.mqlAlertStates || {};
+  let port;
+  try {
+    const r = await fetchJson(DATAPI + '/portfolio/open?user=' + cfg.walletAddress.trim());
+    if (!r.ok) return;
+    port = r.json;
+  } catch (e) { return; }
+  const pools = (port.pools || port.data || []).map(x => x.poolAddress || x.pool_address || x.address).filter(Boolean);
+  const seen = {};
+  for (const pool of pools.slice(0, 6)) {
+    try {
+      const pr = await fetchJson(DATAPI + '/positions/' + pool + '/pnl?user=' + cfg.walletAddress.trim() + '&status=open');
+      if (!pr.ok || !pr.json.positions) continue;
+      const pd = await getPoolData(pool);
+      const feeRate = (pd && pd.ok) ? pd.feeRate1h : 0;
+      const name = (pd && pd.ok) ? pd.pool.name : pool.slice(0, 8);
+      for (const pos of pr.json.positions) {
+        const key = pool + ':' + (pos.positionAddress || '');
+        seen[key] = true;
+        const pnl = Number(pos.pnlSolPctChange);
+        const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice), cur = Number(pos.poolActivePrice);
+        const mid = (minP + maxP) / 2;
+        const W = mid > 0 ? ((maxP - minP) / 2 / mid) * 100 : 20;
+        const tp = Math.round(clampB(W / 4 + feeRate * 0.5, 8, 25));
+        const sl = Math.round(clampB(0.75 * W + 2, 8, 20));
+        const cond = {};
+        cond.OOR_DOWN = cur < minP;
+        cond.OOR_UP = cur > maxP;
+        cond.HIT_TP = pnl >= tp;
+        cond.NEAR_TP = !cond.HIT_TP && pnl >= 0.8 * tp;
+        cond.HIT_SL = pnl <= -sl;
+        cond.NEAR_SL = !cond.HIT_SL && pnl <= -0.8 * sl;
+        const msgs = {
+          OOR_DOWN: '🔻 OUT OF RANGE (below): ' + name + ' — price ' + cur.toExponential(3) + ' under your band. Holding 100% token, earning nothing. PnL ' + pnl.toFixed(1) + '%',
+          OOR_UP: '🔺 OUT OF RANGE (above): ' + name + ' — fully converted to quote. PnL ' + pnl.toFixed(1) + '%. Consider closing to lock + stop rent.',
+          HIT_TP: '🟢 TP HIT: ' + name + ' at ' + pnl.toFixed(1) + '% (target +' + tp + '%). Take it.',
+          NEAR_TP: '🎯 Approaching TP: ' + name + ' at ' + pnl.toFixed(1) + '% of +' + tp + '% target.',
+          HIT_SL: '🔴 SL HIT: ' + name + ' at ' + pnl.toFixed(1) + '% (stop -' + sl + '%). Cut it.',
+          NEAR_SL: '⚠️ Approaching SL: ' + name + ' at ' + pnl.toFixed(1) + '% vs -' + sl + '% stop.'
+        };
+        for (const k of Object.keys(cond)) {
+          const skey = key + ':' + k;
+          if (cond[k] && !states[skey]) {
+            states[skey] = Date.now();
+            await postDiscord(cfg.webhookUrl, '**Meteora Lens** · ' + msgs[k] + '\nhttps://www.meteora.ag/dlmm/' + pool);
+            try { chrome.notifications.create('mql-' + Date.now(), { type: 'basic', iconUrl: 'icon128.png', title: 'Meteora Lens', message: msgs[k], priority: 2 }); } catch (e) {}
+          } else if (!cond[k] && states[skey]) {
+            delete states[skey]; // re-arm when condition clears
+          }
+        }
+      }
+    } catch (e) {}
+  }
+  // prune states for positions no longer open
+  for (const k of Object.keys(states)) { const base = k.split(':').slice(0, 2).join(':'); if (!seen[base]) delete states[k]; }
+  await chrome.storage.local.set({ mqlAlertStates: states });
+}
+chrome.alarms.create('mql-watch', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') watchPositions(); });
+chrome.runtime.onInstalled.addListener(() => chrome.alarms.create('mql-watch', { periodInMinutes: 1 }));
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== 'object') {
     sendResponse({ ok: false, error: 'invalid message' });
     return false;
   }
 
+  if (msg.type === 'testWebhook') {
+    (async () => {
+      const cfg = await chrome.storage.sync.get({ webhookUrl: '' });
+      if (!cfg.webhookUrl) { sendResponse({ ok: false, error: 'no webhook set' }); return; }
+      await postDiscord(cfg.webhookUrl, '**Meteora Lens** · ✅ webhook test — remote alerts are wired. You will get: out-of-range, approaching/hit TP, approaching/hit SL.');
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+  if (msg.type === 'notify') {
+    try {
+      chrome.notifications.create('mql-' + Date.now(), {
+        type: 'basic', iconUrl: 'icon128.png',
+        title: String(msg.title || 'Meteora Quant Lens'),
+        message: String(msg.message || ''), priority: 2
+      });
+    } catch (e) {}
+    sendResponse({ ok: true });
+    return false;
+  }
   if (msg.type === 'getRadar') {
     (async () => {
       try { sendResponse(await getRadar()); }
