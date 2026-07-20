@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meteora Quant Lens — Options</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="mql-opt">
+    <h1>Meteora Quant Lens</h1>
+    <p class="sub">Configure data access and defaults. Nothing here signs transactions or touches your keys.</p>
+
+    <form id="mql-form" autocomplete="off">
+      <label class="field">
+        <span class="label">Jupiter API key</span>
+        <input id="jupApiKey" type="password" placeholder="paste key" spellcheck="false" autocomplete="off">
+        <span class="hint">Free key at <strong>portal.jup.ag</strong>. Without it, token/flow/vol signals are disabled.</span>
+      </label>
+
+      <label class="field">
+        <span class="label">Default range width W (%)</span>
+        <input id="mqlWidthPct" type="number" min="0.1" step="0.1" value="20">
+        <span class="hint">Used for edge / breakeven math when the pool page width can't be read. Default 20.</span>
+      </label>
+
+      <div class="actions">
+        <button id="saveBtn" type="submit">Save</button>
+        <span id="toast" class="toast" role="status" aria-live="polite"></span>
+      </div>
+    </form>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

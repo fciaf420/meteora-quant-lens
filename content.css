@@ -1,0 +1,282 @@
+/* Meteora Quant Lens — content.css (Agent B)
+ * Dark theme matching Meteora. All selectors prefixed #mql- / .mql-.
+ * No global resets. Sane z-index (stays under app modals).
+ */
+
+/* ---- shared card shell ------------------------------------------------- */
+#mql-hud.mql-card,
+#mql-guard.mql-card {
+  box-sizing: border-box;
+  background: #16161f;
+  border: 1px solid #2a2a3a;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #d7d7e0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  z-index: 10;
+  position: relative;
+}
+
+#mql-hud *,
+#mql-guard * {
+  box-sizing: border-box;
+}
+
+/* ---- header ------------------------------------------------------------ */
+#mql-hud .mql-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #23232f;
+}
+#mql-hud .mql-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: #7c6cf0;
+}
+#mql-hud .mql-badge-dot {
+  font-size: 8px;
+  color: #7c6cf0;
+  opacity: 0.7;
+}
+
+/* ---- generic rows ------------------------------------------------------ */
+#mql-hud .mql-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 3px 0;
+}
+#mql-hud .mql-label {
+  color: #8a8a99;
+  font-size: 11px;
+}
+#mql-hud .mql-val {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+#mql-hud .mql-sub {
+  font-size: 10px;
+  color: #6b6b7a;
+  margin: 1px 0 6px;
+}
+#mql-hud .mql-sub2 {
+  font-size: 10px;
+  margin-top: 2px;
+}
+#mql-hud .mql-sub2 span {
+  font-size: 10px;
+}
+
+/* ---- verdict pill ------------------------------------------------------ */
+#mql-hud .mql-verdict-row {
+  justify-content: flex-start;
+  margin: 4px 0 8px;
+}
+#mql-hud .mql-pill {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #0e0e14;
+}
+#mql-hud .mql-v-ignition { background: #ff9838; }
+#mql-hud .mql-v-basing  { background: #3ad1e0; }
+#mql-hud .mql-v-carry   { background: #46d17f; }
+#mql-hud .mql-v-none    { background: #3a3a48; color: #b8b8c4; }
+
+/* ---- edge bar ---------------------------------------------------------- */
+#mql-hud .mql-barwrap {
+  width: 100%;
+  height: 5px;
+  background: #23232f;
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 3px 0;
+}
+#mql-hud .mql-bar {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+/* ---- 3-metric grid ----------------------------------------------------- */
+#mql-hud .mql-grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin: 6px 0;
+}
+#mql-hud .mql-cell {
+  background: #1c1c27;
+  border: 1px solid #23232f;
+  border-radius: 6px;
+  padding: 5px 6px;
+  text-align: center;
+}
+#mql-hud .mql-cell-l {
+  font-size: 10px;
+  color: #8a8a99;
+}
+#mql-hud .mql-cell-v {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- trend ------------------------------------------------------------- */
+#mql-hud .mql-trend {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ---- footer ------------------------------------------------------------ */
+#mql-hud .mql-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid #23232f;
+}
+#mql-hud .mql-age {
+  font-size: 10px;
+  color: #6b6b7a;
+}
+#mql-hud .mql-refresh {
+  background: #23232f;
+  border: 1px solid #2a2a3a;
+  color: #b8b8c4;
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+  line-height: 1.2;
+}
+#mql-hud .mql-refresh:hover {
+  background: #2a2a3a;
+  color: #fff;
+}
+
+/* ---- fee badge --------------------------------------------------------- */
+.mql-feebadge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  background: #1c1c27;
+  border: 1px solid #2a2a3a;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+/* ---- guard ------------------------------------------------------------- */
+#mql-guard .mql-guard-strip {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #1c1c27;
+  border: 1px solid #23232f;
+  margin: 2px 0;
+}
+#mql-guard .mql-guard-banner {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 6px 8px;
+  border-radius: 6px;
+  margin-bottom: 6px;
+  background: #3a2416;
+  border: 1px solid #ff9838;
+  color: #ffb063;
+}
+#mql-guard .mql-guard-info {
+  font-size: 10px;
+  color: #9a9ac0;
+  margin-top: 6px;
+  padding: 4px 8px;
+  border-left: 2px solid #7c6cf0;
+  background: #1a1a26;
+}
+
+/* ---- color helpers ----------------------------------------------------- */
+.mql-good    { color: #46d17f; }
+.mql-warn    { color: #f0c14b; }
+.mql-bad     { color: #ff5f6a; }
+.mql-neutral { color: #d7d7e0; }
+.mql-muted   { color: #8a8a99; }
+
+/* bar fills reuse color classes as background */
+#mql-hud .mql-bar.mql-good    { background: #46d17f; }
+#mql-hud .mql-bar.mql-warn    { background: #f0c14b; }
+#mql-hud .mql-bar.mql-bad     { background: #ff5f6a; }
+#mql-hud .mql-bar.mql-neutral { background: #7c6cf0; }
+
+/* ---- utility ----------------------------------------------------------- */
+.mql-hidden { display: none !important; }
+
+/* recommendation section */
+.mql-rec { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a2a3a; }
+.mql-rec-pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-weight: 700; font-size: 11px; letter-spacing: .04em; }
+.mql-rec-scalp { background: #3a2a12; color: #f0a44c; }
+.mql-rec-rev { background: #10333a; color: #4cd7f0; }
+.mql-rec-carry { background: #143222; color: #4cf09a; }
+.mql-rec-wait { background: #26262f; color: #9a9aa8; }
+.mql-rec-headline { margin: 6px 0 4px; color: #c9c9d6; font-size: 11.5px; line-height: 1.35; }
+.mql-rec-step { color: #a8a8ba; font-size: 11px; line-height: 1.45; margin-left: 2px; }
+.mql-rec-warn { margin-top: 5px; color: #f0764c; font-size: 11px; line-height: 1.4; }
+
+.mql-apply { margin-top: 7px; width: 100%; padding: 6px 10px; border: 1px solid #7c6cf0; background: #221f3a; color: #b7aefc; border-radius: 6px; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.mql-apply:hover { background: #2b2750; }
+.mql-apply.mql-applied { border-color: #4cf09a; color: #4cf09a; background: #143222; cursor: default; }
+
+/* hover explainer tooltips */
+#mql-tooltip { display: none; position: fixed; z-index: 2147483000; max-width: 290px; background: #1c1c28; border: 1px solid #7c6cf0; border-radius: 8px; padding: 9px 11px; color: #d6d6e4; font-size: 11.5px; line-height: 1.5; box-shadow: 0 6px 24px rgba(0,0,0,.5); pointer-events: none; }
+.mql-tippable { cursor: help; border-bottom: 1px dotted #5a5a72; }
+
+.mql-override { border-color: #f0764c; color: #f0a44c; background: #2c1e14; }
+.mql-override:hover { background: #3a2718; }
+
+/* position watch */
+#mql-poswatch { margin-top: 6px; }
+.mql-pw-head { display: flex; align-items: center; justify-content: space-between; }
+.mql-pw-title { font-size: 10px; letter-spacing: .12em; color: #8a8a9a; font-weight: 700; }
+.mql-pw-pill { padding: 2px 9px; border-radius: 10px; font-weight: 700; font-size: 11px; }
+.mql-pw-hold { background: #143222; color: #4cf09a; }
+.mql-pw-warn { background: #3a2a12; color: #f0a44c; }
+.mql-pw-exit { background: #3a1414; color: #f05c5c; animation: mql-pulse 1.6s infinite; }
+@keyframes mql-pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+.mql-pw-reason { color: #c9c9d6; font-size: 11px; line-height: 1.45; margin-top: 4px; }
+.mql-pw-sub { color: #6e6e80; font-size: 10px; margin-top: 5px; }
+
+/* radar banner */
+#mql-radar { position: fixed; bottom: 14px; right: 14px; left: auto; z-index: 999999; display: flex; align-items: center; gap: 7px; max-width: 55vw; overflow-x: auto; scrollbar-width: none; background: rgba(16,16,24,.96); border: 1px solid #2a2a3a; border-radius: 20px; padding: 5px 12px; box-shadow: 0 4px 18px rgba(0,0,0,.45); font-size: 11px; }
+#mql-radar.mql-radar-min { padding: 4px 10px; }
+.mql-radar-title { font-weight: 800; letter-spacing: .08em; color: #7c6cf0; font-size: 10px; white-space: nowrap; }
+.mql-radar-empty { color: #6e6e80; white-space: nowrap; }
+.mql-radar-ts { color: #55556a; font-size: 9px; }
+.mql-chip { border: 1px solid #2a2a3a; border-radius: 14px; padding: 3px 10px; background: #1c1c28; color: #c9c9d6; font-size: 10.5px; cursor: pointer; white-space: nowrap; font-weight: 600; }
+.mql-chip:hover { border-color: #7c6cf0; }
+.mql-chip-full { border-color: #4cf09a55; }
+.mql-chip-ignition { color: #f0a44c; }
+.mql-chip-basing { color: #4cd7f0; }
+.mql-chip-carry { color: #4cf09a; }
+.mql-chip-near { color: #f0a44c; border-color: #f0764c44; }
+
+.mql-pw-do { margin-top: 6px; color: #e8e8f4; font-size: 11px; font-weight: 700; }
+.mql-pw-assist { margin-top: 6px; }
+.mql-target-pulse { outline: 3px solid #7c6cf0 !important; outline-offset: 3px; border-radius: 8px; animation: mql-pulse 0.8s 4; }
+
+.mql-pw-brackets { margin-top: 5px; color: #b7aefc; font-size: 10.5px; font-weight: 600; }
