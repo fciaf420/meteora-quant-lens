@@ -374,7 +374,7 @@
         verdict = "EXIT"; cls = "mql-pw-exit";
         reasons.push("price in FREEFALL — your bins are converting into the falling token");
       }
-      if (verdict === "HOLD" && d.surge != null && d.surge < 1.05 && d.ofi1h != null && d.ofi1h > 2.5) {
+      if (verdict === "HOLD" && Wp < 30 && d.surge != null && d.surge < 1.05 && d.ofi1h != null && d.ofi1h > 2.5) {
         verdict = "TIGHTEN"; cls = "mql-pw-warn";
         reasons.push("vol premium dead (surge " + fmtNum(d.surge,2) + "x) + sell-skewed flow — consider taking fees off");
       }
@@ -423,12 +423,7 @@
         } catch (e) {}
         var tpB = Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
         var slB = Math.round(clampN(0.75 * Wp + 2, 8, 20));
-        var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;
-        var rowEl = document.querySelector('[data-sentry-component="PositionItem"]');
-        if (rowEl) {
-          var mPnl = (rowEl.textContent || "").match(/([+\-]\d+(?:\.\d+)?)%/g);
-          if (mPnl && mPnl.length) pnlNow = parseFloat(mPnl[mPnl.length - 1]);
-        }
+        var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;  // API only — DOM rows contain unrelated %s
         var btxt = "Brackets (\u00b1" + Wp + "% band): TP +" + tpB + "% / SL -" + slB + "%";
         if (pnlNow != null && !isNaN(pnlNow)) {
           btxt += "  \u00b7  now " + (pnlNow >= 0 ? "+" : "") + pnlNow.toFixed(1) + "%  (TP " + (tpB - pnlNow).toFixed(1) + " away, SL " + (pnlNow + slB).toFixed(1) + " of cushion)";
