@@ -359,6 +359,25 @@
         st.mqlPosBaseline[state.pool] = base;
         chrome.storage.local.set({ mqlPosBaseline: st.mqlPosBaseline });
       }
+      // real position width: parse the range prices from the position row (handles 0.0\u2084426-style subscripts)
+      var Wp = (state.apiPos && state.apiPos.widthPct) ? state.apiPos.widthPct : 20;
+      try {
+        var rowN = document.querySelector('[data-sentry-component="PositionItem"]');
+        if (rowN) {
+          var subMap = { "\u2080":0,"\u2081":1,"\u2082":2,"\u2083":3,"\u2084":4,"\u2085":5,"\u2086":6,"\u2087":7,"\u2088":8,"\u2089":9 };
+          var decode = function (s) {
+            var m = s.match(/0\.0([\u2080-\u2089])(\d+)/);
+            if (m) return parseFloat("0." + "0".repeat(subMap[m[1]]) + m[2]);
+            var f = parseFloat(s); return isNaN(f) ? null : f;
+          };
+          var nums = (rowN.textContent || "").match(/0\.0[\u2080-\u2089]\d+|0\.\d{3,}/g);
+          if (nums && nums.length >= 2) {
+            var lo = decode(nums[0]), hi = decode(nums[1]);
+            if (lo && hi && hi > lo) { var mid = (lo + hi) / 2; Wp = Math.round(((hi - lo) / 2 / mid) * 100); }
+          }
+        }
+      } catch (e) {}
+
       var decayPct = base.entryFeeRate > 0 ? (1 - d.feeRate1h / base.entryFeeRate) * 100 : 0;
       // exit rules (same as the bot manager)
       var verdict = "HOLD", cls = "mql-pw-hold", reasons = [];
@@ -403,24 +422,6 @@
       // live sigma-scaled brackets + distance from current PnL (parsed from the position row)
       try {
         var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
-        // real position width: parse the range prices from the position row (handles 0.0\u2084426-style subscripts)
-        var Wp = (state.apiPos && state.apiPos.widthPct) ? state.apiPos.widthPct : 20;
-        try {
-          var rowN = document.querySelector('[data-sentry-component="PositionItem"]');
-          if (rowN) {
-            var subMap = { "\u2080":0,"\u2081":1,"\u2082":2,"\u2083":3,"\u2084":4,"\u2085":5,"\u2086":6,"\u2087":7,"\u2088":8,"\u2089":9 };
-            var decode = function (s) {
-              var m = s.match(/0\.0([\u2080-\u2089])(\d+)/);
-              if (m) return parseFloat("0." + "0".repeat(subMap[m[1]]) + m[2]);
-              var f = parseFloat(s); return isNaN(f) ? null : f;
-            };
-            var nums = (rowN.textContent || "").match(/0\.0[\u2080-\u2089]\d+|0\.\d{3,}/g);
-            if (nums && nums.length >= 2) {
-              var lo = decode(nums[0]), hi = decode(nums[1]);
-              if (lo && hi && hi > lo) { var mid = (lo + hi) / 2; Wp = Math.round(((hi - lo) / 2 / mid) * 100); }
-            }
-          }
-        } catch (e) {}
         var tpB = Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
         var slB = Math.round(clampN(0.75 * Wp + 2, 8, 20));
         var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;  // API only — DOM rows contain unrelated %s
