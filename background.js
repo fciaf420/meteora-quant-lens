@@ -502,11 +502,12 @@ async function buildPoolData(address, settings) {
   try {
     const hs = await chrome.storage.local.get({ mqlHistory: {} });
     const H = hs.mqlHistory || {};
-    const arr = H[address] || [];
+    const histKey = (typeof tokenAddr === 'string' && tokenAddr) ? tokenAddr : address;  // sigma is TOKEN-level: key by mint so all pool variants share one vol baseline
+    const arr = H[histKey] || [];
     const last = arr[arr.length - 1];
     if (!last || Date.now() - last.ts > 50e3) {
       arr.push({ ts: Date.now(), sigma: Math.round(sigma * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100 });
-      H[address] = arr.slice(-60);
+      H[histKey] = arr.slice(-60);
       // prune stale pools
       for (const k of Object.keys(H)) { const a = H[k]; if (!a.length || Date.now() - a[a.length-1].ts > 24*3600e3) delete H[k]; }
       chrome.storage.local.set({ mqlHistory: H });
