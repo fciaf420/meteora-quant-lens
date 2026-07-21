@@ -498,7 +498,7 @@ async function buildPoolData(address, settings) {
   });
 
   // ---- delta history + squeeze detection (data-gated) ----
-  let sigmaTrail = null, sigmaRatio = null;
+  let sigmaTrail = null, sigmaRatio = null, sigmaRatioPersisted = false;
   try {
     const hs = await chrome.storage.local.get({ mqlHistory: {} });
     const H = hs.mqlHistory || {};
@@ -516,11 +516,19 @@ async function buildPoolData(address, settings) {
     if (prior.length >= 6 && spanMin >= 45) {
       const srt = [...prior].sort((a, b) => a - b);
       sigmaTrail = srt[Math.floor(srt.length / 2)];
-      sigmaRatio = sigma / Math.max(sigmaTrail, 0.001);
+      // SMOOTHED current sigma: median of last 3 readings (kills single-blip flapping on calm coins)
+      const recent = arr.slice(-3).map((x) => x.sigma).sort((a, b) => a - b);
+      const sigmaNow = recent[Math.floor(recent.length / 2)];
+      sigmaRatio = sigmaNow / Math.max(sigmaTrail, 0.001);
+      // persistence: store ratio on the latest entry; squeeze needs 2 consecutive compressed evaluations
+      arr[arr.length - 1].ratio = Math.round(sigmaRatio * 100) / 100;
+      const prevRatio = arr.length >= 2 ? arr[arr.length - 2].ratio : null;
+      sigmaRatioPersisted = (sigmaRatio <= 0.6 && prevRatio != null && prevRatio <= 0.6);
+      chrome.storage.local.set({ mqlHistory: (typeof H !== 'undefined' ? H : undefined) || undefined });
     }
   } catch (e) {}
   let squeezeW = null;
-  if (verdict.class === 'NONE' && sigmaRatio != null && sigmaRatio <= 0.6 && path === 'CHOP'
+  if (verdict.class === 'NONE' && sigmaRatioPersisted && path === 'CHOP'
       && (rangePos == null || (rangePos >= 0.35 && rangePos <= 0.65))
       && ofi1h != null && ofi1h >= 0.5 && ofi1h <= 2 && organicScore >= 60 && ageH >= 24
       && tvl >= 80000 && feeRate1h >= 1) {
