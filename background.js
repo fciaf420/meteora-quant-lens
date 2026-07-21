@@ -502,7 +502,7 @@ async function buildPoolData(address, settings) {
   try {
     const hs = await chrome.storage.local.get({ mqlHistory: {} });
     const H = hs.mqlHistory || {};
-    const histKey = (typeof tokenAddr === 'string' && tokenAddr) ? tokenAddr : address;  // sigma is TOKEN-level: key by mint so all pool variants share one vol baseline
+    const histKey = pick(p, 'token_x.address', 'tokenX.address', 'mint_x', 'mintX', 'token_x_mint') || address;  // sigma is TOKEN-level: key by mint so all pool variants share one vol baseline
     const arr = H[histKey] || [];
     const last = arr[arr.length - 1];
     if (!last || Date.now() - last.ts > 50e3) {
