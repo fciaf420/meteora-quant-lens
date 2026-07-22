@@ -417,7 +417,7 @@ async function buildPoolData(address, settings) {
 
   // --- Jupiter (optional; graceful degradation) ---
   const jupNullPayload = {
-    sigma: null, edge: null, ofi1h: null, ofi6h: null, organicScore: null,
+    sigma: null, edge: null, ofi1h: null, ofi6h: null, organicScore: null, orgBuy1h: null,
     tokenAgeHours: null, mintAuthorityDisabled: null, freezeAuthorityDisabled: null,
     topHoldersPct: null, path: null,
     verdict: { class: 'NONE', reasons: ['no Jupiter key (set in options)'] }
@@ -545,6 +545,7 @@ async function buildPoolData(address, settings) {
     pool: { name, address, tvl, binStep, baseFeePct, currentPrice },
     feeRate1h, feeRate24h, trend, surge, accel,
     sigma, edge, ofi1h, ofi6h, organicScore,
+    orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
     tokenAgeHours: ageH,
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
     path, ddHigh, rangePos, dayLow,
@@ -660,6 +661,86 @@ async function postDiscord(url, content) {
   try { await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: content.slice(0, 1900) }) }); } catch (e) {}
 }
 function clampB(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+// ---- position summarization (ACCUM/COMBO-aware) ---------------------------
+// Fill fraction of a below-price accumulation position = token-side share of
+// position value. Prefers explicit value fields from the pnl API; falls back to
+// amount*price if scales look sane; last resort = linear price-traversal
+// estimate (honest approximation, labeled as such downstream). Never fakes math.
+function positionFill(pos, cur) {
+  try {
+    const xVal = num(pick(pos, 'currentXValue', 'current_x_value', 'xValueUsd', 'totalXValueUsd', 'currentTokenXValue'), NaN);
+    const yVal = num(pick(pos, 'currentYValue', 'current_y_value', 'yValueUsd', 'totalYValueUsd', 'currentTokenYValue'), NaN);
+    if (isFinite(xVal) && isFinite(yVal) && (xVal + yVal) > 0) {
+      const f = xVal / (xVal + yVal);
+      if (f >= 0 && f <= 1) return { fill: f, method: 'value' };
+    }
+    const xAmt = num(pick(pos, 'totalXAmount', 'total_x_amount', 'xAmount', 'amountX'), NaN);
+    const yAmt = num(pick(pos, 'totalYAmount', 'total_y_amount', 'yAmount', 'amountY'), NaN);
+    if (isFinite(xAmt) && isFinite(yAmt) && isFinite(cur) && cur > 0) {
+      const xv = xAmt * cur, tot = xv + yAmt;
+      if (tot > 0) {
+        const f = xv / tot;
+        if (f >= 0 && f <= 1) return { fill: f, method: 'amount' };
+      }
+    }
+    const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice);
+    if (isFinite(minP) && isFinite(maxP) && maxP > minP && isFinite(cur)) {
+      const f = Math.min(1, Math.max(0, (maxP - cur) / (maxP - minP)));
+      return { fill: f, method: 'traversal' };
+    }
+  } catch (e) {}
+  return { fill: null, method: null };
+}
+
+function summarizePositions(ps) {
+  const legs = [];
+  let cur = NaN;
+  for (const pp of ps) {
+    const minP = Number(pp.minPrice), maxP = Number(pp.maxPrice), mid = (minP + maxP) / 2;
+    const c = Number(pp.poolActivePrice);
+    if (isFinite(c)) cur = c;
+    const W = mid > 0 ? ((maxP - minP) / 2 / mid) * 100 : 20;
+    legs.push({
+      sig: String(pp.positionAddress || pp.position_address || ''),
+      pnlPct: Number(pp.pnlSolPctChange),
+      minPrice: minP, maxPrice: maxP,
+      widthPct: Math.round(W)
+    });
+  }
+  const minAll = Math.min(...legs.map((l) => l.minPrice));
+  const maxAll = Math.max(...legs.map((l) => l.maxPrice));
+  const midAll = (minAll + maxAll) / 2;
+  const wAll = midAll > 0 ? Math.round(((maxAll - minAll) / 2 / midAll) * 100) : 20;
+  // aggregate PnL: value-weighted when the API exposes position value, else simple mean
+  let wsum = 0, vsum = 0, weighted = true;
+  for (let i = 0; i < ps.length; i++) {
+    const tv = num(pick(ps[i], 'totalValue', 'total_value', 'currentValue', 'current_value', 'positionValue', 'totalCurrentValue'), NaN);
+    if (!isFinite(tv) || tv <= 0) { weighted = false; break; }
+    wsum += legs[i].pnlPct * tv; vsum += tv;
+  }
+  const aggPnl = (weighted && vsum > 0) ? (wsum / vsum)
+    : legs.reduce((s, l) => s + (isFinite(l.pnlPct) ? l.pnlPct : 0), 0) / Math.max(legs.length, 1);
+  // accumulation profile: whole book sits at/below price, or price already fell through
+  const accum = isFinite(cur) && (maxAll <= cur * 1.05 || cur < minAll);
+  let fillSum = 0, fillN = 0, fillMethod = null;
+  for (let i = 0; i < ps.length; i++) {
+    const f = positionFill(ps[i], cur);
+    if (f.fill != null) { fillSum += f.fill; fillN++; if (!fillMethod) fillMethod = f.method; legs[i].fillPct = Math.round(f.fill * 100); }
+  }
+  const fillPct = fillN ? Math.round((fillSum / fillN) * 100) : null;
+  return {
+    ok: true, has: true,
+    count: legs.length,
+    pnlPct: Math.round(aggPnl * 10) / 10,   // backward compat (aggregate)
+    widthPct: wAll,                          // backward compat (combined range)
+    poolActivePrice: cur,
+    combo: legs.length > 1,
+    accum, fillPct, fillMethod,
+    minPrice: minAll, maxPrice: maxAll,
+    legs
+  };
+}
 async function watchPositions() {
   const cfg = await chrome.storage.sync.get({ webhookUrl: '', walletAddress: '' });
   if (!cfg.webhookUrl || !cfg.walletAddress) return;
@@ -682,6 +763,7 @@ async function watchPositions() {
       const name = (pd && pd.ok) ? pd.pool.name : pool.slice(0, 8);
       const ofi1h = (pd && pd.ok) ? pd.ofi1h : null;
       const pc1h = (pd && pd.ok) ? pd.pc1h : null;
+      const poolFill = { sum: 0, n: 0 };   // aggregate fill across accumulation legs (COMBO-aware)
       for (const pos of pr.json.positions) {
         const key = pool + ':' + (pos.positionAddress || '');
         seen[key] = true;
@@ -719,6 +801,23 @@ async function watchPositions() {
           DECAY: '📉 FEE ENGINE DYING: ' + name + ' — 1h fee rate ' + feeRate.toFixed(1) + '%/d, ~' + Math.round((1 - feeRate / entryFeeRate) * 100) + '% below your entry (' + entryFeeRate.toFixed(1) + '%/d). The fees WERE the trade — exit even if price looks fine. PnL ' + pnl.toFixed(1) + '%',
           FLOW: '🩸 DISTRIBUTION: ' + name + ' — organic sellers ' + (ofi1h != null ? ofi1h.toFixed(1) : '?') + ':1 while price ' + (pc1h != null ? pc1h.toFixed(1) : '?') + '%/1h. Real wallets are exiting through you. Cut it. PnL ' + pnl.toFixed(1) + '%'
         };
+        // ---- ACCUMULATION profile: own rulebook (priors pending calibration) ----
+        // detected once at first sight (band at/below price) and persisted; scalp
+        // TP/SL alerts don't apply to a bag-building band.
+        const isAccum = (prevSnap && typeof prevSnap.accum === 'boolean')
+          ? prevSnap.accum
+          : (isFinite(maxP) && isFinite(cur) && (maxP <= cur * 1.05 || cur < minP));
+        st.mqlLastPos[key].accum = isAccum;
+        if (isAccum) {
+          delete cond.HIT_TP; delete cond.NEAR_TP; delete cond.HIT_SL; delete cond.NEAR_SL;
+          cond.FULLY_FILLED = cond.OOR_DOWN; delete cond.OOR_DOWN;
+          msgs.FULLY_FILLED = '🪣 FULLY FILLED: ' + name + ' — price fell through the whole accumulation band. You are 100% token now. Decide: hold the bag you built, or cut. PnL ' + pnl.toFixed(1) + '%';
+          msgs.OOR_UP = '🟢 POPPED ABOVE BAND: ' + name + ' — price rose above your accumulation range: 100% SOL with fees banked. Re-arm lower if you still want the bag. PnL ' + pnl.toFixed(1) + '%';
+          msgs.DECAY = '📉 DYING WHILE YOU ACCUMULATE: ' + name + ' — 1h fee rate ' + feeRate.toFixed(1) + '%/d, ~' + Math.round((1 - feeRate / entryFeeRate) * 100) + '% below entry. Volume is leaving the token you are buying — the one alert that matters on an accumulation. PnL ' + pnl.toFixed(1) + '%';
+          msgs.FLOW = '🩸 DISTRIBUTION INTO YOUR BAND: ' + name + ' — organic sellers ' + (ofi1h != null ? ofi1h.toFixed(1) : '?') + ':1 while price ' + (pc1h != null ? pc1h.toFixed(1) : '?') + '%/1h. You are the exit liquidity for the token you are accumulating. PnL ' + pnl.toFixed(1) + '%';
+          const pf = positionFill(pos, cur);
+          if (pf.fill != null) { poolFill.sum += pf.fill; poolFill.n++; }
+        }
         for (const k of Object.keys(cond)) {
           const skey = key + ':' + k;
           if (cond[k] && !states[skey]) {
@@ -728,6 +827,18 @@ async function watchPositions() {
           } else if (!cond[k] && states[skey]) {
             delete states[skey]; // re-arm when condition clears
           }
+        }
+      }
+      // pool-level fill crossings for accumulation books (averaged across combo legs)
+      if (poolFill.n) {
+        const fp = (poolFill.sum / poolFill.n) * 100;
+        for (const th of [25, 50, 75]) {
+          const fkey = pool + ':FILL_' + th;
+          seen[fkey] = true; // protect from state pruning below
+          if (fp >= th && !states[fkey]) {
+            states[fkey] = Date.now();
+            await postDiscord(cfg.webhookUrl, '**Meteora Lens** · 🪣 ACCUMULATING: ' + name + ' — band ' + Math.round(fp) + '% filled (crossed ' + th + '%). SOL is converting to token as designed.\nhttps://www.meteora.ag/dlmm/' + pool);
+          } else if (fp < th && states[fkey]) { delete states[fkey]; }
         }
       }
     } catch (e) {}
@@ -826,10 +937,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (!cfg.walletAddress || !msg.pool) { sendResponse({ ok: true, has: false }); return; }
         const r = await fetchJson(DATAPI + '/positions/' + msg.pool + '/pnl?user=' + cfg.walletAddress.trim() + '&status=open');
         if (!r.ok || !r.json.positions || !r.json.positions.length) { sendResponse({ ok: true, has: false }); return; }
-        const pp = r.json.positions[0];
-        const minP = Number(pp.minPrice), maxP = Number(pp.maxPrice), mid = (minP + maxP) / 2;
-        const W = mid > 0 ? ((maxP - minP) / 2 / mid) * 100 : 20;
-        sendResponse({ ok: true, has: true, pnlPct: Number(pp.pnlSolPctChange), poolActivePrice: Number(pp.poolActivePrice), widthPct: Math.round(W), count: r.json.positions.length });
+        sendResponse(summarizePositions(r.json.positions));
       } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
     })();
     return true;

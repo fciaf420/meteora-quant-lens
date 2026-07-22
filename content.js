@@ -230,6 +230,274 @@
   });
 
 
+  // ========================================================================
+  // ACCUM COMBO — deep single-sided SOL accumulation band, two legs in one
+  // range: Bid-Ask base (~70%, bottom-weighted) + Spot layer (~30%, uniform).
+  // ALL thresholds below are structured priors pending calibration (PLAYBOOK).
+  // ========================================================================
+  var comboUI = { open: false, total: 1.0 };
+
+  function accumComboCheck(d) {
+    if (!d || !d.ok) return null;
+    // hard gates — directional bag risk: safety outranks the edge math
+    var gates = {
+      auth: !!(d.mintAuthorityDisabled && d.freezeAuthorityDisabled),            // non-negotiable
+      top10: d.topHoldersPct != null && d.topHoldersPct <= 35,
+      flow: d.orgBuy1h != null && d.orgBuy1h > 0,                               // organic buyers exist
+      vol: d.feeRate1h >= 0.5 * d.feeRate24h && d.feeRate24h >= 8,              // volume persistence
+      // dying-knife block. NOTE: OFI here = organic sells/buys (Jupiter), so a
+      // freefall NOBODY is buying = OFI high. (Spec said "OFI<0.7" assuming
+      // buy/sell; implemented as sells/buys >= 1.43 — same intent.)
+      path: !(d.path === "FREEFALL" && d.ofi1h != null && d.ofi1h >= 1.43)
+    };
+    var fails = Object.keys(gates).filter(function (k) { return !gates[k]; });
+    if (fails.length === 1 && fails[0] === "vol") {
+      // say WHICH sub-condition failed — decay vs thin-floor are different stories
+      var decaying = d.feeRate1h < 0.5 * d.feeRate24h;
+      return { show: "volnote", volMsg: decaying
+        ? "ACCUM: volume decaying (1h " + fmtNum(d.feeRate1h, 1) + " vs 24h " + fmtNum(d.feeRate24h, 1) + "%/d) — wait for the fee trend to stabilize"
+        : "ACCUM: fees too thin — 24h " + fmtNum(d.feeRate24h, 1) + "%/d under the 8%/d floor" + (d.feeRate1h >= 8 ? " (1h " + fmtNum(d.feeRate1h, 1) + " is heating — close; re-check soon)" : "") };
+    }
+    if (fails.length) return null;
+    var sig = d.sigma == null ? 100 : d.sigma;
+    // depth: σ-scaled — the band must survive a normal bad day for this token
+    var depth = sig >= 150 ? 75 : (sig <= 80 ? 60 : 60 + ((sig - 80) / 70) * 15);
+    if (d.ddHigh != null && d.ddHigh < 20) depth = Math.min(75, depth + 5);   // near ATH: more room to fall
+    if (d.ddHigh != null && d.ddHigh > 50) depth = Math.max(60, depth - 5);   // already crashed: less
+    depth = Math.round(depth);
+    // bid-ask share: rises with σ and with sell-skewed flow (deep fills likelier)
+    var share = 0.55 + (sig - 100) / 1000 +
+      ((d.ofi1h != null && d.ofi1h > 1) ? 0.05 : 0) +   // sell pressure (sells/buys > 1)
+      (d.path === "FREEFALL" ? 0.05 : 0);
+    share = Math.min(0.80, Math.max(0.60, share));
+    share = Math.round(share * 20) / 20;
+    return { show: "full", depth: depth, share: share };
+  }
+
+  var renderAccumBlock = safe(function renderAccumBlock(hud, d) {
+    var chk = accumComboCheck(d);
+    if (!chk) return;
+    if (chk.show === "volnote") {
+      hud.appendChild(el("div", "mql-accum-note", chk.volMsg || "ACCUM: volume gate not met"));
+      return;
+    }
+    var wrap = el("div", "mql-accum");
+    var head = el("div", "mql-accum-head");
+    var title = el("span", "mql-accum-title", "🪣 ACCUM COMBO — safer long-term build");
+    tipify(title, "accum");
+    head.appendChild(title);
+    head.appendChild(el("span", "mql-accum-caret", comboUI.open ? "▾" : "▸"));
+    head.addEventListener("click", safe(function (e) {
+      if (e.target && e.target.closest && e.target.closest("input,button")) return;
+      comboUI.open = !comboUI.open; renderHUD();
+    }));
+    wrap.appendChild(head);
+    if (comboUI.open) {
+      var body = el("div", "mql-accum-body");
+      var rangeLine = el("div", "mql-accum-line", "range 0% → -" + chk.depth + "% (σ-scaled depth)");
+      tipify(rangeLine, "accumdepth");
+      body.appendChild(rangeLine);
+      var total = comboUI.total || 1.0;
+      var splitLine = el("div", "mql-accum-line");
+      splitLine.id = "mql-accum-split";
+      var setSplitText = function (tot) {
+        var a = Math.round(chk.share * tot * 1000) / 1000;
+        var b = Math.round((1 - chk.share) * tot * 1000) / 1000;
+        splitLine.textContent = "split " + Math.round(chk.share * 100) + "/" + Math.round((1 - chk.share) * 100) +
+          ": " + a + " SOL Bid-Ask + " + b + " SOL Spot (same range)";
+      };
+      setSplitText(total);
+      tipify(splitLine, "accumsplit");
+      body.appendChild(splitLine);
+      var totRow = el("div", "mql-accum-total");
+      totRow.appendChild(el("span", "", "total SOL"));
+      var totInp = el("input", "");
+      totInp.type = "number"; totInp.step = "0.1"; totInp.min = "0.01"; totInp.value = String(total);
+      totInp.addEventListener("input", safe(function () {
+        var v = parseFloat(totInp.value);
+        if (isFinite(v) && v > 0) {
+          comboUI.total = v;
+          try { chrome.storage.local.set({ mqlComboTotal: v }); } catch (e) {}
+          setSplitText(v);
+        }
+      }));
+      totRow.appendChild(totInp);
+      body.appendChild(totRow);
+      body.appendChild(el("div", "mql-accum-line mql-muted",
+        "σ " + fmtNum(d.sigma, 0) + "%/d → depth " + chk.depth + "% · fees 1h " + fmtNum(d.feeRate1h, 1) +
+        " vs 24h " + fmtNum(d.feeRate24h, 1) + "%/d (persisting) · OFI " + fmtNum(d.ofi1h, 2)));
+      body.appendChild(el("div", "mql-rec-warn", "⚠ directional bag risk: if the token dies you own it the whole way down — size for total loss"));
+      body.appendChild(el("div", "mql-accum-prior", "depth/split are structured priors pending calibration"));
+      var applyBtn = el("button", "mql-apply", "⚡ Apply Combo (2 legs)");
+      applyBtn.addEventListener("click", safe(function () {
+        startCombo(chk.depth, chk.share, comboUI.total || 1.0);
+      }));
+      body.appendChild(applyBtn);
+      wrap.appendChild(body);
+    }
+    hud.appendChild(wrap);
+  });
+
+  // ---- guided two-leg apply flow (state survives reloads via storage) ----
+  var comboFlow = { st: null, timer: null };
+
+  function comboSave() { try { chrome.storage.local.set({ mqlComboState: comboFlow.st }); } catch (e) {} }
+  function comboClear() {
+    comboFlow.st = null;
+    if (comboFlow.timer) { clearInterval(comboFlow.timer); comboFlow.timer = null; }
+    try { chrome.storage.local.remove("mqlComboState"); } catch (e) {}
+    var b = document.getElementById("mql-combo-banner"); if (b) b.remove();
+  }
+  function comboLegParams(st) {
+    return st.leg === 1
+      ? { strategy: "Bid Ask", minPct: -st.depth, maxPct: 0, mode: "single" }
+      : { strategy: "Spot", minPct: -st.depth, maxPct: 0, mode: "single" };
+  }
+  function comboLegAmt(st) {
+    var amt = st.leg === 1 ? st.share * st.totalSol : (1 - st.share) * st.totalSol;
+    return Math.round(amt * 1000) / 1000;
+  }
+
+  // Fill the SOL amount input. DOM assumption (flagged for live review): each
+  // AmountInput wrap shows its token symbol as text; we fill the unique wrap
+  // mentioning SOL, else fall back to the 2nd of exactly two inputs (quote side).
+  function fillSolAmount(amt) {
+    try {
+      var wraps = document.querySelectorAll('[data-sentry-component="AmountInput"]');
+      var target = null, hits = 0;
+      for (var i = 0; i < wraps.length; i++) {
+        var t = wraps[i].textContent || "";
+        if (/\bSOL\b/.test(t) && !/USDC|USDT/.test(t)) { target = wraps[i].querySelector("input"); hits++; }
+      }
+      if (hits === 1 && target) { setNativeInput(target, String(amt)); return true; }
+      if (wraps.length === 2 && hits !== 1) {
+        var inp2 = wraps[1].querySelector("input");
+        if (inp2) { setNativeInput(inp2, String(amt)); return true; }
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+
+  var comboApplyLeg = safe(function comboApplyLeg() {
+    var st = comboFlow.st; if (!st) return;
+    applySetup(comboLegParams(st), null);
+    setTimeout(safe(function () {
+      var st2 = comboFlow.st; if (!st2) return;
+      var r = readRange();
+      if (!r) { renderComboBanner("open the deposit / Add Position panel first, then hit ↻ re-apply"); return; }
+      st2.amtFilled = fillSolAmount(comboLegAmt(st2));
+      comboSave(); renderComboBanner();
+      // re-verify the range stuck (Auto-Fill likes to reset it)
+      setTimeout(safe(function () {
+        var st3 = comboFlow.st; if (!st3) return;
+        var r2 = readRange();
+        if (r2 && (Math.abs(r2.min - (-st3.depth)) > 1 || Math.abs(r2.max) > 1)) {
+          applySetup(comboLegParams(st3), null);
+          flashResetWarning("Combo: range was reset — re-applied leg " + st3.leg + ". Keep Auto-Fill OFF.");
+        }
+      }), 2600);
+    }), 1400);
+  });
+
+  function renderComboBanner(note) {
+    var st = comboFlow.st; if (!st) return;
+    var b = document.getElementById("mql-combo-banner");
+    if (!b) { b = el("div", ""); b.id = "mql-combo-banner"; document.body.appendChild(b); }
+    b.innerHTML = "";
+    var amt = comboLegAmt(st);
+    var shape = st.leg === 1 ? "BID-ASK" : "SPOT";
+    b.appendChild(el("div", "mql-combo-step", "LEG " + st.leg + "/2 — " + shape + " " + amt + " SOL · range 0 → -" + st.depth + "%"));
+    var subTxt = note || (st.amtFilled
+      ? "form filled — review & sign in wallet (keep Auto-Fill OFF, SOL side only)"
+      : "strategy + range filled — ENTER " + amt + " SOL yourself, then sign (keep Auto-Fill OFF)");
+    b.appendChild(el("div", "mql-combo-sub", subTxt));
+    var row = el("div", "mql-combo-row");
+    var re = el("button", "mql-apply", "↻ re-apply fills");
+    re.addEventListener("click", safe(function () { comboApplyLeg(); }));
+    row.appendChild(re);
+    var manual = el("button", "mql-apply", "✓ leg " + st.leg + " signed → " + (st.leg === 1 ? "set up leg 2" : "finish"));
+    manual.addEventListener("click", safe(function () { comboAdvance("manual"); }));
+    row.appendChild(manual);
+    var abort = el("button", "mql-apply mql-combo-abort", "✕ abort");
+    abort.addEventListener("click", safe(function () { comboClear(); }));
+    row.appendChild(abort);
+    b.appendChild(row);
+  }
+
+  var comboAdvance = safe(function comboAdvance(how) {
+    var st = comboFlow.st; if (!st) return;
+    if (st.leg === 1) {
+      st.leg = 2; st.leg1At = Date.now(); st.amtFilled = false; st.warned = false;
+      comboSave();
+      renderComboBanner();
+      comboApplyLeg();
+    } else {
+      try {
+        chrome.storage.local.get({ mqlTradeLog: [] }, function (jr) {
+          var logArr = jr.mqlTradeLog || [];
+          logArr.push({ type: "COMBO_OPEN", pool: st.poolAddr, depth: st.depth, share: st.share,
+            totalSol: st.totalSol, startedAt: st.startedAt, leg1At: st.leg1At || null,
+            finishedAt: Date.now(), detectedBy: how });
+          chrome.storage.local.set({ mqlTradeLog: logArr.slice(-200) });
+        });
+      } catch (e) {}
+      var b = document.getElementById("mql-combo-banner");
+      if (b) {
+        b.innerHTML = "";
+        b.appendChild(el("div", "mql-combo-step mql-good", "✅ COMBO DEPLOYED — 2 legs live (bid-ask base + spot layer). Position Watch is tracking fill %."));
+        setTimeout(safe(function () { var n = document.getElementById("mql-combo-banner"); if (n) n.remove(); }), 9000);
+      }
+      comboFlow.st = null;
+      if (comboFlow.timer) { clearInterval(comboFlow.timer); comboFlow.timer = null; }
+      try { chrome.storage.local.remove("mqlComboState"); } catch (e) {}
+      pollMyPosition();
+    }
+  });
+
+  function comboPollStart() {
+    if (comboFlow.timer) clearInterval(comboFlow.timer);
+    comboFlow.timer = setInterval(safe(function () {
+      var st = comboFlow.st;
+      if (!st) { clearInterval(comboFlow.timer); comboFlow.timer = null; return; }
+      var legStart = st.leg === 1 ? st.startedAt : (st.leg1At || st.startedAt);
+      if (Date.now() - legStart > 600e3 && !st.warned) {
+        st.warned = true; comboSave();
+        renderComboBanner("still waiting — did you sign? (auto-detect needs your wallet saved in Lens options; or use the ✓ button)");
+      }
+      sendMessage({ type: "getMyPosition", pool: st.poolAddr }).then(safe(function (r) {
+        var st2 = comboFlow.st; if (!st2 || !r || !r.ok) return;
+        var count = r.has ? (r.count || 0) : 0;
+        var known = st2.lastCount == null ? st2.startCount : st2.lastCount;
+        if (count > known) { st2.lastCount = count; st2.warned = false; comboSave(); comboAdvance("auto"); }
+      }));
+    }), 15000);
+  }
+
+  var startCombo = safe(function startCombo(depth, share, totalSol) {
+    var startCount = (state.apiPos && state.apiPos.count) || 0;
+    comboFlow.st = { poolAddr: state.pool, depth: depth, share: share, totalSol: totalSol,
+      leg: 1, startedAt: Date.now(), startCount: startCount, lastCount: startCount,
+      amtFilled: false, warned: false };
+    comboSave();
+    renderComboBanner();
+    comboApplyLeg();
+    comboPollStart();
+  });
+
+  function comboResume() {
+    try {
+      chrome.storage.local.get({ mqlComboState: null }, safe(function (st) {
+        var c = st.mqlComboState;
+        if (!c || !c.poolAddr) return;
+        if (Date.now() - c.startedAt > 2 * 3600e3) { chrome.storage.local.remove("mqlComboState"); return; }
+        if (c.poolAddr !== state.pool) return;
+        comboFlow.st = c;
+        renderComboBanner("resumed — leg " + c.leg + " of 2 (↻ re-apply if the form is empty)");
+        comboPollStart();
+      }));
+    } catch (e) {}
+  }
+
   // ---- hover explainer tooltips ----
   var MQL_TIPS = {
     "verdict": "The bottom line. The Lens tests this pool against three entry playbooks (SCALP / REVERSION / CARRY). NO ENTRY means none of them clear their bars \u2014 whatever the APR looks like.",
@@ -246,7 +514,11 @@
     "radar": "Board-wide scanner: every 3 min it screens the most active DLMM pools and pins the actionable ones here. \ud83d\udd25 = full signal (all gates green). \u26a0 = near-miss (1-2 gates short \u2014 override territory). Click a chip to jump to that pool. Click RADAR to collapse.",
     "pwbrackets": "Suggested exit brackets, anchored to what a two-sided Spot can ACTUALLY earn: TP = W/4 (capped appreciation of a \u00b1W band \u2014 a clean pump-out only yields ~W/4) + half a day of the fee rate (chop income is the real engine). SL sits just inside the structural band-break value (~-0.75W). \u2018Away\u2019 = how far your current PnL sits from each. These are guidance \u2014 the hard rules (fee-decay, flow-flip, freefall) fire on their own regardless.",
     "poswatch": "Exit intelligence for the position you hold in THIS pool: it snapshots the fee rate when it first sees your position, then applies the bot\u2019s exit rules \u2014 fee-decay (exit at 50% decay), organic flow-flip, freefall, surge-death. HOLD / WATCH / TIGHTEN / EXIT with the reason.",
-    "breakeven": "IL-breakeven check for YOUR current range: at this pool's volatility, a range this wide must earn at least X%/day in fees just to offset expected impermanent loss. \u2713 = the pool pays more than that. \u2717 = your range loses money on expectation."
+    "breakeven": "IL-breakeven check for YOUR current range: at this pool's volatility, a range this wide must earn at least X%/day in fees just to offset expected impermanent loss. \u2713 = the pool pays more than that. \u2717 = your range loses money on expectation.",
+    "accum": "ACCUM COMBO — the long-term accumulation recipe: a deep single-sided SOL band below price, built as two legs in the SAME range — a Bid-Ask base (bottom-heavy: buys MORE as price falls deeper) + a Spot layer (uniform: shallow dips still fill and earn). You only buy dips, never tops, and earn fees while waiting. Directional: if the token dies you own it — which is why the gates (authorities, organic flow, volume persistence) outrank the math.",
+    "accumdepth": "How deep the band goes, scaled from realized vol: \u03c3\u2265150%/day \u2192 -75%, \u03c3\u226480 \u2192 -60% (linear between), nudged deeper near ATH and shallower if already crashed. A -70% wick is a normal day for a high-\u03c3 memecoin \u2014 the band must survive it. Prior pending calibration.",
+    "accumsplit": "Capital split between the two legs. The Bid-Ask share rises with \u03c3 and with sell-skewed flow (deep fills more likely), clamped 60-80%. Default lands \u2248 70/30. Prior pending calibration.",
+    "accumfill": "How much of your accumulation band has converted from SOL into the token — the progress bar of the bag you're building. Value-based when the API provides amounts; otherwise \u2248 a linear price-traversal estimate (labeled)."
   };
   var tipEl = null;
   function ensureTipEl() {
@@ -379,8 +651,28 @@
       } catch (e) {}
 
       var decayPct = base.entryFeeRate > 0 ? (1 - d.feeRate1h / base.entryFeeRate) * 100 : 0;
-      // exit rules (same as the bot manager)
+      var ap = state.apiPos;
+      var isAccum = !!(ap && ap.accum);
+      var isCombo = !!(ap && ap.combo);
+      // exit rules (same as the bot manager) — accumulation books get their own rulebook
       var verdict = "HOLD", cls = "mql-pw-hold", reasons = [];
+      if (isAccum) {
+        // ACCUM profile: scalp TP/SL/TIGHTEN don't apply (priors pending calibration)
+        var decayFire = d.feeRate1h < 0.5 * base.entryFeeRate && base.entryFeeRate > 2;
+        var flowFire = d.ofi1h != null && d.ofi1h > 3 && d.pc1h != null && d.pc1h < -15;
+        if (decayFire && flowFire) {
+          verdict = "EXIT"; cls = "mql-pw-exit";
+          reasons.push("token dying while you accumulate — fee engine " + Math.round(decayPct) + "% below baseline AND organic distribution " + fmtNum(d.ofi1h, 1) + ":1. Both kill-rules fired.");
+        } else if (decayFire || flowFire || decayPct > 25 || d.trend === "COOLING") {
+          verdict = "WATCH"; cls = "mql-pw-warn";
+          if (decayFire) reasons.push("fee engine decayed " + Math.round(decayPct) + "% — EXIT arms if the flow flips too");
+          if (flowFire) reasons.push("organic distribution " + fmtNum(d.ofi1h, 1) + ":1 into your band — EXIT arms if the fee engine dies too");
+          if (!decayFire && !flowFire) reasons.push("fee trend softening (" + fmtNum(d.feeRate1h, 1) + "%/d, " + Math.round(decayPct) + "% below baseline) — the band only pays if volume persists");
+        } else {
+          reasons.push("accumulating as designed — volume alive (" + fmtNum(d.feeRate1h, 1) + "%/d), flow OFI " + fmtNum(d.ofi1h, 2));
+        }
+        if (d.path === "FREEFALL" && verdict !== "EXIT") reasons.push("FREEFALL: band filling fast — that is the design; the kill-switch is fee-decay + flow-flip, not price");
+      } else {
       if (d.feeRate1h < 0.5 * base.entryFeeRate && base.entryFeeRate > 2) {
         verdict = "EXIT"; cls = "mql-pw-exit";
         reasons.push("fee engine decayed " + Math.round(decayPct) + "% from your baseline (" + fmtNum(base.entryFeeRate,1) + " → " + fmtNum(d.feeRate1h,1) + "%/d) — the fees were the trade");
@@ -401,9 +693,15 @@
         if (decayPct > 25) { verdict = "WATCH"; cls = "mql-pw-warn"; reasons.push("fee rate down " + Math.round(decayPct) + "% from baseline — exit rule fires at 50%"); }
         else reasons.push("fee engine healthy (" + fmtNum(d.feeRate1h,1) + "%/d, " + (decayPct >= 0 ? Math.round(decayPct) + "% below" : Math.round(-decayPct) + "% above") + " baseline) · flow OFI " + fmtNum(d.ofi1h,2));
       }
+      }
       // explicit action guidance per verdict
       var doLine = null, assist = null;
-      if (verdict === "HOLD") doLine = "DO: nothing — let it print.";
+      if (isAccum) {
+        if (verdict === "HOLD") doLine = "DO: nothing — let the band fill. You only buy dips here.";
+        else if (verdict === "WATCH") doLine = "DO: stop adding size. If the second kill-rule fires, cut — no negotiating.";
+        else if (verdict === "EXIT") { doLine = "DO: close and take what's left back to SOL — accumulating a dying token is just slow bleeding."; assist = { kind: "exit", label: "→ open the Withdraw panel" }; }
+      }
+      else if (verdict === "HOLD") doLine = "DO: nothing — let it print.";
       else if (verdict === "WATCH") doLine = "DO: nothing yet — stop adding size, re-check often; EXIT arms at 50% decay.";
       else if (verdict === "TIGHTEN") { doLine = "DO: claim accrued fees NOW (bank the harvest) and consider pulling partial size. Keep a runner."; assist = { kind: "claim", label: "→ show me the Claim button" }; }
       else if (verdict === "EXIT") { doLine = "DO: close 100% → Zap Out to SOL. Do not negotiate with a fired rule."; assist = { kind: "exit", label: "→ open the Withdraw panel" }; }
@@ -413,25 +711,66 @@
       card.innerHTML = "";
       var head = el("div", "mql-pw-head");
       head.appendChild(el("span", "mql-pw-title", "POSITION WATCH"));
+      if (isCombo) head.appendChild(el("span", "mql-pw-combo", "COMBO ×" + ap.count));
+      if (isAccum) head.appendChild(el("span", "mql-pw-combo", "🪣 ACCUM"));
       var pill = el("span", "mql-pw-pill " + cls, verdict);
       tipify(pill, "poswatch");
       head.appendChild(pill);
       card.appendChild(head);
       reasons.forEach(function (r) { card.appendChild(el("div", "mql-pw-reason", "• " + r)); });
       if (doLine) card.appendChild(el("div", "mql-pw-do", doLine));
-      // live sigma-scaled brackets + distance from current PnL (parsed from the position row)
+      // live sigma-scaled brackets (scalp books) OR fill tracking (accum books)
       try {
-        var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
-        var tpB = Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
-        var slB = Math.round(clampN(0.75 * Wp + 2, 8, 20));
-        var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;  // API only — DOM rows contain unrelated %s
-        var btxt = "Brackets (\u00b1" + Wp + "% band): TP +" + tpB + "% / SL -" + slB + "%";
-        if (pnlNow != null && !isNaN(pnlNow)) {
-          btxt += "  \u00b7  now " + (pnlNow >= 0 ? "+" : "") + pnlNow.toFixed(1) + "%  (TP " + (tpB - pnlNow).toFixed(1) + " away, SL " + (pnlNow + slB).toFixed(1) + " of cushion)";
+        if (!isAccum) {
+          var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
+          var tpB = Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
+          var slB = Math.round(clampN(0.75 * Wp + 2, 8, 20));
+          var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;  // API only — DOM rows contain unrelated %s
+          var btxt = "Brackets (\u00b1" + Wp + "% band): TP +" + tpB + "% / SL -" + slB + "%";
+          if (pnlNow != null && !isNaN(pnlNow)) {
+            btxt += "  \u00b7  now " + (pnlNow >= 0 ? "+" : "") + pnlNow.toFixed(1) + "%  (TP " + (tpB - pnlNow).toFixed(1) + " away, SL " + (pnlNow + slB).toFixed(1) + " of cushion)";
+          }
+          var bEl = el("div", "mql-pw-brackets", btxt);
+          tipify(bEl, "pwbrackets");
+          card.appendChild(bEl);
+        } else {
+          // band line relative to current price (no scalp brackets on a bag build)
+          var bandTxt = "band ";
+          if (ap && ap.minPrice != null && ap.poolActivePrice) {
+            var hiRel = (ap.maxPrice / ap.poolActivePrice - 1) * 100;
+            var loRel = (ap.minPrice / ap.poolActivePrice - 1) * 100;
+            bandTxt += fmtNum(hiRel, 0) + "% → " + fmtNum(loRel, 0) + "% vs price";
+            var pnlA = (ap.pnlPct != null && !isNaN(ap.pnlPct)) ? ap.pnlPct : null;
+            if (pnlA != null) bandTxt += "  ·  PnL " + (pnlA >= 0 ? "+" : "") + fmtNum(pnlA, 1) + "%";
+          } else bandTxt += "\u00b1" + Wp + "%";
+          card.appendChild(el("div", "mql-pw-brackets", bandTxt));
+          // fill progress bar — the bag you're building
+          var fw = el("div", "mql-fillwrap");
+          var flab = el("div", "mql-fill-label",
+            (ap && ap.fillPct != null)
+              ? ("FILLED " + ap.fillPct + "%" + (ap.fillMethod === "traversal" ? " (\u2248 price traversal)" : ""))
+              : "fill: unknown");
+          tipify(flab, "accumfill");
+          fw.appendChild(flab);
+          var fbw = el("div", "mql-fillbarwrap");
+          var fb = el("div", "mql-fillbar");
+          fb.style.width = Math.max(2, Math.min(100, (ap && ap.fillPct) || 0)) + "%";
+          fbw.appendChild(fb);
+          fw.appendChild(fbw);
+          card.appendChild(fw);
         }
-        var bEl = el("div", "mql-pw-brackets", btxt);
-        tipify(bEl, "pwbrackets");
-        card.appendChild(bEl);
+        // per-leg lines for combo books
+        if (isCombo && ap && ap.legs) {
+          ap.legs.forEach(function (l, i) {
+            var rangeTxt = (l.minPrice != null && ap.poolActivePrice)
+              ? fmtNum((l.maxPrice / ap.poolActivePrice - 1) * 100, 0) + "%→" + fmtNum((l.minPrice / ap.poolActivePrice - 1) * 100, 0) + "%"
+              : "\u00b1" + l.widthPct + "%";
+            card.appendChild(el("div", "mql-pw-leg",
+              "leg " + (i + 1) + ": " + rangeTxt +
+              " · PnL " + (l.pnlPct >= 0 ? "+" : "") + fmtNum(l.pnlPct, 1) + "%" +
+              (l.fillPct != null ? " · fill " + l.fillPct + "%" : "")));
+          });
+        }
       } catch (e) {}
       if (assist) {
         var aBtn = el("button", "mql-apply mql-pw-assist", assist.label);
@@ -505,6 +844,11 @@
   var renderHUD = safe(function renderHUD() {
     var hud = document.getElementById("mql-hud");
     if (!hud) return;
+    // don't yank the DOM out from under the user while they type in a Lens input
+    try {
+      var ae = document.activeElement;
+      if (ae && ae.tagName === "INPUT" && ae.closest && ae.closest("#mql-hud")) return;
+    } catch (e) {}
     var d = state.data;
 
     if (!d) {
@@ -654,6 +998,9 @@
       (rec.watch || []).forEach(function (w) { recWrap.appendChild(el("div", "mql-rec-warn", w)); });
       hud.appendChild(recWrap);
     }
+
+    // ACCUM COMBO block (long-term accumulation recipe; priors pending calibration)
+    try { renderAccumBlock(hud, d); } catch (e) {}
 
 
     // attach hover explainers to remaining zones
@@ -1049,10 +1396,13 @@
   // ========================================================================
   function teardownForNavigation() {
     stopPolling();
-    ["mql-hud", "mql-feebadge", "mql-guard"].forEach(function (id) {
+    ["mql-hud", "mql-feebadge", "mql-guard", "mql-combo-banner"].forEach(function (id) {
       var n = document.getElementById(id);
       if (n && n.parentElement) n.parentElement.removeChild(n);
     });
+    // stop the combo poller (storage state persists — flow resumes if user returns)
+    if (comboFlow.timer) { clearInterval(comboFlow.timer); comboFlow.timer = null; }
+    comboFlow.st = null;
     state.data = null;
     state.lastFetchTs = 0;
     state.lastRange = null;
@@ -1067,6 +1417,7 @@
     if (state.pool) {
       mountAll();
       startPolling();
+      comboResume();
     }
   });
 
@@ -1104,9 +1455,17 @@
       }
     }));
     startObserver();
+    // restore persisted combo total for the ACCUM block
+    try {
+      chrome.storage.local.get({ mqlComboTotal: 1.0 }, function (st) {
+        var v = parseFloat(st.mqlComboTotal);
+        comboUI.total = (isFinite(v) && v > 0) ? v : 1.0;
+      });
+    } catch (e) {}
     if (state.pool) {
       mountAll();
       startPolling();
+      comboResume();
     }
   });
 

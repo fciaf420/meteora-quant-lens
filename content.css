@@ -283,3 +283,26 @@
 
 .mql-rec-squeeze { background: #2a1440; color: #c04cf0; }
 .mql-chip-squeeze { color: #c04cf0; }
+
+/* ==== ACCUM COMBO (v0.4.0) ==== */
+.mql-accum { margin-top: 8px; border: 1px solid #2a2a3a; border-radius: 8px; padding: 6px 8px; background: rgba(124, 108, 240, 0.06); }
+.mql-accum-head { display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+.mql-accum-title { font-weight: 600; font-size: 12px; color: #b9aef7; }
+.mql-accum-caret { color: #8888a8; font-size: 11px; }
+.mql-accum-body { margin-top: 6px; }
+.mql-accum-line { font-size: 11.5px; color: #cfcfe4; margin: 3px 0; }
+.mql-accum-note { margin-top: 6px; font-size: 11px; color: #c9a94a; }
+.mql-accum-prior { font-size: 10px; color: #77778f; margin-top: 4px; }
+.mql-accum-total { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 11.5px; color: #cfcfe4; }
+.mql-accum-total input { width: 64px; background: #1b1b27; border: 1px solid #33334a; color: #e8e8f4; border-radius: 5px; padding: 2px 6px; font-size: 11.5px; }
+#mql-combo-banner { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 2147483000; background: #16161f; border: 1px solid #7c6cf0; border-radius: 10px; padding: 10px 14px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5); max-width: 540px; font-family: ui-sans-serif, system-ui, sans-serif; }
+.mql-combo-step { font-weight: 700; font-size: 13px; color: #e8e8f4; }
+.mql-combo-sub { font-size: 11.5px; color: #b9b9ce; margin-top: 3px; }
+.mql-combo-row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.mql-combo-abort { background: #3a2330 !important; color: #e08c9d !important; }
+.mql-pw-combo { margin-left: 6px; font-size: 10px; font-weight: 700; color: #b9aef7; border: 1px solid #7c6cf0; border-radius: 6px; padding: 1px 5px; }
+.mql-fillwrap { margin: 6px 0 2px; }
+.mql-fill-label { font-size: 10.5px; color: #9d9db5; margin-bottom: 2px; }
+.mql-fillbarwrap { height: 6px; background: #22222f; border-radius: 4px; overflow: hidden; }
+.mql-fillbar { height: 100%; background: linear-gradient(90deg, #7c6cf0, #4ac97e); }
+.mql-pw-leg { font-size: 10.5px; color: #9d9db5; margin: 1px 0 0 6px; }

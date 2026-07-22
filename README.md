@@ -69,3 +69,12 @@ Signals are heuristics derived from public Meteora and Jupiter data and can be
 wrong, stale, or incomplete. DLMM liquidity provision carries real risk including
 impermanent loss and total loss of capital. Always do your own research and
 verify every number on-chain before committing funds.
+
+## v0.4.0 — ACCUM COMBO
+
+The popular "dip-catcher" build: a deep single-sided SOL band below price (0 → -60..-75%), created as **two legs in the same range** — a Bid-Ask base (~70%, bottom-weighted so you buy more the deeper it dips) + a Spot layer (~30%, uniform so shallow dips still fill and earn).
+
+- **HUD block** (🪣 ACCUM COMBO): appears only when the hard gates pass — mint+freeze burned, top10 ≤ 35%, organic buyers present, volume persisting (1h fee rate ≥ 50% of 24h, 24h ≥ 8%/day), and not a dying knife (FREEFALL with organic sellers ≥ 1.43:1 is blocked). Depth is σ-scaled (σ≥150 → -75%, σ≤80 → -60%, ATH/drawdown-nudged); the Bid-Ask share scales with σ and flow (clamped 60–80%). All thresholds are structured priors pending calibration.
+- **⚡ Apply Combo**: guided two-leg flow with a step banner — fills Bid-Ask + range + SOL amount for leg 1, waits for your signature (auto-detects the new position via the saved-wallet API, or use the ✓ button), then re-fills the form for the Spot layer. State survives page reloads; ✕ aborts anytime. The extension never signs anything.
+- **Position Watch**: multiple positions in one pool render as a single **COMBO ×N** card (aggregate PnL, combined band, per-leg lines). Accumulation books get their own rulebook — no scalp TP/SL; verdicts are HOLD (filling, volume alive) / WATCH (fee trend softening) / EXIT (fee-decay AND flow-flip — the token is dying while you accumulate). A fill bar tracks how much of the band has converted from SOL into the token.
+- **Discord alerts** (accum-flavored): band 25/50/75% filled, FULLY FILLED (decide: hold or cut), popped above band (100% SOL + fees banked), and the dying-token alerts.
