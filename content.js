@@ -378,8 +378,46 @@
     } catch (e) { return false; }
   }
 
+  // Leg 2 = ADD LIQUIDITY into the leg-1 position (user-confirmed: ONE position,
+  // bid-ask base + spot layered on top). Range is locked to the position's bins,
+  // so we only drive: Add Liquidity button -> Spot strategy -> SOL amount.
+  function findAddLiquidityBtn() {
+    var btns = document.querySelectorAll("button");
+    for (var i = 0; i < btns.length; i++) {
+      var t = (btns[i].textContent || "").replace(/\s+/g, " ").trim();
+      if (/^add liquidity$/i.test(t)) return btns[i];
+    }
+    return null;
+  }
+
+  var comboAddSpotLayer = safe(function comboAddSpotLayer() {
+    var st = comboFlow.st; if (!st) return;
+    var addBtn = findAddLiquidityBtn();
+    if (addBtn) { try { addBtn.click(); } catch (e) {} }
+    setTimeout(safe(function () {
+      var st2 = comboFlow.st; if (!st2) return;
+      // strategy: Spot (same proven selector as applySetup)
+      var stratWrap = document.querySelector('[data-sentry-component="StrategySelection"]');
+      if (stratWrap) {
+        var btns = stratWrap.querySelectorAll("button");
+        for (var i = 0; i < btns.length; i++) {
+          if ((btns[i].textContent || "").replace(/\s+/g, " ").trim().endsWith("Spot")) { btns[i].click(); break; }
+        }
+      }
+      setTimeout(safe(function () {
+        var st3 = comboFlow.st; if (!st3) return;
+        st3.amtFilled = fillSolAmount(comboLegAmt(st3));
+        comboSave();
+        renderComboBanner((addBtn || stratWrap)
+          ? null
+          : "couldn't find your position's Add Liquidity panel — open the position card, click Add Liquidity, pick Spot, enter " + comboLegAmt(st3) + " SOL, then sign");
+      }), 700);
+    }), 1300);
+  });
+
   var comboApplyLeg = safe(function comboApplyLeg() {
     var st = comboFlow.st; if (!st) return;
+    if (st.leg === 2) { comboAddSpotLayer(); return; }
     applySetup(comboLegParams(st), null);
     setTimeout(safe(function () {
       var st2 = comboFlow.st; if (!st2) return;
@@ -405,8 +443,10 @@
     if (!b) { b = el("div", ""); b.id = "mql-combo-banner"; document.body.appendChild(b); }
     b.innerHTML = "";
     var amt = comboLegAmt(st);
-    var shape = st.leg === 1 ? "BID-ASK" : "SPOT";
-    b.appendChild(el("div", "mql-combo-step", "LEG " + st.leg + "/2 — " + shape + " " + amt + " SOL · range 0 → -" + st.depth + "%"));
+    var stepTxt = st.leg === 1
+      ? "LEG 1/2 — BID-ASK " + amt + " SOL · range 0 → -" + st.depth + "% (creates the position)"
+      : "LEG 2/2 — ADD " + amt + " SOL as SPOT into the SAME position (range locked to leg 1)";
+    b.appendChild(el("div", "mql-combo-step", stepTxt));
     var subTxt = note || (st.amtFilled
       ? "form filled — review & sign in wallet (keep Auto-Fill OFF, SOL side only)"
       : "strategy + range filled — ENTER " + amt + " SOL yourself, then sign (keep Auto-Fill OFF)");
@@ -444,7 +484,7 @@
       var b = document.getElementById("mql-combo-banner");
       if (b) {
         b.innerHTML = "";
-        b.appendChild(el("div", "mql-combo-step mql-good", "✅ COMBO DEPLOYED — 2 legs live (bid-ask base + spot layer). Position Watch is tracking fill %."));
+        b.appendChild(el("div", "mql-combo-step mql-good", "✅ COMBO DEPLOYED — one position: bid-ask base + spot layer. Position Watch is tracking fill %."));
         setTimeout(safe(function () { var n = document.getElementById("mql-combo-banner"); if (n) n.remove(); }), 9000);
       }
       comboFlow.st = null;
@@ -467,8 +507,29 @@
       sendMessage({ type: "getMyPosition", pool: st.poolAddr }).then(safe(function (r) {
         var st2 = comboFlow.st; if (!st2 || !r || !r.ok) return;
         var count = r.has ? (r.count || 0) : 0;
-        var known = st2.lastCount == null ? st2.startCount : st2.lastCount;
-        if (count > known) { st2.lastCount = count; st2.warned = false; comboSave(); comboAdvance("auto"); }
+        var deps = (r.depositsSol != null && isFinite(Number(r.depositsSol))) ? Number(r.depositsSol) : null;
+        if (st2.leg === 1) {
+          // leg 1 = position created: count rises (or deposits jump if API lags count)
+          var known = st2.lastCount == null ? st2.startCount : st2.lastCount;
+          var leg1Amt = st2.share * st2.totalSol;
+          var depBase = st2.startDeposits || 0;
+          if (count > known || (deps != null && deps > depBase + 0.3 * leg1Amt)) {
+            st2.lastCount = count; st2.leg1Deposits = deps; st2.warned = false; comboSave();
+            comboAdvance("auto");
+          }
+        } else {
+          // leg 2 = ADD into the SAME position: count stays flat — detect via
+          // total deposits growing by ~the spot layer amount
+          var leg2Amt = (1 - st2.share) * st2.totalSol;
+          var base = (st2.leg1Deposits != null) ? st2.leg1Deposits
+            : (st2.startDeposits || 0) + st2.share * st2.totalSol * 0.7;
+          if (deps != null && deps > base + 0.3 * leg2Amt) {
+            st2.warned = false; comboSave(); comboAdvance("auto");
+          } else if (count > (st2.lastCount || 0)) {
+            // user created a separate position instead — still counts as leg 2 done
+            st2.lastCount = count; comboSave(); comboAdvance("auto");
+          }
+        }
       }));
     }), 15000);
   }
@@ -477,7 +538,8 @@
     var startCount = (state.apiPos && state.apiPos.count) || 0;
     comboFlow.st = { poolAddr: state.pool, depth: depth, share: share, totalSol: totalSol,
       leg: 1, startedAt: Date.now(), startCount: startCount, lastCount: startCount,
-      amtFilled: false, warned: false };
+      startDeposits: (state.apiPos && state.apiPos.depositsSol != null ? Number(state.apiPos.depositsSol) : 0),
+      leg1Deposits: null, amtFilled: false, warned: false };
     comboSave();
     renderComboBanner();
     comboApplyLeg();

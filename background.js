@@ -696,7 +696,9 @@ function positionFill(pos, cur) {
 function summarizePositions(ps) {
   const legs = [];
   let cur = NaN;
+  let depSum = 0; // all-time deposits (SOL) across legs — combo leg-2 detection
   for (const pp of ps) {
+    try { depSum += Number((pp.allTimeDeposits && pp.allTimeDeposits.total && pp.allTimeDeposits.total.sol) || 0); } catch (e) {}
     const minP = Number(pp.minPrice), maxP = Number(pp.maxPrice), mid = (minP + maxP) / 2;
     const c = Number(pp.poolActivePrice);
     if (isFinite(c)) cur = c;
@@ -736,6 +738,7 @@ function summarizePositions(ps) {
     widthPct: wAll,                          // backward compat (combined range)
     poolActivePrice: cur,
     combo: legs.length > 1,
+    depositsSol: Math.round(depSum * 1e6) / 1e6,
     accum, fillPct, fillMethod,
     minPrice: minAll, maxPrice: maxAll,
     legs
