@@ -201,6 +201,7 @@ function buildRecommendation(s) {
 
   if (s.verdict && s.verdict.class === 'IGNITION') {
     r.params = (s.ofi1h > 2) ? { strategy: 'Spot', minPct: -W, maxPct: 0, mode: 'single' } : { strategy: 'Spot', minPct: -W, maxPct: W, mode: 'two' };
+    r.plan = { cls: 'IGNITION', tp: tp, sl: sl, widthPct: W };
     r.action = 'SCALP'; r.headline = 'Event-driven scalp — fees overpay for risk AND a catalyst is live.';
     r.steps = [
       (s.ofi1h > 2 ? 'Single-sided SOL below price (flow is sell-skewed)' : 'Two-sided Spot centered on price') + ', width ±' + W + '%',
@@ -210,6 +211,7 @@ function buildRecommendation(s) {
     ];
   } else if (s.verdict && s.verdict.class === 'BASING') {
     r.params = { strategy: 'Spot', minPct: -18, maxPct: 18, mode: 'two' };
+    r.plan = { cls: 'BASING', tp: 20, sl: 15, widthPct: 18, stopPrice: (s.dayLow ? s.dayLow * 0.98 : null) };
     r.action = 'REVERSION'; r.headline = 'Crash is over, base is forming, real buyers absorbing — straddle the base.';
     r.steps = [
       'Two-sided Spot centered, width ±18%',
@@ -219,6 +221,7 @@ function buildRecommendation(s) {
     ];
   } else if (s.verdict && s.verdict.class === 'CARRY') {
     r.params = { strategy: 'Spot', minPct: -35, maxPct: 35, mode: 'two' };
+    r.plan = { cls: 'CARRY', tp: 15, sl: 12, widthPct: 35 };
     r.action = 'CARRY'; r.headline = 'Calm, mature, organic-buying pool that overpays for its risk — park and ride.';
     r.steps = [
       'Two-sided Spot, WIDE: ±35% (durability over density)',
@@ -229,6 +232,7 @@ function buildRecommendation(s) {
   } else if (s.verdict && s.verdict.class === 'SQUEEZE') {
     const Wq = s.squeezeW || 20;
     r.params = { strategy: 'Bid Ask', minPct: -Wq, maxPct: Wq, mode: 'two' };
+    r.plan = { cls: 'SQUEEZE', tp: Math.round(Wq/3 + (s.feeRate1h||0)*0.5), sl: Math.round(0.7*Wq+2), widthPct: Wq };
     r.action = 'SQUEEZE'; r.headline = 'Vol coiled to ' + (s.sigmaRatio ? Math.round(s.sigmaRatio*100) + '%' : '<60%') + ' of its norm \u2014 bet on range expansion, either direction.';
     r.steps = [
       'Two-sided BID-ASK, width \u00b1' + Wq + '% (edges loaded, center thin \u2014 pays on the breakout)',
@@ -747,8 +751,9 @@ function summarizePositions(ps) {
 async function watchPositions() {
   const cfg = await chrome.storage.sync.get({ webhookUrl: '', walletAddress: '' });
   if (!cfg.webhookUrl || !cfg.walletAddress) return;
-  const st = await chrome.storage.local.get({ mqlAlertStates: {} });
+  const st = await chrome.storage.local.get({ mqlAlertStates: {}, mqlEntryPlan: {} });
   const states = st.mqlAlertStates || {};
+  const plans = st.mqlEntryPlan || {};
   let port;
   try {
     const r = await fetchJson(DATAPI + '/portfolio/open?user=' + cfg.walletAddress.trim());
@@ -783,9 +788,13 @@ async function watchPositions() {
         const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice), cur = Number(pos.poolActivePrice);
         const mid = (minP + maxP) / 2;
         const W = mid > 0 ? ((maxP - minP) / 2 / mid) * 100 : 20;
-        const tp = Math.round(clampB(W / 4 + feeRate * 0.5, 8, 25));
-        const sl = Math.round(clampB(0.75 * W + 2, 8, 20));
+        // Entry plan (journaled by the HUD Apply button) outranks generic width-math:
+        // the class brackets the user actually entered on (e.g. BASING +20/-15 + stop).
+        const plan = plans[pool] && (Date.now() - (plans[pool].ts || 0) < 7 * 86400e3) ? plans[pool] : null;
+        const tp = (plan && plan.tp) ? plan.tp : Math.round(clampB(W / 4 + feeRate * 0.5, 8, 25));
+        const sl = (plan && plan.sl) ? plan.sl : Math.round(clampB(0.75 * W + 2, 8, 20));
         const cond = {};
+        if (plan && plan.stopPrice > 0 && isFinite(cur)) cond.PLAN_STOP = cur < plan.stopPrice;
         cond.OOR_DOWN = cur < minP;
         cond.OOR_UP = cur > maxP;
         cond.HIT_TP = pnl >= tp;
@@ -802,6 +811,7 @@ async function watchPositions() {
           HIT_SL: '🔴 SL HIT: ' + name + ' at ' + pnl.toFixed(1) + '% (stop -' + sl + '%). Cut it.',
           NEAR_SL: '⚠️ Approaching SL: ' + name + ' at ' + pnl.toFixed(1) + '% vs -' + sl + '% stop.',
           DECAY: '📉 FEE ENGINE DYING: ' + name + ' — 1h fee rate ' + feeRate.toFixed(1) + '%/d, ~' + Math.round((1 - feeRate / entryFeeRate) * 100) + '% below your entry (' + entryFeeRate.toFixed(1) + '%/d). The fees WERE the trade — exit even if price looks fine. PnL ' + pnl.toFixed(1) + '%',
+          PLAN_STOP: '⛔ PLAN STOP BROKEN: ' + name + ' — price ' + cur.toExponential(3) + ' fell below your ' + (plan && plan.cls ? plan.cls : '') + ' stop ' + (plan && plan.stopPrice ? plan.stopPrice.toExponential(3) : '') + '. Thesis dead — exit regardless of PnL (' + pnl.toFixed(1) + '%).',
           FLOW: '🩸 DISTRIBUTION: ' + name + ' — organic sellers ' + (ofi1h != null ? ofi1h.toFixed(1) : '?') + ':1 while price ' + (pc1h != null ? pc1h.toFixed(1) : '?') + '%/1h. Real wallets are exiting through you. Cut it. PnL ' + pnl.toFixed(1) + '%'
         };
         // ---- ACCUMULATION profile: own rulebook (priors pending calibration) ----
@@ -866,6 +876,15 @@ async function watchPositions() {
       await chrome.storage.local.set({ mqlTradeLog: logArr.slice(-200), mqlPosBaseline: bl.mqlPosBaseline || {} });
     }
     st.mqlLastPos = lp;
+  } catch (e) {}
+  // prune entry plans for pools with no open position anymore (>24h grace so a
+  // freshly-applied plan survives the gap between Apply and signing)
+  try {
+    let planDirty = false;
+    for (const pk of Object.keys(plans)) {
+      if (!pools.includes(pk) && Date.now() - (plans[pk].ts || 0) > 86400e3) { delete plans[pk]; planDirty = true; }
+    }
+    if (planDirty) await chrome.storage.local.set({ mqlEntryPlan: plans });
   } catch (e) {}
   // prune states for positions no longer open
   for (const k of Object.keys(states)) { const base = k.split(':').slice(0, 2).join(':'); if (!seen[base]) delete states[k]; }

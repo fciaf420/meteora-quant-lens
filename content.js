@@ -546,6 +546,15 @@
     comboPollStart();
   });
 
+  function loadEntryPlan() {
+    try {
+      chrome.storage.local.get({ mqlEntryPlan: {} }, safe(function (jr) {
+        var plans = jr.mqlEntryPlan || {};
+        state.entryPlan = (state.pool && plans[state.pool]) ? plans[state.pool] : null;
+      }));
+    } catch (e) {}
+  }
+
   function comboResume() {
     try {
       chrome.storage.local.get({ mqlComboState: null }, safe(function (st) {
@@ -785,16 +794,34 @@
       try {
         if (!isAccum) {
           var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
-          var tpB = Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
-          var slB = Math.round(clampN(0.75 * Wp + 2, 8, 20));
+          // entry plan (journaled at Apply) outranks generic width-math
+          var plan = (state.entryPlan && state.entryPlan.pool === state.pool &&
+                      Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3) ? state.entryPlan : null;
+          var tpB = plan && plan.tp ? plan.tp : Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
+          var slB = plan && plan.sl ? plan.sl : Math.round(clampN(0.75 * Wp + 2, 8, 20));
           var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;  // API only — DOM rows contain unrelated %s
-          var btxt = "Brackets (\u00b1" + Wp + "% band): TP +" + tpB + "% / SL -" + slB + "%";
+          var btxt = plan
+            ? "Brackets (" + plan.cls + " plan · band \u00b1" + Wp + "%): TP +" + tpB + "% / SL -" + slB + "%"
+            : "Brackets (\u00b1" + Wp + "% band): TP +" + tpB + "% / SL -" + slB + "%";
           if (pnlNow != null && !isNaN(pnlNow)) {
             btxt += "  \u00b7  now " + (pnlNow >= 0 ? "+" : "") + pnlNow.toFixed(1) + "%  (TP " + (tpB - pnlNow).toFixed(1) + " away, SL " + (pnlNow + slB).toFixed(1) + " of cushion)";
           }
           var bEl = el("div", "mql-pw-brackets", btxt);
           tipify(bEl, "pwbrackets");
           card.appendChild(bEl);
+          if (plan) {
+            // width drift: the band you actually hold vs the recipe you applied
+            if (plan.widthPct && Math.abs(Wp - plan.widthPct) > 0.4 * plan.widthPct) {
+              card.appendChild(el("div", "mql-pw-reason", "⚠ band \u00b1" + Wp + "% ≠ plan \u00b1" + plan.widthPct + "% — range likely reset before you signed (Auto-Fill trap). Brackets shown are the PLAN's; judge fills accordingly."));
+            }
+            if (plan.stopPrice > 0) {
+              var curP = state.apiPos && state.apiPos.poolActivePrice;
+              var broken = curP != null && isFinite(curP) && curP < plan.stopPrice;
+              card.appendChild(el("div", broken ? "mql-pw-do" : "mql-pw-reason",
+                broken ? "⛔ PLAN STOP BROKEN — price under " + plan.stopPrice.toExponential(3) + ": thesis dead, exit regardless of PnL"
+                       : "plan stop " + plan.stopPrice.toExponential(3) + " ✓ price above"));
+            }
+          }
         } else {
           // band line relative to current price (no scalp brackets on a bag build)
           var bandTxt = "band ";
@@ -1030,7 +1057,21 @@
       (rec.steps || []).forEach(function (s) { recWrap.appendChild(el("div", "mql-rec-step", "• " + s)); });
       if (rec.params && rec.action !== "WAIT") {
         var applyBtn = el("button", "mql-apply", "⚡ Apply setup to form");
-        applyBtn.addEventListener("click", function () { applySetup(rec.params, applyBtn); });
+        applyBtn.addEventListener("click", function () {
+          applySetup(rec.params, applyBtn);
+          // journal the ENTRY PLAN so Position Watch honors the class brackets
+          // (BASING +20/-15 + stop, etc.) instead of re-deriving generic width-math
+          if (rec.plan && state.pool) {
+            try {
+              chrome.storage.local.get({ mqlEntryPlan: {} }, safe(function (jr) {
+                var plans = jr.mqlEntryPlan || {};
+                plans[state.pool] = Object.assign({}, rec.plan, { pool: state.pool, ts: Date.now() });
+                chrome.storage.local.set({ mqlEntryPlan: plans });
+                state.entryPlan = plans[state.pool];
+              }));
+            } catch (e) {}
+          }
+        });
         recWrap.appendChild(applyBtn);
       }
       // discretionary override on WAIT: 2-step confirm + journal
@@ -1480,6 +1521,7 @@
       mountAll();
       startPolling();
       comboResume();
+      loadEntryPlan();
     }
   });
 
@@ -1528,6 +1570,7 @@
       mountAll();
       startPolling();
       comboResume();
+      loadEntryPlan();
     }
   });
 
