@@ -8,11 +8,13 @@ math the stock UI hides and warns you about range-reset foot-guns.
 
 ## Install (Load Unpacked)
 
-1. Clone/download this folder (`meteora-lens/`).
-2. Open `chrome://extensions`.
+1. Clone or download this repo (green **Code** button → *Download ZIP* → unzip).
+2. Open `chrome://extensions` in Chrome.
 3. Toggle **Developer mode** on (top-right).
-4. Click **Load unpacked** and select the `meteora-lens/` folder.
+4. Click **Load unpacked** and select the cloned/unzipped repo folder (the one
+   containing `manifest.json`).
 5. Open any DLMM pool page, e.g. `https://www.meteora.ag/dlmm/<poolAddress>`.
+   If a Meteora tab was already open, refresh it once.
 
 ## Configure
 
@@ -25,8 +27,33 @@ Open the extension **Options** page (via `chrome://extensions` → *Details* →
   verdict reads `no Jupiter key (set in options)`.
 - **Default range width W (%)** — used for the edge / breakeven math when the
   pool page's range width can't be read. Default `20`.
+- **Wallet address** (public address only, never a key) — required for
+  **Position Watch**: lets the extension read your open positions via Meteora's
+  API, so positions entered from ANY device (including mobile) show up and get
+  managed. Without it you only get entry-side signals — no exit-side coverage.
+- **Discord webhook URL** — optional but recommended: remote alerts for your
+  positions (TP/SL/stop, out-of-range, fee-decay, flow-flip, fill milestones)
+  and — if the toggle is on — board-wide **radar signal** pings.
 
 Meteora's data API needs no auth.
+
+## Entry signal vs exit signal (read this once)
+
+The HUD verdict (IGNITION/BASING/CARRY/SQUEEZE vs NO ENTRY) is an **entry filter
+for new capital only**. It re-evaluates live data continuously and will flicker
+around its thresholds — a pool showing a valid entry, then "no edge" 5 minutes
+later, is normal noise, **not** a signal to exit a position you already opened.
+
+Open positions are managed by **POSITION WATCH** (the HOLD/WATCH/TIGHTEN/EXIT
+card + Discord alerts), which is anchored to *your entry*: fee-decay vs your
+entry baseline (2 consecutive reads), flow-flip, TP/SL brackets, structural
+stop, out-of-range. Exit when THAT layer says exit — not when the entry light
+blinks off.
+
+When you enter via **⚡ Apply**, the recipe's class brackets + stop are journaled
+per pool (`entry plan`) and Position Watch enforces those exact numbers — what
+you entered on is what you're managed by. It also warns if your actual position
+band differs materially from the plan width (the Auto-Fill range-reset trap).
 
 ## What each element means
 
@@ -75,6 +102,6 @@ verify every number on-chain before committing funds.
 The popular "dip-catcher" build: a deep single-sided SOL band below price (0 → -60..-75%), created as **two legs in the same range** — a Bid-Ask base (~70%, bottom-weighted so you buy more the deeper it dips) + a Spot layer (~30%, uniform so shallow dips still fill and earn).
 
 - **HUD block** (🪣 ACCUM COMBO): appears only when the hard gates pass — mint+freeze burned, top10 ≤ 35%, organic buyers present, volume persisting (1h fee rate ≥ 50% of 24h, 24h ≥ 8%/day), and not a dying knife (FREEFALL with organic sellers ≥ 1.43:1 is blocked). Depth is σ-scaled (σ≥150 → -75%, σ≤80 → -60%, ATH/drawdown-nudged); the Bid-Ask share scales with σ and flow (clamped 60–80%). All thresholds are structured priors pending calibration.
-- **⚡ Apply Combo**: guided two-leg flow with a step banner — fills Bid-Ask + range + SOL amount for leg 1, waits for your signature (auto-detects the new position via the saved-wallet API, or use the ✓ button), then re-fills the form for the Spot layer. State survives page reloads; ✕ aborts anytime. The extension never signs anything.
+- **⚡ Apply Combo**: guided two-leg flow producing ONE position — leg 1 fills the create form (Bid-Ask + range + SOL amount), waits for your signature (auto-detected via the saved-wallet API, or use the ✓ button), then leg 2 opens that position's **Add Liquidity** panel, selects Spot, and fills the remaining SOL — the spot layer lands in the SAME position (range locked to leg 1's bins). Completion detected via your total deposits growing. State survives page reloads; ✕ aborts anytime. The extension never signs anything.
 - **Position Watch**: multiple positions in one pool render as a single **COMBO ×N** card (aggregate PnL, combined band, per-leg lines). Accumulation books get their own rulebook — no scalp TP/SL; verdicts are HOLD (filling, volume alive) / WATCH (fee trend softening) / EXIT (fee-decay AND flow-flip — the token is dying while you accumulate). A fill bar tracks how much of the band has converted from SOL into the token.
 - **Discord alerts** (accum-flavored): band 25/50/75% filled, FULLY FILLED (decide: hold or cut), popped above band (100% SOL + fees banked), and the dying-token alerts.
