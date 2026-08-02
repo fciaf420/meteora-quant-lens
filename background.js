@@ -1018,12 +1018,35 @@ async function watchPositions() {
       const bl = { mqlPosBaseline: posBaseAll };
       for (const k of closed) {
         const rec = lp[k];
+        // TRUE realized PnL from on-chain events (indexed in seconds, unlike the
+        // closed-pnl rollup which lags): removes + fee claims - adds, in USD.
+        // lastSeen kept as fallback (watcher's final 1-min-tick observation).
+        let realizedPnlUsd = null, realizedPnlPct = null, feesUsd = null;
+        try {
+          const posAddr = k.split(':')[1];
+          if (posAddr) {
+            const hev = await fetchJson(DATAPI + '/positions/' + posAddr + '/historical?page_size=100');
+            const evs = (hev.ok && hev.json && hev.json.events) || [];
+            if (evs.length) {
+              const su = { add: 0, remove: 0, claim_fee: 0 };
+              for (const ev of evs) { if (su[ev.eventType] != null) su[ev.eventType] += Number(ev.totalUsd || 0); }
+              if (su.add > 0) {
+                realizedPnlUsd = Math.round((su.remove + su.claim_fee - su.add) * 100) / 100;
+                realizedPnlPct = Math.round((su.remove + su.claim_fee - su.add) / su.add * 10000) / 100;
+                feesUsd = Math.round(su.claim_fee * 100) / 100;
+              }
+            }
+          }
+        } catch (e) { /* fall back to last-seen */ }
         logArr.push({ pool: rec.pool, name: rec.name, lastSeenPnlPct: rec.pnl,
+          realizedPnlPct, realizedPnlUsd, feesUsd,
           openedFirstSeen: rec.firstSeen, closedDetected: Date.now(),
           holdMinutes: Math.round((Date.now() - rec.firstSeen) / 60e3) });
         delete lp[k];
         if (bl.mqlPosBaseline && bl.mqlPosBaseline[rec.pool]) delete bl.mqlPosBaseline[rec.pool];
-        await postDiscord(cfg.webhookUrl, '**Meteora Lens** \u00b7 \ud83d\udccb Position closed: ' + rec.name + ' \u2014 last seen PnL ' + (rec.pnl >= 0 ? '+' : '') + rec.pnl.toFixed(1) + '% after ~' + Math.round((Date.now() - rec.firstSeen) / 60e3) + 'min. Journaled.');
+        const pnlShow = (realizedPnlPct != null) ? realizedPnlPct : rec.pnl;
+        const pnlTag = (realizedPnlPct != null) ? 'realized' : 'last seen';
+        await postDiscord(cfg.webhookUrl, '**Meteora Lens** \u00b7 \ud83d\udccb Position closed: ' + rec.name + ' \u2014 ' + pnlTag + ' PnL ' + (pnlShow >= 0 ? '+' : '') + pnlShow.toFixed(1) + '%' + (realizedPnlUsd != null ? ' ($' + (realizedPnlUsd >= 0 ? '+' : '') + realizedPnlUsd.toFixed(2) + (feesUsd ? ', fees $' + feesUsd.toFixed(2) : '') + ')' : '') + ' after ~' + Math.round((Date.now() - rec.firstSeen) / 60e3) + 'min. Journaled.');
       }
       await chrome.storage.local.set({ mqlTradeLog: logArr.slice(-200), mqlPosBaseline: bl.mqlPosBaseline || {} });
     }

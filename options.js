@@ -70,15 +70,19 @@ function loadJournal() {
       jrRaw = { log, ovr };
       const closes = log.filter((x) => x.closedDetected != null).slice().reverse();
       const opens = log.filter((x) => x.type === 'COMBO_OPEN').slice().reverse();
-      const pnls = closes.map((x) => Number(x.lastSeenPnlPct)).filter(isFinite);
+      const bestPnl = (x) => Number(x.realizedPnlPct != null ? x.realizedPnlPct : x.lastSeenPnlPct);
+      const pnls = closes.map(bestPnl).filter(isFinite);
       const wins = pnls.filter((p) => p > 0).length;
       const sum = pnls.reduce((a, b) => a + b, 0);
       $('jrStats').textContent = pnls.length
-        ? (pnls.length + ' round trips · ' + wins + 'W/' + (pnls.length - wins) + 'L (' + Math.round(wins / pnls.length * 100) + '%) · avg ' + (sum / pnls.length).toFixed(1) + '% · sum ' + sum.toFixed(1) + '% · PnL is last-seen %, not SOL-weighted')
+        ? (pnls.length + ' round trips · ' + wins + 'W/' + (pnls.length - wins) + 'L (' + Math.round(wins / pnls.length * 100) + '%) · avg ' + (sum / pnls.length).toFixed(1) + '% · sum ' + sum.toFixed(1) + '% · realized (on-chain events) where available, else last-seen')
         : 'No round trips journaled yet. Closes are detected by Position Watch (wallet address required).';
       for (const x of closes.slice(0, 50)) {
-        const pnl = Number(x.lastSeenPnlPct);
-        const tr = row($('jrCloses'), [fmtTs(x.closedDetected), poolLink(x.pool, x.name), (isFinite(pnl) ? (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%' : '—'), (x.holdMinutes != null ? (x.holdMinutes >= 90 ? (x.holdMinutes / 60).toFixed(1) + 'h' : x.holdMinutes + 'm') : '—')]);
+        const pnl = bestPnl(x);
+        let pnlTxt = isFinite(pnl) ? (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%' : '—';
+        if (x.realizedPnlUsd != null) pnlTxt += ' ($' + (x.realizedPnlUsd >= 0 ? '+' : '') + Number(x.realizedPnlUsd).toFixed(2) + ')';
+        else if (isFinite(pnl)) pnlTxt += ' (last seen)';
+        const tr = row($('jrCloses'), [fmtTs(x.closedDetected), poolLink(x.pool, x.name), pnlTxt, (x.holdMinutes != null ? (x.holdMinutes >= 90 ? (x.holdMinutes / 60).toFixed(1) + 'h' : x.holdMinutes + 'm') : '—')]);
         if (isFinite(pnl)) tr.children[2].className = pnl >= 0 ? 'jr-pos' : 'jr-neg';
       }
       for (const x of opens.slice(0, 30)) {
@@ -92,12 +96,12 @@ function loadJournal() {
 }
 function exportCsv() {
   const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-  const lines = ['kind,ts,pool,name,pnlPct,holdMinutes,totalSol,depth,share,cls,edge,sigma,feeRate1h,ignoredGates'];
+  const lines = ['kind,ts,pool,name,pnlPct,realizedPnlPct,realizedPnlUsd,feesUsd,holdMinutes,totalSol,depth,share,cls,edge,sigma,feeRate1h,ignoredGates'];
   for (const x of jrRaw.log) {
-    if (x.closedDetected != null) lines.push(['close', new Date(x.closedDetected).toISOString(), x.pool, x.name, x.lastSeenPnlPct, x.holdMinutes, '', '', '', '', '', '', '', ''].map(esc).join(','));
-    else if (x.type === 'COMBO_OPEN') lines.push(['combo_open', new Date(x.finishedAt || x.startedAt).toISOString(), x.pool, '', '', '', x.totalSol, x.depth, x.share, '', '', '', '', ''].map(esc).join(','));
+    if (x.closedDetected != null) lines.push(['close', new Date(x.closedDetected).toISOString(), x.pool, x.name, x.lastSeenPnlPct, x.realizedPnlPct, x.realizedPnlUsd, x.feesUsd, x.holdMinutes, '', '', '', '', '', '', '', ''].map(esc).join(','));
+    else if (x.type === 'COMBO_OPEN') lines.push(['combo_open', new Date(x.finishedAt || x.startedAt).toISOString(), x.pool, '', '', '', '', '', '', x.totalSol, x.depth, x.share, '', '', '', '', ''].map(esc).join(','));
   }
-  for (const x of jrRaw.ovr) lines.push(['override', new Date(x.ts).toISOString(), x.pool, '', '', '', '', '', '', x.cls, x.edge, x.sigma, x.feeRate1h, (x.ignoredGates || []).join('|')].map(esc).join(','));
+  for (const x of jrRaw.ovr) lines.push(['override', new Date(x.ts).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', x.cls, x.edge, x.sigma, x.feeRate1h, (x.ignoredGates || []).join('|')].map(esc).join(','));
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
