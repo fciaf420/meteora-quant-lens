@@ -92,6 +92,18 @@ button {
 
 button:hover { filter: brightness(1.1); }
 
+.journal { margin-top: 28px; border-top: 1px solid #2a2f3a; padding-top: 18px; }
+.journal h2 { font-size: 16px; margin: 0 0 6px; }
+.journal h3 { font-size: 12px; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
+.jr-stats { font-size: 12px; opacity: .85; margin-bottom: 8px; }
+.jr-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.jr-table th, .jr-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #232833; }
+.jr-table th { opacity: .6; font-weight: 600; }
+.jr-table a { color: #7ab7ff; text-decoration: none; }
+.jr-table a:hover { text-decoration: underline; }
+.jr-pos { color: #4ade80; }
+.jr-neg { color: #f87171; }
+
 .toast {
   font-size: 12px;
   color: #4ade80;

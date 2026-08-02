@@ -49,6 +49,17 @@
         <span id="toast" class="toast" role="status" aria-live="polite"></span>
       </div>
     </form>
+    <section class="journal" id="journalSec">
+      <h2>Trade Journal</h2>
+      <div id="jrStats" class="jr-stats"></div>
+      <h3>Round trips (closes)</h3>
+      <table class="jr-table" id="jrCloses"><thead><tr><th>closed</th><th>pool</th><th>PnL</th><th>hold</th></tr></thead><tbody></tbody></table>
+      <h3>Combo opens</h3>
+      <table class="jr-table" id="jrOpens"><thead><tr><th>opened</th><th>pool</th><th>SOL</th><th>depth</th><th>bid-ask share</th></tr></thead><tbody></tbody></table>
+      <h3>Discretionary overrides (entered on WAIT)</h3>
+      <table class="jr-table" id="jrOverrides"><thead><tr><th>when</th><th>pool</th><th>class</th><th>edge</th><th>σ</th><th>fee%/d</th><th>gates ignored</th></tr></thead><tbody></tbody></table>
+      <div class="actions"><button id="jrExport" type="button">Export CSV</button></div>
+    </section>
   </main>
   <script src="options.js"></script>
 </body>
