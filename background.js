@@ -797,6 +797,8 @@ async function watchPositions() {
       const name = (pd && pd.ok) ? pd.pool.name : pool.slice(0, 8);
       const ofi1h = (pd && pd.ok) ? pd.ofi1h : null;
       const pc1h = (pd && pd.ok) ? pd.pc1h : null;
+      const surgeV = (pd && pd.ok) ? pd.surge : null;
+      const pathV = (pd && pd.ok) ? pd.path : null;
       const poolFill = { sum: 0, n: 0 };   // aggregate fill across accumulation legs (COMBO-aware)
       for (const pos of pr.json.positions) {
         const key = pool + ':' + (pos.positionAddress || '');
@@ -829,6 +831,10 @@ async function watchPositions() {
         cond.NEAR_SL = !cond.HIT_SL && pnl <= -0.8 * sl;
         cond.DECAY = belowCount >= 2;  // fee engine died: 1h rate < 50% of entry, two reads
         cond.FLOW = ofi1h != null && ofi1h > 3 && pc1h != null && pc1h < -15;  // organic distribution
+        // parity with the HUD card: FREEFALL = EXIT verdict; TIGHTEN = fee-harvest nudge
+        cond.FREEFALL = pathV === 'FREEFALL';
+        cond.TIGHTEN = W < 30 && surgeV != null && surgeV < 1.05 && ofi1h != null && ofi1h > 2.5
+          && !cond.DECAY && !cond.FLOW && !cond.FREEFALL && !cond.HIT_SL && !cond.NEAR_SL && !cond.OOR_DOWN && !cond.OOR_UP;
         const msgs = {
           OOR_DOWN: '🔻 OUT OF RANGE (below): ' + name + ' — price ' + cur.toExponential(3) + ' under your band. Holding 100% token, earning nothing. PnL ' + pnl.toFixed(1) + '%',
           OOR_UP: '🔺 OUT OF RANGE (above): ' + name + ' — fully converted to quote. PnL ' + pnl.toFixed(1) + '%. Consider closing to lock + stop rent.',
@@ -838,7 +844,9 @@ async function watchPositions() {
           NEAR_SL: '⚠️ Approaching SL: ' + name + ' at ' + pnl.toFixed(1) + '% vs -' + sl + '% stop.',
           DECAY: '📉 FEE ENGINE DYING: ' + name + ' — 1h fee rate ' + feeRate.toFixed(1) + '%/d, ~' + Math.round((1 - feeRate / entryFeeRate) * 100) + '% below your entry (' + entryFeeRate.toFixed(1) + '%/d). The fees WERE the trade — exit even if price looks fine. PnL ' + pnl.toFixed(1) + '%',
           PLAN_STOP: '⛔ PLAN STOP BROKEN: ' + name + ' — price ' + cur.toExponential(3) + ' fell below your ' + (plan && plan.cls ? plan.cls : '') + ' stop ' + (plan && plan.stopPrice ? plan.stopPrice.toExponential(3) : '') + '. Thesis dead — exit regardless of PnL (' + pnl.toFixed(1) + '%).',
-          FLOW: '🩸 DISTRIBUTION: ' + name + ' — organic sellers ' + (ofi1h != null ? ofi1h.toFixed(1) : '?') + ':1 while price ' + (pc1h != null ? pc1h.toFixed(1) : '?') + '%/1h. Real wallets are exiting through you. Cut it. PnL ' + pnl.toFixed(1) + '%'
+          FLOW: '🩸 DISTRIBUTION: ' + name + ' — organic sellers ' + (ofi1h != null ? ofi1h.toFixed(1) : '?') + ':1 while price ' + (pc1h != null ? pc1h.toFixed(1) : '?') + '%/1h. Real wallets are exiting through you. Cut it. PnL ' + pnl.toFixed(1) + '%',
+          FREEFALL: '🔪 FREEFALL: ' + name + ' — price is actively dumping; your bins are converting into the falling token. HUD verdict: EXIT. PnL ' + pnl.toFixed(1) + '%',
+          TIGHTEN: '🧰 TIGHTEN: ' + name + ' — vol premium dead (surge ' + (surgeV != null ? surgeV.toFixed(2) : '?') + 'x) + sell-skewed organic flow (' + (ofi1h != null ? ofi1h.toFixed(1) : '?') + ':1). Claim accrued fees NOW and consider pulling partial size — keep a runner. PnL ' + pnl.toFixed(1) + '%'
         };
         // ---- ACCUMULATION profile: own rulebook (priors pending calibration) ----
         // detected once at first sight (band at/below price) and persisted; scalp
@@ -849,6 +857,7 @@ async function watchPositions() {
         st.mqlLastPos[key].accum = isAccum;
         if (isAccum) {
           delete cond.HIT_TP; delete cond.NEAR_TP; delete cond.HIT_SL; delete cond.NEAR_SL;
+          delete cond.TIGHTEN; delete cond.FREEFALL;  // accum: freefall is the design; scalp nudges don't apply
           cond.FULLY_FILLED = cond.OOR_DOWN; delete cond.OOR_DOWN;
           msgs.FULLY_FILLED = '🪣 FULLY FILLED: ' + name + ' — price fell through the whole accumulation band. You are 100% token now. Decide: hold the bag you built, or cut. PnL ' + pnl.toFixed(1) + '%';
           msgs.OOR_UP = '🟢 POPPED ABOVE BAND: ' + name + ' — price rose above your accumulation range: 100% SOL with fees banked. Re-arm lower if you still want the bag. PnL ' + pnl.toFixed(1) + '%';
