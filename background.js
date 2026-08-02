@@ -992,13 +992,16 @@ async function watchPositions() {
   // re-anchor entryFeeRate at the current (possibly already-decayed) rate.
   try {
     const lp = st.mqlLastPos || {};
+    const inPortfolio = new Set(pools);
     const processed = new Set(pools.slice(0, 6));
     const closed = [];
     for (const k of Object.keys(lp)) {
       if (seen[k]) { if (lp[k]) lp[k].miss = 0; continue; }
       const rec = lp[k];
       const poolOfK = (rec && rec.pool) || k.split(':')[0];
-      if (failedPools.has(poolOfK) || !processed.has(poolOfK)) continue;
+      if (failedPools.has(poolOfK)) continue;                       // API error: unknown
+      if (inPortfolio.has(poolOfK) && !processed.has(poolOfK)) continue;  // truncated (>6 pools): unknown
+      // pool absent from a SUCCESSFUL portfolio response = positively gone -> count it
       rec.miss = (rec.miss || 0) + 1;
       if (rec.miss >= 3) closed.push(k);
     }
