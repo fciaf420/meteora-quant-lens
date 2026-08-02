@@ -83,16 +83,49 @@
     } catch (e) { return null; }
   }
 
+  // When the extension is reloaded/updated, this (now-orphaned) content script's
+  // chrome.* APIs die permanently — retrying can never succeed; only a page
+  // refresh reconnects. Detect it once, stop all polling, prompt to refresh.
+  var ctxDead = false;
+  function markCtxDead() {
+    if (ctxDead) return;
+    ctxDead = true;
+    try { stopPolling(); } catch (e) {}
+    try { if (comboFlow && comboFlow.timer) { clearInterval(comboFlow.timer); comboFlow.timer = null; } } catch (e) {}
+    try { renderDeadPrompt(); } catch (e) {}
+  }
+  function renderDeadPrompt() {
+    var hud = document.getElementById("mql-hud");
+    if (!hud) return;
+    hud.innerHTML = "";
+    var row = document.createElement("div");
+    row.className = "mql-row";
+    row.textContent = "\u26a1 Lens was updated \u2014 refresh this page to reconnect.";
+    hud.appendChild(row);
+    var btn = document.createElement("button");
+    btn.className = "mql-refresh";
+    btn.type = "button";
+    btn.textContent = "\u21bb refresh page";
+    btn.addEventListener("click", function () { location.reload(); });
+    hud.appendChild(btn);
+  }
+  function isCtxDeadError(m) { return /context invalidated/i.test(String(m || "")); }
   function sendMessage(msg) {
     return new Promise(function (resolve) {
+      if (ctxDead) { resolve({ ok: false, error: "extension updated \u2014 refresh page" }); return; }
       try {
         chrome.runtime.sendMessage(msg, function (resp) {
           // swallow "message port closed" / context invalidated errors
           var err = chrome.runtime && chrome.runtime.lastError;
-          if (err) { resolve({ ok: false, error: err.message }); return; }
+          if (err) {
+            if (isCtxDeadError(err.message)) markCtxDead();
+            resolve({ ok: false, error: err.message });
+            return;
+          }
           resolve(resp || { ok: false, error: "no response" });
         });
       } catch (e) {
+        if (isCtxDeadError(e && e.message)) markCtxDead();
         resolve({ ok: false, error: e && e.message });
       }
     });
@@ -102,6 +135,7 @@
   // DATA FETCH + POLLING
   // ========================================================================
   var fetchData = safe(function fetchData() {
+    if (ctxDead) return;
     if (!state.pool || state.fetching) return;
     if (document.visibilityState !== "visible") return;
     state.fetching = true;
@@ -119,7 +153,7 @@
         })(12);
         renderFeeBadge();
         renderGuard(); // guard uses feeRate for the breakeven-vs-pays line context
-      } else {
+      } else if (!ctxDead) {
         renderHUDError(resp && resp.error);
       }
     }));
@@ -574,7 +608,7 @@
     "verdict": "The bottom line. The Lens tests this pool against three entry playbooks (SCALP / REVERSION / CARRY). NO ENTRY means none of them clear their bars \u2014 whatever the APR looks like.",
     "edge": "THE core number. LPing = selling insurance: fees are your premium, impermanent loss is the claims you pay when price moves. Edge = fees \u00f7 expected IL (with a 30% safety margin). Above 1.0 = you're being overpaid for the risk. Below 1 = the pool is farming YOU.",
     "fee": "The truth about yield. The site's 24h number is backward-looking; the 1h rate is what the pool pays RIGHT NOW, annualized to %/day. \u25b2 HEATING = accelerating. \u25bc COOLING = the party already happened.",
-    "sigma": "Realized volatility, %/day \u2014 how violently this token actually moves (measured from 5m/1h/24h price changes, \u221at-scaled). High \u03c3 means high IL risk: the same fees buy you much less safety.",
+    "sigma": "Realized volatility, %/day \u2014 EWMA over the last ~4h of 5m closes. A trailing ~ means the token is too fresh for candle data (<30 min): the number is the legacy single-print estimate, typically inflated on launches \u2014 trust it less. High \u03c3 means high IL risk: the same fees buy you much less safety.",
     "surge": "DLMM raises fees automatically during volatility (the accumulator). Surge = current dynamic fee \u00f7 base fee. \u22651.25x = the premium is elevated \u2014 the best moments to provide liquidity. ~0 = premium fully decayed.",
     "accel": "Volume acceleration: last-30-min pace vs last-4h pace. \u22651.2x = flow is building (a catalyst). Below 1 = activity fading \u2014 you'd be arriving after the party.",
     "flow": "Organic Flow Imbalance from Jupiter: real-wallet sells \u00f7 buys (bots filtered out). Over 2 = genuine holders are DISTRIBUTING \u2014 entering means buying their exit. Under 0.5 = organic accumulation. Shown for 1h / 6h windows.",
@@ -667,6 +701,7 @@
   });
 
   function pollMyPosition() {
+    if (ctxDead) return;
     try {
       chrome.runtime.sendMessage({ type: "getMyPosition", pool: state.pool }, function (r) {
         if (chrome.runtime.lastError) return;
@@ -928,13 +963,14 @@
     bar.appendChild(ago);
   });
   function pollRadar() {
+    if (ctxDead) return;
     if (document.visibilityState !== "visible") return;
     try {
       chrome.runtime.sendMessage({ type: "getRadar" }, function (r) {
         if (chrome.runtime.lastError) return;
         renderRadar(r);
       });
-    } catch (e) {}
+    } catch (e) { if (isCtxDeadError(e && e.message)) markCtxDead(); }
   }
   setInterval(safe(pollRadar), 180e3);
   setTimeout(safe(pollRadar), 4000);
@@ -1002,7 +1038,7 @@
 
     // sigma / surge / accel
     var grid = el("div", "mql-grid3");
-    grid.appendChild(metricCell("σ", fmtPct(d.sigma, 1) + "/d", "mql-neutral"));
+    grid.appendChild(metricCell("σ", fmtPct(d.sigma, 1) + "/d" + (d.sigmaSource === "legacy" ? " ~" : ""), "mql-neutral"));
     grid.appendChild(metricCell("Surge", fmtNum(d.surge, 2) + "x",
       (d.surge != null && d.surge >= 1.25) ? "mql-good" : "mql-neutral"));
     grid.appendChild(metricCell("Accel", fmtNum(d.accel, 2) + "x",
