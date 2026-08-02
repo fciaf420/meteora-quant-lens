@@ -546,12 +546,13 @@ async function buildPoolData(address, settings) {
     const arrE = HE[histKeyE] || [];
     const lastE = arrE[arrE.length - 1];
     if (!lastE || Date.now() - lastE.ts > 50e3) {
-      arrE.push({ ts: Date.now(), sigma: Math.round(sigmaRaw * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100 });
+      arrE.push({ ts: Date.now(), sigma: Math.round(sigmaRaw * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100, src: (rvSigma != null ? 'rv' : 'lg') });
       HE[histKeyE] = arrE.slice(-60);
       for (const k of Object.keys(HE)) { const a = HE[k]; if (!a.length || Date.now() - a[a.length - 1].ts > 24 * 3600e3) delete HE[k]; }
       await chrome.storage.local.set({ mqlHistory: HE });
     }
-    const recentE = arrE.slice(-3)
+    const srcE = (rvSigma != null ? 'rv' : 'lg');
+    const recentE = arrE.filter((x) => x.src === srcE).slice(-3)
       .filter((x) => Date.now() - x.ts <= 10 * 60e3)
       .map((x) => x.sigma).filter((x) => x > 0)
       .sort((a, b) => a - b);
@@ -589,24 +590,30 @@ async function buildPoolData(address, settings) {
     const arr = H[histKey] || [];
     const last = arr[arr.length - 1];
     if (!last || Date.now() - last.ts > 50e3) {
-      arr.push({ ts: Date.now(), sigma: Math.round(sigmaRaw * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100 });
+      arr.push({ ts: Date.now(), sigma: Math.round(sigmaRaw * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100, src: (rvSigma != null ? 'rv' : 'lg') });
       H[histKey] = arr.slice(-60);
       // prune stale pools
       for (const k of Object.keys(H)) { const a = H[k]; if (!a.length || Date.now() - a[a.length-1].ts > 24*3600e3) delete H[k]; }
       chrome.storage.local.set({ mqlHistory: H });
     }
-    const prior = arr.slice(0, -1).map((x) => x.sigma).filter((x) => x > 0);
-    const spanMin = arr.length >= 2 ? (arr[arr.length-1].ts - arr[0].ts) / 60e3 : 0;
+    // CONTAMINATION GUARD: ratios only within same-source entries. When the sigma
+    // model changed (legacy -> rv5m), the level shift read as a ~50% "compression"
+    // and fired false SQUEEZEs board-wide (caught live 2026-08-02: CATE alert at
+    // edge 0.16). After a model change the detector must re-accumulate 6+ readings.
+    const curSrc = (rvSigma != null ? 'rv' : 'lg');
+    const sameSrc = arr.filter((x) => x.src === curSrc);
+    const prior = sameSrc.slice(0, -1).map((x) => x.sigma).filter((x) => x > 0);
+    const spanMin = sameSrc.length >= 2 ? (sameSrc[sameSrc.length-1].ts - sameSrc[0].ts) / 60e3 : 0;
     if (prior.length >= 6 && spanMin >= 45) {
       const srt = [...prior].sort((a, b) => a - b);
       sigmaTrail = srt[Math.floor(srt.length / 2)];
-      // SMOOTHED current sigma: median of last 3 readings (kills single-blip flapping on calm coins)
-      const recent = arr.slice(-3).map((x) => x.sigma).sort((a, b) => a - b);
+      // SMOOTHED current sigma: median of last 3 same-source readings
+      const recent = sameSrc.slice(-3).map((x) => x.sigma).sort((a, b) => a - b);
       const sigmaNow = recent[Math.floor(recent.length / 2)];
       sigmaRatio = sigmaNow / Math.max(sigmaTrail, 0.001);
-      // persistence: store ratio on the latest entry; squeeze needs 2 consecutive compressed evaluations
-      arr[arr.length - 1].ratio = Math.round(sigmaRatio * 100) / 100;
-      const prevRatio = arr.length >= 2 ? arr[arr.length - 2].ratio : null;
+      // persistence: store ratio on the latest same-source entry; squeeze needs 2 consecutive
+      sameSrc[sameSrc.length - 1].ratio = Math.round(sigmaRatio * 100) / 100;
+      const prevRatio = sameSrc.length >= 2 ? sameSrc[sameSrc.length - 2].ratio : null;
       sigmaRatioPersisted = (sigmaRatio <= 0.6 && prevRatio != null && prevRatio <= 0.6);
       chrome.storage.local.set({ mqlHistory: (typeof H !== 'undefined' ? H : undefined) || undefined });
     }
