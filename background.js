@@ -110,10 +110,14 @@ async function fetchPoolRaw(address) {
 }
 
 async function fetchOhlcvRaw(address) {
-  // 5m candles over the last 24h in ONE call: realized vol from recent closes
-  // + day high/low structure (replaces the old single daily-candle read)
+  // datapi caps the 5m range at ~8h (a 24h/5m request 400s "time range too large"),
+  // so: 6h of 5m candles for realized vol + 24h of 1h candles for day structure, in parallel
   const nowSec = Math.floor(Date.now() / 1000);
-  return fetchJson(DATAPI + '/pools/' + encodeURIComponent(address) + '/ohlcv?timeframe=5m&start_time=' + (nowSec - 86400) + '&end_time=' + nowSec);
+  const [rv, day] = await Promise.all([
+    fetchJson(DATAPI + '/pools/' + encodeURIComponent(address) + '/ohlcv?timeframe=5m&start_time=' + (nowSec - 6 * 3600) + '&end_time=' + nowSec),
+    fetchJson(DATAPI + '/pools/' + encodeURIComponent(address) + '/ohlcv?timeframe=1h&start_time=' + (nowSec - 86400) + '&end_time=' + nowSec)
+  ]);
+  return { ok: !!((rv && rv.ok) || (day && day.ok)), rv, day };
 }
 
 // EWMA realized vol from 5m closes, annualized to %/day.
@@ -444,29 +448,31 @@ async function buildPoolData(address, settings) {
   try {
     const ohResp = await fetchOhlcvRaw(address);
     if (ohResp.ok) {
-      const oj = ohResp.json;
-      let candles = null;
-      if (Array.isArray(oj)) candles = oj;
-      else if (oj && Array.isArray(oj.data)) candles = oj.data;
-      else if (oj && Array.isArray(oj.candles)) candles = oj.candles;
-      if (candles && candles.length) {
-        // day structure aggregated from the 5m series (same semantics as the old daily candle)
-        let hi = -Infinity, lo = Infinity;
-        for (const c of candles) {
-          const h = num(pick(c, 'high', 'h', 'High'), NaN);
-          const l = num(pick(c, 'low', 'l', 'Low'), NaN);
-          if (isFinite(h) && h > hi) hi = h;
-          if (isFinite(l) && l > 0 && l < lo) lo = l;
-        }
-        const close = num(pick(candles[candles.length - 1], 'close', 'c', 'Close'), NaN);
-        if (isFinite(hi) && isFinite(close) && hi > 0) ddHigh = (hi - close) / hi * 100;
-        if (isFinite(hi) && isFinite(lo) && lo < Infinity && isFinite(close)) {
-          rangePos = (close - lo) / Math.max(hi - lo, 1e-9);
-        }
-        if (isFinite(lo) && lo < Infinity) dayLow = lo;
-        if (isFinite(close)) candleClose = close;
-        rvSigma = computeRealizedVol(candles);
+      const arrOf = (r) => {
+        const oj = r && r.ok ? r.json : null;
+        if (Array.isArray(oj)) return oj;
+        if (oj && Array.isArray(oj.data)) return oj.data;
+        if (oj && Array.isArray(oj.candles)) return oj.candles;
+        return [];
+      };
+      const rvC = arrOf(ohResp.rv), dayC = arrOf(ohResp.day);
+      // rolling-24h structure from the 1h candles
+      let hi = -Infinity, lo = Infinity;
+      for (const c of dayC) {
+        const h = num(pick(c, 'high', 'h', 'High'), NaN);
+        const l = num(pick(c, 'low', 'l', 'Low'), NaN);
+        if (isFinite(h) && h > hi) hi = h;
+        if (isFinite(l) && l > 0 && l < lo) lo = l;
       }
+      const closeSrc = rvC.length ? rvC : dayC;
+      const close = closeSrc.length ? num(pick(closeSrc[closeSrc.length - 1], 'close', 'c', 'Close'), NaN) : NaN;
+      if (isFinite(hi) && isFinite(close) && hi > 0) ddHigh = (hi - close) / hi * 100;
+      if (isFinite(hi) && isFinite(lo) && lo < Infinity && isFinite(close)) {
+        rangePos = (close - lo) / Math.max(hi - lo, 1e-9);
+      }
+      if (isFinite(lo) && lo < Infinity) dayLow = lo;
+      if (isFinite(close)) candleClose = close;
+      rvSigma = computeRealizedVol(rvC);
     }
   } catch (e) { /* keep nulls */ }
 
@@ -840,9 +846,15 @@ function summarizePositions(ps) {
 async function watchPositions() {
   const cfg = await chrome.storage.sync.get({ webhookUrl: '', walletAddress: '' });
   if (!cfg.webhookUrl || !cfg.walletAddress) return;
-  const st = await chrome.storage.local.get({ mqlAlertStates: {}, mqlEntryPlan: {} });
+  // NB: mqlLastPos/mqlPosBaseline MUST be loaded here — they were previously never
+  // read back, so every tick started with an empty snapshot: entry baselines reset to
+  // the current fee rate each minute (DECAY could never fire) and the close-journal
+  // never triggered. Found live 2026-08-02 when an 80% fee decay produced no ping.
+  const st = await chrome.storage.local.get({ mqlAlertStates: {}, mqlEntryPlan: {}, mqlLastPos: {}, mqlPosBaseline: {} });
   const states = st.mqlAlertStates || {};
   const plans = st.mqlEntryPlan || {};
+  const posBaseAll = st.mqlPosBaseline || {};
+  const failedPools = new Set();  // API errors this tick: position state UNKNOWN, not closed
   let port;
   try {
     const r = await fetchJson(DATAPI + '/portfolio/open?user=' + cfg.walletAddress.trim());
@@ -854,7 +866,7 @@ async function watchPositions() {
   for (const pool of pools.slice(0, 6)) {
     try {
       const pr = await fetchJson(DATAPI + '/positions/' + pool + '/pnl?user=' + cfg.walletAddress.trim() + '&status=open');
-      if (!pr.ok || !pr.json.positions) continue;
+      if (!pr.ok || !pr.json.positions) { failedPools.add(pool); continue; }
       const pd = await getPoolData(pool);
       const feeRate = (pd && pd.ok) ? pd.feeRate1h : 0;
       const name = (pd && pd.ok) ? pd.pool.name : pool.slice(0, 8);
@@ -869,11 +881,16 @@ async function watchPositions() {
         // rolling snapshot so a close (from ANY device) can be journaled with last-seen PnL
         if (!st.mqlLastPos) st.mqlLastPos = {};
         const prevSnap = st.mqlLastPos[key];
-        // Apply-time baseline (journaled in the entry plan) outranks first-seen:
-        // first-seen can catch a fee spike (premature DECAY) or a stale lull (DECAY never fires)
+        // Baseline preference: Apply-time (journaled) > HUD first-seen store > own
+        // rolling snapshot > current rate. Keeps HUD and background on ONE baseline.
         const planEarly = plans[pool] && (Date.now() - (plans[pool].ts || 0) < 7 * 86400e3) ? plans[pool] : null;
+        const hudBase = posBaseAll[pool];
         const entryFeeRate = (planEarly && planEarly.entryFeeRate > 0) ? planEarly.entryFeeRate
+          : (hudBase && hudBase.entryFeeRate > 0) ? hudBase.entryFeeRate
           : (prevSnap && prevSnap.entryFeeRate != null) ? prevSnap.entryFeeRate : feeRate;
+        if (!hudBase && feeRate > 0) {
+          posBaseAll[pool] = { entryFeeRate, sigma: (pd && pd.ok) ? pd.sigma : null, ts: Date.now() };
+        }
         let belowCount = (prevSnap && prevSnap.belowCount) || 0;
         if (entryFeeRate > 2 && feeRate < 0.5 * entryFeeRate) belowCount++; else belowCount = 0;
         st.mqlLastPos[key] = { pool, name, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
@@ -969,14 +986,26 @@ async function watchPositions() {
       }
     } catch (e) {}
   }
-  // detect closes (any device): journal round trip + clean up
+  // detect closes (any device): journal round trip + clean up.
+  // Guards: an API-failed pool is UNKNOWN (skip), and a close needs 3 consecutive
+  // confirmed-missing ticks — one flaky response must not delete the baseline and
+  // re-anchor entryFeeRate at the current (possibly already-decayed) rate.
   try {
     const lp = st.mqlLastPos || {};
-    const closed = Object.keys(lp).filter((k) => !seen[k]);
+    const processed = new Set(pools.slice(0, 6));
+    const closed = [];
+    for (const k of Object.keys(lp)) {
+      if (seen[k]) { if (lp[k]) lp[k].miss = 0; continue; }
+      const rec = lp[k];
+      const poolOfK = (rec && rec.pool) || k.split(':')[0];
+      if (failedPools.has(poolOfK) || !processed.has(poolOfK)) continue;
+      rec.miss = (rec.miss || 0) + 1;
+      if (rec.miss >= 3) closed.push(k);
+    }
     if (closed.length) {
       const jr = await chrome.storage.local.get({ mqlTradeLog: [] });
       const logArr = jr.mqlTradeLog || [];
-      const bl = await chrome.storage.local.get({ mqlPosBaseline: {} });
+      const bl = { mqlPosBaseline: posBaseAll };
       for (const k of closed) {
         const rec = lp[k];
         logArr.push({ pool: rec.pool, name: rec.name, lastSeenPnlPct: rec.pnl,
@@ -1001,7 +1030,7 @@ async function watchPositions() {
   } catch (e) {}
   // prune states for positions no longer open
   for (const k of Object.keys(states)) { const base = k.split(':').slice(0, 2).join(':'); if (!seen[base]) delete states[k]; }
-  await chrome.storage.local.set({ mqlAlertStates: states, mqlLastPos: st.mqlLastPos || {} });
+  await chrome.storage.local.set({ mqlAlertStates: states, mqlLastPos: st.mqlLastPos || {}, mqlPosBaseline: posBaseAll });
 }
 
 // ---- RADAR ALERTS: ping Discord when a pool passes ALL gates (a 🔥 full signal) ----
