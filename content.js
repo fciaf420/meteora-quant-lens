@@ -702,6 +702,11 @@
         st.mqlPosBaseline[state.pool] = base;
         chrome.storage.local.set({ mqlPosBaseline: st.mqlPosBaseline });
       }
+      // Apply-time baseline outranks first-seen (parity with the background watcher)
+      if (state.entryPlan && state.entryPlan.pool === state.pool && state.entryPlan.entryFeeRate > 0 &&
+          Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3) {
+        base = Object.assign({}, base, { entryFeeRate: state.entryPlan.entryFeeRate });
+      }
       // real position width: parse the range prices from the position row (handles 0.0\u2084426-style subscripts)
       var Wp = (state.apiPos && state.apiPos.widthPct) ? state.apiPos.widthPct : 20;
       try {
@@ -1069,7 +1074,10 @@
             try {
               chrome.storage.local.get({ mqlEntryPlan: {} }, safe(function (jr) {
                 var plans = jr.mqlEntryPlan || {};
-                plans[state.pool] = Object.assign({}, rec.plan, { pool: state.pool, ts: Date.now() });
+                plans[state.pool] = Object.assign({}, rec.plan, { pool: state.pool, ts: Date.now(),
+                  // baseline at the moment you actually entered — Position Watch prefers
+                  // this over the first-seen snapshot (which can catch a spike or a lull)
+                  entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null });
                 chrome.storage.local.set({ mqlEntryPlan: plans });
                 state.entryPlan = plans[state.pool];
               }));

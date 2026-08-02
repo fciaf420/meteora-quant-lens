@@ -16,7 +16,22 @@ const CACHE_TTL_MS = 60 * 1000;
 const FETCH_TIMEOUT_MS = 8000;
 
 // per-pool cache: address -> { ts, data }
-const poolCache = new Map();
+const poolCache = new Map();  // L1: dies with the MV3 service worker (~30s idle)
+
+// L2 cache in chrome.storage.session: survives service-worker unloads. Without
+// it every 1-min alarm woke a COLD worker and refetched the whole board
+// (~25 API calls/min); the in-memory TTLs effectively never applied.
+async function sessionCacheGet(key, ttlMs) {
+  try {
+    const o = await chrome.storage.session.get(key);
+    const v = o && o[key];
+    if (v && Date.now() - v.ts < ttlMs) return v;
+  } catch (e) {}
+  return null;
+}
+function sessionCacheSet(key, data) {
+  try { chrome.storage.session.set({ [key]: { ts: Date.now(), data } }); } catch (e) {}
+}
 
 function num(v, dflt = 0) {
   const n = typeof v === 'string' ? parseFloat(v) : v;
@@ -95,7 +110,30 @@ async function fetchPoolRaw(address) {
 }
 
 async function fetchOhlcvRaw(address) {
-  return fetchJson(DATAPI + '/pools/' + encodeURIComponent(address) + '/ohlcv');
+  // 5m candles over the last 24h in ONE call: realized vol from recent closes
+  // + day high/low structure (replaces the old single daily-candle read)
+  const nowSec = Math.floor(Date.now() / 1000);
+  return fetchJson(DATAPI + '/pools/' + encodeURIComponent(address) + '/ohlcv?timeframe=5m&start_time=' + (nowSec - 86400) + '&end_time=' + nowSec);
+}
+
+// EWMA realized vol from 5m closes, annualized to %/day.
+// Replaces the legacy max(|5m|*17, ...) single-print estimator whose noise made
+// edge (~1/sigma^2) swing 9x between polls.
+function computeRealizedVol(candles) {
+  const closes = [];
+  for (const c of candles) {
+    const cl = num(pick(c, 'close', 'c', 'Close'), NaN);
+    if (isFinite(cl) && cl > 0) closes.push(cl);
+  }
+  const rets = [];
+  for (let i = 1; i < closes.length; i++) rets.push(Math.log(closes[i] / closes[i - 1]));
+  const recent = rets.slice(-48);          // last ~4h of 5m returns
+  if (recent.length < 6) return null;      // too thin: caller falls back to legacy estimator
+  const lambda = 0.9;                      // EWMA: newest return ~10% weight, smooth but responsive
+  let v = 0, wsum = 0, w = 1;
+  for (let i = recent.length - 1; i >= 0; i--) { v += w * recent[i] * recent[i]; wsum += w; w *= lambda; }
+  v /= Math.max(wsum, 1e-12);
+  return Math.sqrt(v) * Math.sqrt(288) * 100;  // per-5m -> %/day
 }
 
 async function fetchJupToken(tokenAddress, apiKey) {
@@ -148,8 +186,12 @@ function pickJupToken(resp, tokenAddress) {
 // MATH
 // ---------------------------------------------------------------------------
 
-// sigma: age-aware realized vol %/day
-function computeSigma(ageH, pc5, pc1, pc24) {
+// sigma: age-aware realized vol %/day. rvSigma (EWMA over 5m closes) is the
+// primary source; the legacy single-print estimator is only a fallback.
+function computeSigma(ageH, pc5, pc1, pc24, rvSigma) {
+  if (rvSigma != null && isFinite(rvSigma) && rvSigma > 0) {
+    return ageH < 24 ? Math.max(rvSigma, 60) : rvSigma;
+  }
   const a5 = Math.abs(num(pc5));
   const a1 = Math.abs(num(pc1));
   if (ageH >= 24) {
@@ -398,23 +440,32 @@ async function buildPoolData(address, settings) {
   // --- OHLCV (best effort) ---
   let ddHigh = null, rangePos = null, dayLow = null;
   let candleClose = null;
+  let rvSigma = null;
   try {
     const ohResp = await fetchOhlcvRaw(address);
     if (ohResp.ok) {
-      const c = latestCandle(ohResp.json);
-      if (c) {
-        const high = num(pick(c, 'high', 'h', 'High'), NaN);
-        const low = num(pick(c, 'low', 'l', 'Low'), NaN);
-        const close = num(pick(c, 'close', 'c', 'Close'), NaN);
-        if (isFinite(high) && isFinite(close) && high > 0) {
-          ddHigh = (high - close) / high * 100;
+      const oj = ohResp.json;
+      let candles = null;
+      if (Array.isArray(oj)) candles = oj;
+      else if (oj && Array.isArray(oj.data)) candles = oj.data;
+      else if (oj && Array.isArray(oj.candles)) candles = oj.candles;
+      if (candles && candles.length) {
+        // day structure aggregated from the 5m series (same semantics as the old daily candle)
+        let hi = -Infinity, lo = Infinity;
+        for (const c of candles) {
+          const h = num(pick(c, 'high', 'h', 'High'), NaN);
+          const l = num(pick(c, 'low', 'l', 'Low'), NaN);
+          if (isFinite(h) && h > hi) hi = h;
+          if (isFinite(l) && l > 0 && l < lo) lo = l;
         }
-        if (isFinite(high) && isFinite(low) && isFinite(close)) {
-          const denom = Math.max(high - low, 1e-9);
-          rangePos = (close - low) / denom;
+        const close = num(pick(candles[candles.length - 1], 'close', 'c', 'Close'), NaN);
+        if (isFinite(hi) && isFinite(close) && hi > 0) ddHigh = (hi - close) / hi * 100;
+        if (isFinite(hi) && isFinite(lo) && lo < Infinity && isFinite(close)) {
+          rangePos = (close - lo) / Math.max(hi - lo, 1e-9);
         }
-        if (isFinite(low)) dayLow = low;
+        if (isFinite(lo) && lo < Infinity) dayLow = lo;
         if (isFinite(close)) candleClose = close;
+        rvSigma = computeRealizedVol(candles);
       }
     }
   } catch (e) { /* keep nulls */ }
@@ -477,7 +528,7 @@ async function buildPoolData(address, settings) {
     if (isFinite(t)) ageH = Math.max((Date.now() - t) / 3600000, 0);
   }
 
-  const sigmaRaw = computeSigma(ageH, pc5, pc1, pc24);
+  const sigmaRaw = computeSigma(ageH, pc5, pc1, pc24, rvSigma);
   // ---- sigma damping: record the raw read, then use a rolling median of the last 3
   // reads (~3 min) for edge/verdict. Edge ~ 1/sigma^2 and sigma is driven by |5m|*17,
   // so a single jumpy candle can 9x the edge between two polls without this.
@@ -570,7 +621,7 @@ async function buildPoolData(address, settings) {
     ok: true,
     pool: { name, address, tvl, binStep, baseFeePct, currentPrice },
     feeRate1h, feeRate24h, trend, surge, accel,
-    sigma, sigmaRaw, edge, ofi1h, ofi6h, organicScore,
+    sigma, sigmaRaw, sigmaSource: (rvSigma != null ? 'rv5m' : 'legacy'), edge, ofi1h, ofi6h, organicScore,
     orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
     tokenAgeHours: ageH,
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
@@ -603,10 +654,16 @@ async function getPoolData(address) {
   if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
     return cached.data;
   }
+  const sc = await sessionCacheGet('mqlc:pool:' + address, CACHE_TTL_MS);
+  if (sc) {
+    poolCache.set(address, { ts: sc.ts, data: sc.data });
+    return sc.data;
+  }
   const settings = await getSettings();
   const data = await buildPoolData(address, settings);
   if (data && data.ok) {
     poolCache.set(address, { ts: Date.now(), data });
+    sessionCacheSet('mqlc:pool:' + address, data);
   }
   return data;
 }
@@ -650,6 +707,8 @@ async function getBreakeven(address, widthPct) {
 let radarCache = { ts: 0, data: null };
 async function getRadar() {
   if (radarCache.data && Date.now() - radarCache.ts < 180e3) return radarCache.data;
+  const scr = await sessionCacheGet('mqlc:radar', 180e3);
+  if (scr) { radarCache = { ts: scr.ts, data: scr.data }; return scr.data; }
   const boardResp = await fetchJson(DATAPI + '/pools?sort_by=volume_24h:desc&page_size=100');
   if (!boardResp.ok) return { ok: false, error: 'board fetch failed' };
   const arr = (boardResp.json.data || boardResp.json.pools || boardResp.json || []).filter(
@@ -658,9 +717,12 @@ async function getRadar() {
   arr.forEach((p) => { p._fr = ((p.fee_tvl_ratio && p.fee_tvl_ratio['1h']) || 0) * 24; });
   arr.sort((a, b) => b._fr - a._fr);
   const items = [];
-  for (const p of arr.slice(0, 8)) {
+  // parallel: 8 sequential full analyses were the slowest path in the extension
+  const results = await Promise.all(arr.slice(0, 8).map((p) => getPoolData(p.address).then((d) => ({ p, d })).catch(() => null)));
+  for (const rp of results) {
     try {
-      const d = await getPoolData(p.address);
+      if (!rp) continue;
+      const p = rp.p, d = rp.d;
       if (!d || !d.ok) continue;
       if (d.verdict && d.verdict.class !== 'NONE') {
         items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: d.verdict.class, edge: d.edge, feeRate1h: d.feeRate1h, kind: 'FULL', rec: d.recommendation, dataTs: d.ts });
@@ -682,6 +744,7 @@ async function getRadar() {
   const oldestDataTs = kept.length ? Math.min(...kept.map((it) => it.dataTs || Date.now())) : Date.now();
   const out = { ok: true, ts: Date.now(), oldestDataTs, items: kept };
   radarCache = { ts: Date.now(), data: out };
+  sessionCacheSet('mqlc:radar', out);
   return out;
 }
 
@@ -806,7 +869,11 @@ async function watchPositions() {
         // rolling snapshot so a close (from ANY device) can be journaled with last-seen PnL
         if (!st.mqlLastPos) st.mqlLastPos = {};
         const prevSnap = st.mqlLastPos[key];
-        const entryFeeRate = (prevSnap && prevSnap.entryFeeRate != null) ? prevSnap.entryFeeRate : feeRate;
+        // Apply-time baseline (journaled in the entry plan) outranks first-seen:
+        // first-seen can catch a fee spike (premature DECAY) or a stale lull (DECAY never fires)
+        const planEarly = plans[pool] && (Date.now() - (plans[pool].ts || 0) < 7 * 86400e3) ? plans[pool] : null;
+        const entryFeeRate = (planEarly && planEarly.entryFeeRate > 0) ? planEarly.entryFeeRate
+          : (prevSnap && prevSnap.entryFeeRate != null) ? prevSnap.entryFeeRate : feeRate;
         let belowCount = (prevSnap && prevSnap.belowCount) || 0;
         if (entryFeeRate > 2 && feeRate < 0.5 * entryFeeRate) belowCount++; else belowCount = 0;
         st.mqlLastPos[key] = { pool, name, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
@@ -818,7 +885,7 @@ async function watchPositions() {
         const W = mid > 0 ? ((maxP - minP) / 2 / mid) * 100 : 20;
         // Entry plan (journaled by the HUD Apply button) outranks generic width-math:
         // the class brackets the user actually entered on (e.g. BASING +20/-15 + stop).
-        const plan = plans[pool] && (Date.now() - (plans[pool].ts || 0) < 7 * 86400e3) ? plans[pool] : null;
+        const plan = planEarly;
         const tp = (plan && plan.tp) ? plan.tp : Math.round(clampB(W / 4 + feeRate * 0.5, 8, 25));
         const sl = (plan && plan.sl) ? plan.sl : Math.round(clampB(0.75 * W + 2, 8, 20));
         const cond = {};
@@ -868,12 +935,23 @@ async function watchPositions() {
         }
         for (const k of Object.keys(cond)) {
           const skey = key + ':' + k;
-          if (cond[k] && !states[skey]) {
-            states[skey] = Date.now();
-            await postDiscord(cfg.webhookUrl, '**Meteora Lens** · ' + msgs[k] + '\nhttps://www.meteora.ag/dlmm/' + pool);
-            try { chrome.notifications.create('mql-' + Date.now(), { type: 'basic', iconUrl: 'icon128.png', title: 'Meteora Lens', message: msgs[k], priority: 2 }); } catch (e) {}
-          } else if (!cond[k] && states[skey]) {
-            delete states[skey]; // re-arm when condition clears
+          const s0 = states[skey];
+          if (cond[k]) {
+            if (!s0) {
+              states[skey] = { ts: Date.now(), clear: 0 };
+              await postDiscord(cfg.webhookUrl, '**Meteora Lens** · ' + msgs[k] + '\nhttps://www.meteora.ag/dlmm/' + pool);
+              try { chrome.notifications.create('mql-' + Date.now(), { type: 'basic', iconUrl: 'icon128.png', title: 'Meteora Lens', message: msgs[k], priority: 2 }); } catch (e) {}
+            } else if (typeof s0 === 'object') {
+              s0.clear = 0;  // condition back on: cancel any pending re-arm
+            }
+          } else if (s0 && k !== 'TIGHTEN') {
+            // hysteresis re-arm: 3 consecutive clear reads AND 30 min since it fired.
+            // (the old instant-delete re-arm let an oscillating NEAR_SL spam a ping per flip;
+            // TIGHTEN stays one-shot per position — it is a nudge, not a state)
+            const so = (typeof s0 === 'object') ? s0 : { ts: s0, clear: 0 };
+            so.clear = (so.clear || 0) + 1;
+            if (so.clear >= 3 && Date.now() - (so.ts || 0) > 30 * 60e3) delete states[skey];
+            else states[skey] = so;
           }
         }
       }
