@@ -915,7 +915,11 @@
       chip.addEventListener("click", function () { window.location.href = "/dlmm/" + it.address; });
       bar.appendChild(chip);
     });
-    var ago = el("span", "mql-radar-ts", Math.round((Date.now() - r.ts) / 60000) + "m");
+    // age from the stalest per-pool snapshot inside the build, not the build wrapper
+    // (poolCache + radarCache stack: chips can be minutes older than the old label claimed)
+    var ageMin = Math.round((Date.now() - (r.oldestDataTs || r.ts)) / 60000);
+    var ago = el("span", "mql-radar-ts", ageMin + "m" + (ageMin >= 3 ? " ⏳" : ""));
+    ago.title = "Age of the oldest pool snapshot in this radar build. HUD refreshes every 60s; radar every 3 min — a fast-moving σ can make chip edges lag the HUD.";
     bar.appendChild(ago);
   });
   function pollRadar() {

@@ -477,7 +477,29 @@ async function buildPoolData(address, settings) {
     if (isFinite(t)) ageH = Math.max((Date.now() - t) / 3600000, 0);
   }
 
-  const sigma = computeSigma(ageH, pc5, pc1, pc24);
+  const sigmaRaw = computeSigma(ageH, pc5, pc1, pc24);
+  // ---- sigma damping: record the raw read, then use a rolling median of the last 3
+  // reads (~3 min) for edge/verdict. Edge ~ 1/sigma^2 and sigma is driven by |5m|*17,
+  // so a single jumpy candle can 9x the edge between two polls without this.
+  let sigma = sigmaRaw;
+  try {
+    const histKeyE = pick(p, 'token_x.address', 'tokenX.address', 'mint_x', 'mintX', 'token_x_mint') || address;
+    const hsE = await chrome.storage.local.get({ mqlHistory: {} });
+    const HE = hsE.mqlHistory || {};
+    const arrE = HE[histKeyE] || [];
+    const lastE = arrE[arrE.length - 1];
+    if (!lastE || Date.now() - lastE.ts > 50e3) {
+      arrE.push({ ts: Date.now(), sigma: Math.round(sigmaRaw * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100 });
+      HE[histKeyE] = arrE.slice(-60);
+      for (const k of Object.keys(HE)) { const a = HE[k]; if (!a.length || Date.now() - a[a.length - 1].ts > 24 * 3600e3) delete HE[k]; }
+      await chrome.storage.local.set({ mqlHistory: HE });
+    }
+    const recentE = arrE.slice(-3)
+      .filter((x) => Date.now() - x.ts <= 10 * 60e3)
+      .map((x) => x.sigma).filter((x) => x > 0)
+      .sort((a, b) => a - b);
+    if (recentE.length >= 2) sigma = recentE[Math.floor(recentE.length / 2)];
+  } catch (e) { /* best-effort damping; fall back to raw sigma */ }
   const edge = computeEdge(feeRate1h, sigma, W);
 
   // OFI per window: sellOrganicVolume / max(buyOrganicVolume,1)
@@ -510,7 +532,7 @@ async function buildPoolData(address, settings) {
     const arr = H[histKey] || [];
     const last = arr[arr.length - 1];
     if (!last || Date.now() - last.ts > 50e3) {
-      arr.push({ ts: Date.now(), sigma: Math.round(sigma * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100 });
+      arr.push({ ts: Date.now(), sigma: Math.round(sigmaRaw * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100 });
       H[histKey] = arr.slice(-60);
       // prune stale pools
       for (const k of Object.keys(H)) { const a = H[k]; if (!a.length || Date.now() - a[a.length-1].ts > 24*3600e3) delete H[k]; }
@@ -548,7 +570,7 @@ async function buildPoolData(address, settings) {
     ok: true,
     pool: { name, address, tvl, binStep, baseFeePct, currentPrice },
     feeRate1h, feeRate24h, trend, surge, accel,
-    sigma, edge, ofi1h, ofi6h, organicScore,
+    sigma, sigmaRaw, edge, ofi1h, ofi6h, organicScore,
     orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
     tokenAgeHours: ageH,
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
@@ -641,20 +663,24 @@ async function getRadar() {
       const d = await getPoolData(p.address);
       if (!d || !d.ok) continue;
       if (d.verdict && d.verdict.class !== 'NONE') {
-        items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: d.verdict.class, edge: d.edge, feeRate1h: d.feeRate1h, kind: 'FULL', rec: d.recommendation });
+        items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: d.verdict.class, edge: d.edge, feeRate1h: d.feeRate1h, kind: 'FULL', rec: d.recommendation, dataTs: d.ts });
       } else if (d.path !== 'FREEFALL') {
         const fails = [];
         if (d.edge < 1.0) fails.push('edge ' + (Math.round(d.edge * 100) / 100));
         if (d.surge < 1.25) fails.push('surge ' + (Math.round(d.surge * 100) / 100));
         if (d.accel < 1.2) fails.push('accel ' + (Math.round(d.accel * 100) / 100));
         if (fails.length > 0 && fails.length <= 2) {
-          items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: 'NEAR', edge: d.edge, feeRate1h: d.feeRate1h, kind: 'NEAR', fails });
+          items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: 'NEAR', edge: d.edge, feeRate1h: d.feeRate1h, kind: 'NEAR', fails, dataTs: d.ts });
         }
       }
     } catch (e) {}
   }
   items.sort((a, b) => (a.kind === b.kind ? (b.edge || 0) - (a.edge || 0) : a.kind === 'FULL' ? -1 : 1));
-  const out = { ok: true, ts: Date.now(), items: items.slice(0, 6) };
+  const kept = items.slice(0, 6);
+  // oldestDataTs = true age of the stalest per-pool snapshot inside this build
+  // (poolCache can serve reads up to 60s older than the radar build itself)
+  const oldestDataTs = kept.length ? Math.min(...kept.map((it) => it.dataTs || Date.now())) : Date.now();
+  const out = { ok: true, ts: Date.now(), oldestDataTs, items: kept };
   radarCache = { ts: Date.now(), data: out };
   return out;
 }
