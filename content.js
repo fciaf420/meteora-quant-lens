@@ -397,17 +397,34 @@
   // mentioning SOL, else fall back to the 2nd of exactly two inputs (quote side).
   function fillSolAmount(amt) {
     try {
+      // NESTED-WRAP TRAP (caught live on the Add Liquidity panel): AmountInput wraps
+      // can NEST - a parent wrap contains BOTH the token and SOL sections, so its
+      // textContent matches /SOL/ and querySelector('input') returns the FIRST input
+      // = the TOKEN box. Judge each input by its own LEAF section text instead:
+      // climb ancestors while the container still holds only that one input.
       var wraps = document.querySelectorAll('[data-sentry-component="AmountInput"]');
-      var target = null, hits = 0;
+      var seen = [], inputs = [];
       for (var i = 0; i < wraps.length; i++) {
-        var t = wraps[i].textContent || "";
-        if (/\bSOL\b/.test(t) && !/USDC|USDT/.test(t)) { target = wraps[i].querySelector("input"); hits++; }
+        var ins = wraps[i].querySelectorAll("input");
+        for (var j = 0; j < ins.length; j++) {
+          if (seen.indexOf(ins[j]) >= 0) continue;
+          seen.push(ins[j]); inputs.push(ins[j]);
+        }
       }
-      if (hits === 1 && target) { setNativeInput(target, String(amt)); return true; }
-      if (wraps.length === 2 && hits !== 1) {
-        var inp2 = wraps[1].querySelector("input");
-        if (inp2) { setNativeInput(inp2, String(amt)); return true; }
+      function localText(inp) {
+        var n = inp.parentElement, last = inp;
+        while (n && n !== document.body && n.querySelectorAll("input").length <= 1) { last = n; n = n.parentElement; }
+        return (last.textContent || "");
       }
+      var solInputs = [], anyEnabled = [];
+      for (var k = 0; k < inputs.length; k++) {
+        var lt = localText(inputs[k]);
+        if (/\bSOL\b/.test(lt) && !/USDC|USDT/.test(lt)) solInputs.push(inputs[k]);
+        if (!inputs[k].disabled) anyEnabled.push(inputs[k]);
+      }
+      var pick = solInputs.filter(function (x) { return !x.disabled; })[0] || solInputs[0]
+        || (inputs.length ? inputs[inputs.length - 1] : null);  // quote side renders last
+      if (pick) { setNativeInput(pick, String(amt)); return true; }
       return false;
     } catch (e) { return false; }
   }
@@ -1638,6 +1655,15 @@
       window.addEventListener("popstate", safe(onUrlChange));
       window.addEventListener("mql:locationchange", safe(onUrlChange));
     } catch (e) { log("history hook failed", e && e.message); }
+    // ISOLATED-WORLD TRAP: the pushState wrap above only sees THIS world's calls.
+    // Meteora's router pushes state in the MAIN world, which we cannot intercept -
+    // so in-app pool navigation never fired onUrlChange and the HUD kept polling
+    // the PREVIOUS pool (caught live: STONK tab rendering Doom-SOL's FREEFALL).
+    // A dumb URL poll is the only world-proof detector.
+    var lastHref = location.href;
+    setInterval(safe(function () {
+      if (location.href !== lastHref) { lastHref = location.href; onUrlChange(); }
+    }), 800);
   }
 
   // ========================================================================
