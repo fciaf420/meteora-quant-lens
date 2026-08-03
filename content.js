@@ -746,6 +746,12 @@
       var Wp = (state.apiPos && state.apiPos.widthPct) ? state.apiPos.widthPct : 20;
       try {
         var rowN = document.querySelector('[data-sentry-component="PositionItem"]');
+        // DOM self-test: we KNOW a position exists (API said so) but the row
+        // selector found nothing — Meteora likely redeployed their UI. Ping once.
+        if (!rowN && state.apiPos && state.apiPos.has) {
+          window.__mqlWidthMiss = (window.__mqlWidthMiss || 0) + 1;
+          if (window.__mqlWidthMiss === 3) sendMessage({ type: "domSelfTest", what: "PositionItem row (width parsing)" });
+        } else if (rowN) { window.__mqlWidthMiss = 0; }
         if (rowN) {
           var subMap = { "\u2080":0,"\u2081":1,"\u2082":2,"\u2083":3,"\u2084":4,"\u2085":5,"\u2086":6,"\u2087":7,"\u2088":8,"\u2089":9 };
           var decode = function (s) {
@@ -1011,6 +1017,42 @@
     edgeRow.appendChild(el("span", "mql-label", "EDGE"));
     var edgeVal = el("span", "mql-val " + colorForEdge(edge), fmtNum(edge, 2));
     edgeRow.appendChild(edgeVal);
+    // edge at the recipe's actual width (edge scales linearly with band width)
+    if (d.edgeRecipe != null && d.recipeW != null) {
+      var er = el("span", "mql-sub " + colorForEdge(d.edgeRecipe), " \u00b1" + d.recipeW + "%: " + fmtNum(d.edgeRecipe, 2));
+      er.title = "Edge re-quoted at the recommended band width (\u00b1" + d.recipeW + "%). The headline number assumes the default \u00b1" + (d._W || 20) + "% \u2014 wider bands pay less IL per unit of vol, so the same pool quotes better at the recipe width.";
+      edgeRow.appendChild(er);
+    }
+    // 60-min edge sparkline from the recorded trail (same-source entries only)
+    try {
+      var tr9 = (d.trail || []).filter(function (x) { return x.src === (d.sigmaSource === "rv5m" ? "rv" : "lg") && x.sigma > 0; }).slice(-60);
+      if (tr9.length >= 5) {
+        var Wsp = d._W || 20;
+        var es = tr9.map(function (x) { return (x.feeRate * 0.9 / x.sigma) / Math.max(1.3 * x.sigma / (8 * Wsp), 0.001); });
+        var mx = Math.max.apply(null, es.concat([1.5])), mn = 0;
+        var pts = es.map(function (v, i) {
+          return (i / (es.length - 1) * 96 + 2).toFixed(1) + "," + (16 - ((v - mn) / (mx - mn)) * 14 + 1).toFixed(1);
+        }).join(" ");
+        var svgNS = "http://www.w3.org/2000/svg";
+        var svg = document.createElementNS(svgNS, "svg");
+        svg.setAttribute("width", "100"); svg.setAttribute("height", "18");
+        svg.setAttribute("class", "mql-spark");
+        var yGate = (16 - ((1.0 - mn) / (mx - mn)) * 14 + 1).toFixed(1);
+        var gate = document.createElementNS(svgNS, "line");
+        gate.setAttribute("x1", "2"); gate.setAttribute("x2", "98");
+        gate.setAttribute("y1", yGate); gate.setAttribute("y2", yGate);
+        gate.setAttribute("stroke", "#555"); gate.setAttribute("stroke-dasharray", "2,2"); gate.setAttribute("stroke-width", "1");
+        svg.appendChild(gate);
+        var pl = document.createElementNS(svgNS, "polyline");
+        pl.setAttribute("points", pts);
+        pl.setAttribute("fill", "none");
+        pl.setAttribute("stroke", es[es.length - 1] >= 1 ? "#4ade80" : "#f87171");
+        pl.setAttribute("stroke-width", "1.5");
+        svg.appendChild(pl);
+        svg.setAttribute("title", "edge over the last ~hour \u00b7 dashed line = 1.0 gate");
+        edgeRow.appendChild(svg);
+      }
+    } catch (e) {}
     hud.appendChild(edgeRow);
     var barWrap = el("div", "mql-barwrap");
     var bar = el("div", "mql-bar " + colorForEdge(edge));
@@ -1113,7 +1155,12 @@
                 plans[state.pool] = Object.assign({}, rec.plan, { pool: state.pool, ts: Date.now(),
                   // baseline at the moment you actually entered — Position Watch prefers
                   // this over the first-seen snapshot (which can catch a spike or a lull)
-                  entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null });
+                  entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null,
+                  // full entry-time signal snapshot: joined into the close journal row
+                  // so every round trip is origin-tagged for calibration
+                  entryEdge: (state.data && state.data.edge != null) ? Math.round(state.data.edge * 100) / 100 : null,
+                  entrySigma: (state.data && state.data.sigma != null) ? Math.round(state.data.sigma * 10) / 10 : null,
+                  entrySigmaSource: (state.data && state.data.sigmaSource) || null });
                 chrome.storage.local.set({ mqlEntryPlan: plans });
                 state.entryPlan = plans[state.pool];
               }));

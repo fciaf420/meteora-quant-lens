@@ -33,7 +33,7 @@
     </div>
     <div class="field">
       <label for="walletAddress">Wallet address to watch</label>
-      <input type="text" id="walletAddress" placeholder="your Solana wallet (positions watched via API, no tab needed)" />
+      <input type="text" id="walletAddress" placeholder="wallet(s) — comma-separate up to 3 (e.g. main, bot)" />
       <p class="hint">Background checks every minute while Chrome runs: out-of-range, approaching/hit TP & SL.</p>
     </div>
     <div class="field">
@@ -53,7 +53,7 @@
       <h2>Trade Journal</h2>
       <div id="jrStats" class="jr-stats"></div>
       <h3>Round trips (closes)</h3>
-      <table class="jr-table" id="jrCloses"><thead><tr><th>closed</th><th>pool</th><th>PnL</th><th>hold</th></tr></thead><tbody></tbody></table>
+      <table class="jr-table" id="jrCloses"><thead><tr><th>closed</th><th>pool</th><th>PnL</th><th>hold</th><th>entry</th></tr></thead><tbody></tbody></table>
       <h3>Combo opens</h3>
       <table class="jr-table" id="jrOpens"><thead><tr><th>opened</th><th>pool</th><th>SOL</th><th>depth</th><th>bid-ask share</th></tr></thead><tbody></tbody></table>
       <h3>Discretionary overrides (entered on WAIT)</h3>

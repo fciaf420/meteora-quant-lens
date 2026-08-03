@@ -2,6 +2,8 @@
  * Dark theme matching Meteora. All selectors prefixed #mql- / .mql-.
  * No global resets. Sane z-index (stays under app modals).
  */
+.mql-sub { font-size: 10px; opacity: .85; margin-left: 6px; }
+.mql-spark { margin-left: 8px; vertical-align: middle; }
 
 /* ---- shared card shell ------------------------------------------------- */
 #mql-hud.mql-card,

@@ -82,7 +82,10 @@ function loadJournal() {
         let pnlTxt = isFinite(pnl) ? (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%' : '—';
         if (x.realizedPnlUsd != null) pnlTxt += ' ($' + (x.realizedPnlUsd >= 0 ? '+' : '') + Number(x.realizedPnlUsd).toFixed(2) + ')';
         else if (isFinite(pnl)) pnlTxt += ' (last seen)';
-        const tr = row($('jrCloses'), [fmtTs(x.closedDetected), poolLink(x.pool, x.name), pnlTxt, (x.holdMinutes != null ? (x.holdMinutes >= 90 ? (x.holdMinutes / 60).toFixed(1) + 'h' : x.holdMinutes + 'm') : '—')]);
+        var entryTxt = '—';
+        if (x.entryOrigin === 'override') entryTxt = (x.entryCls || '?') + ' OVERRIDE' + (x.entryEdge != null ? ' @ ' + Number(x.entryEdge).toFixed(2) : '');
+        else if (x.entryOrigin === 'signal') entryTxt = (x.entryCls || '?') + (x.entryEdge != null ? ' @ ' + Number(x.entryEdge).toFixed(2) : '') + (x.entrySigma != null ? ' σ' + Math.round(x.entrySigma) : '');
+        const tr = row($('jrCloses'), [fmtTs(x.closedDetected), poolLink(x.pool, x.name), pnlTxt, (x.holdMinutes != null ? (x.holdMinutes >= 90 ? (x.holdMinutes / 60).toFixed(1) + 'h' : x.holdMinutes + 'm') : '—'), entryTxt]);
         if (isFinite(pnl)) tr.children[2].className = pnl >= 0 ? 'jr-pos' : 'jr-neg';
       }
       for (const x of opens.slice(0, 30)) {
@@ -96,12 +99,12 @@ function loadJournal() {
 }
 function exportCsv() {
   const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-  const lines = ['kind,ts,pool,name,pnlPct,realizedPnlPct,realizedPnlUsd,feesUsd,holdMinutes,totalSol,depth,share,cls,edge,sigma,feeRate1h,ignoredGates'];
+  const lines = ['kind,ts,pool,name,pnlPct,realizedPnlPct,realizedPnlUsd,feesUsd,holdMinutes,entryOrigin,entryCls,entryEdge,entrySigma,entrySigmaSource,entryFeeRateAtOpen,totalSol,depth,share,cls,edge,sigma,feeRate1h,ignoredGates'];
   for (const x of jrRaw.log) {
-    if (x.closedDetected != null) lines.push(['close', new Date(x.closedDetected).toISOString(), x.pool, x.name, x.lastSeenPnlPct, x.realizedPnlPct, x.realizedPnlUsd, x.feesUsd, x.holdMinutes, '', '', '', '', '', '', '', ''].map(esc).join(','));
-    else if (x.type === 'COMBO_OPEN') lines.push(['combo_open', new Date(x.finishedAt || x.startedAt).toISOString(), x.pool, '', '', '', '', '', '', x.totalSol, x.depth, x.share, '', '', '', '', ''].map(esc).join(','));
+    if (x.closedDetected != null) lines.push(['close', new Date(x.closedDetected).toISOString(), x.pool, x.name, x.lastSeenPnlPct, x.realizedPnlPct, x.realizedPnlUsd, x.feesUsd, x.holdMinutes, x.entryOrigin, x.entryCls, x.entryEdge, x.entrySigma, x.entrySigmaSource, x.entryFeeRateAtOpen, '', '', '', '', '', '', '', ''].map(esc).join(','));
+    else if (x.type === 'COMBO_OPEN') lines.push(['combo_open', new Date(x.finishedAt || x.startedAt).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', x.totalSol, x.depth, x.share, '', '', '', '', ''].map(esc).join(','));
   }
-  for (const x of jrRaw.ovr) lines.push(['override', new Date(x.ts).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', x.cls, x.edge, x.sigma, x.feeRate1h, (x.ignoredGates || []).join('|')].map(esc).join(','));
+  for (const x of jrRaw.ovr) lines.push(['override', new Date(x.ts).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', x.cls, x.edge, x.sigma, x.feeRate1h, (x.ignoredGates || []).join('|')].map(esc).join(','));
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);

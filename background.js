@@ -459,8 +459,10 @@ async function buildPoolData(address, settings) {
   let ddHigh = null, rangePos = null, dayLow = null;
   let candleClose = null;
   let rvSigma = null;
+  let trailOut = null;   // recent sigma/fee trail (exported for the HUD sparkline)
   try {
     const ohResp = await fetchOhlcvRaw(address);
+    recordHealth('ohlcv', !!(ohResp && ohResp.rv && ohResp.rv.ok));
     if (ohResp.ok) {
       const arrOf = (r) => {
         const oj = r && r.ok ? r.json : null;
@@ -562,6 +564,7 @@ async function buildPoolData(address, settings) {
     if (!lastE || Date.now() - lastE.ts > 50e3) {
       arrE.push({ ts: Date.now(), sigma: Math.round(sigmaRaw * 10) / 10, feeRate: Math.round(feeRate1h * 100) / 100, src: (rvSigma != null ? 'rv' : 'lg') });
       HE[histKeyE] = arrE.slice(-60);
+      trailOut = HE[histKeyE];
       for (const k of Object.keys(HE)) { const a = HE[k]; if (!a.length || Date.now() - a[a.length - 1].ts > 24 * 3600e3) delete HE[k]; }
       await chrome.storage.local.set({ mqlHistory: HE });
     }
@@ -643,12 +646,20 @@ async function buildPoolData(address, settings) {
       '\u2713 CHOP mid-range, balanced organic flow', '\u2713 data-gated: ' + '6+ readings over 45+ min'];
   }
   const recommendation = buildRecommendation({ verdict, squeezeW, sigmaTrail, sigmaRatio, edge, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl });
+  // Edge quoted at the RECIPE's width, not the generic default W: edge scales
+  // linearly with band width, so a CARRY judged at +-20 math is ~1.75x better at
+  // its real +-35 band. Display-level only; verdict gates untouched (calibration).
+  const recipeW = (recommendation && recommendation.plan && recommendation.plan.widthPct) ? recommendation.plan.widthPct : null;
+  const edgeRecipe = (recipeW && recipeW !== W) ? Math.round(edge * recipeW / W * 100) / 100 : null;
+  // health: legacy sigma on a mature (>1h) token should not happen when candles flow
+  if (ageH > 1 && rvSigma == null) recordHealth('legacyMature', address);
 
   const data = {
     ok: true,
     pool: { name, address, tvl, binStep, baseFeePct, currentPrice },
     feeRate1h, feeRate24h, trend, surge, accel,
-    sigma, sigmaRaw, sigmaSource: (rvSigma != null ? 'rv5m' : 'legacy'), edge, ofi1h, ofi6h, organicScore,
+    sigma, sigmaRaw, sigmaSource: (rvSigma != null ? 'rv5m' : 'legacy'), edge, edgeRecipe, recipeW, trail: trailOut,
+    ofi1h, ofi6h, organicScore,
     orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
     tokenAgeHours: ageH,
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
@@ -744,8 +755,14 @@ async function getRadar() {
   arr.forEach((p) => { p._fr = ((p.fee_tvl_ratio && p.fee_tvl_ratio['1h']) || 0) * 24; });
   arr.sort((a, b) => b._fr - a._fr);
   const items = [];
-  // parallel: 8 sequential full analyses were the slowest path in the extension
-  const results = await Promise.all(arr.slice(0, 8).map((p) => getPoolData(p.address).then((d) => ({ p, d })).catch(() => null)));
+  // parallel but chunked to 4: 8 concurrent analyses x ~4 fetches each brushed
+  // the datapi's 30 RPS limit in one burst
+  const top8 = arr.slice(0, 8);
+  const results = [];
+  for (let ci = 0; ci < top8.length; ci += 4) {
+    const chunk = await Promise.all(top8.slice(ci, ci + 4).map((p) => getPoolData(p.address).then((d) => ({ p, d })).catch(() => null)));
+    results.push(...chunk);
+  }
   for (const rp of results) {
     try {
       if (!rp) continue;
@@ -864,6 +881,45 @@ function summarizePositions(ps) {
     legs
   };
 }
+// ---- DATA-HEALTH WATCHDOG: the extension must say when it is degraded ----
+// (the OHLCV range-cap bug ran silently on legacy sigma for hours - never again)
+function recordHealth(kind, val) {
+  try {
+    chrome.storage.session.get({ mqlHealth: { ohlcv: [], legacyMature: [] } }).then((h) => {
+      const H = h.mqlHealth || { ohlcv: [], legacyMature: [] };
+      const cut = Date.now() - 15 * 60e3;
+      if (kind === 'ohlcv') H.ohlcv = (H.ohlcv || []).filter((x) => x.t > cut).concat([{ t: Date.now(), ok: !!val }]);
+      if (kind === 'legacyMature') H.legacyMature = (H.legacyMature || []).filter((x) => x.t > cut).concat([{ t: Date.now(), pool: String(val) }]);
+      chrome.storage.session.set({ mqlHealth: H });
+    });
+  } catch (e) {}
+}
+async function healthCheck() {
+  try {
+    const cfg = await chrome.storage.sync.get({ webhookUrl: '' });
+    if (!cfg.webhookUrl) return;
+    const h = await chrome.storage.session.get({ mqlHealth: { ohlcv: [], legacyMature: [] } });
+    const H = h.mqlHealth || {};
+    const cut = Date.now() - 10 * 60e3;
+    const oh = (H.ohlcv || []).filter((x) => x.t > cut);
+    const lm = (H.legacyMature || []).filter((x) => x.t > cut);
+    const fails = oh.filter((x) => !x.ok).length;
+    const lmPools = [...new Set(lm.map((x) => x.pool))];
+    let msg = null;
+    if (oh.length >= 5 && fails / oh.length > 0.5) msg = '\u26a0\ufe0f **Meteora Lens \u2014 DEGRADED**: OHLCV fetch failing ' + Math.round(fails / oh.length * 100) + '% over 10 min (' + fails + '/' + oh.length + '). Sigma is running on the legacy estimator \u2014 edge/verdict numbers are low-quality until this clears.';
+    else if (lmPools.length >= 2) msg = '\u26a0\ufe0f **Meteora Lens \u2014 DEGRADED**: legacy sigma on ' + lmPools.length + ' mature pools (candle data missing where it should exist). Treat edge/verdicts with suspicion.';
+    if (!msg) return;
+    const st = await chrome.storage.local.get({ mqlHealthPingTs: 0 });
+    if (Date.now() - (st.mqlHealthPingTs || 0) < 6 * 3600e3) return;  // one ping / 6h
+    await postDiscord(cfg.webhookUrl, msg);
+    try { chrome.notifications.create('mql-health-' + Date.now(), { type: 'basic', iconUrl: 'icon128.png', title: '\u26a0\ufe0f Lens degraded', message: 'Vol data quality dropped \u2014 check Discord.', priority: 2 }); } catch (e) {}
+    await chrome.storage.local.set({ mqlHealthPingTs: Date.now() });
+  } catch (e) {}
+}
+
+function parseWallets(s) {
+  return String(s || '').split(/[\s,;]+/).map((w) => w.trim()).filter(Boolean).slice(0, 3);
+}
 async function watchPositions() {
   const cfg = await chrome.storage.sync.get({ webhookUrl: '', walletAddress: '' });
   if (!cfg.webhookUrl || !cfg.walletAddress) return;
@@ -875,18 +931,25 @@ async function watchPositions() {
   const states = st.mqlAlertStates || {};
   const plans = st.mqlEntryPlan || {};
   const posBaseAll = st.mqlPosBaseline || {};
-  const failedPools = new Set();  // API errors this tick: position state UNKNOWN, not closed
-  let port;
-  try {
-    const r = await fetchJson(DATAPI + '/portfolio/open?user=' + cfg.walletAddress.trim());
-    if (!r.ok) return;
-    port = r.json;
-  } catch (e) { return; }
-  const pools = (port.pools || port.data || []).map(x => x.poolAddress || x.pool_address || x.address).filter(Boolean);
-  const seen = {};
-  for (const pool of pools.slice(0, 6)) {
+  const failedPools = new Set();   // API errors this tick: position state UNKNOWN, not closed
+  const failedWallets = new Set(); // whole-wallet portfolio failures: skip close detection for its keys
+  const wallets = parseWallets(cfg.walletAddress);
+  const pools = [];        // union across wallets (close detection)
+  const walletPools = [];  // [wallet, pool] pairs actually processed
+  for (const wallet of wallets) {
     try {
-      const pr = await fetchJson(DATAPI + '/positions/' + pool + '/pnl?user=' + cfg.walletAddress.trim() + '&status=open');
+      const r = await fetchJson(DATAPI + '/portfolio/open?user=' + wallet);
+      if (!r.ok) { failedWallets.add(wallet); continue; }
+      const wp = ((r.json.pools || r.json.data || [])).map(x => x.poolAddress || x.pool_address || x.address).filter(Boolean);
+      pools.push(...wp);
+      for (const p of wp.slice(0, 6)) walletPools.push([wallet, p]);
+    } catch (e) { failedWallets.add(wallet); }
+  }
+  if (failedWallets.size === wallets.length && wallets.length > 0) return;  // nothing readable this tick
+  const seen = {};
+  for (const [wallet, pool] of walletPools) {
+    try {
+      const pr = await fetchJson(DATAPI + '/positions/' + pool + '/pnl?user=' + wallet + '&status=open');
       if (!pr.ok || !pr.json.positions) { failedPools.add(pool); continue; }
       const pd = await getPoolData(pool);
       const feeRate = (pd && pd.ok) ? pd.feeRate1h : 0;
@@ -914,7 +977,7 @@ async function watchPositions() {
         }
         let belowCount = (prevSnap && prevSnap.belowCount) || 0;
         if (entryFeeRate > 2 && feeRate < 0.5 * entryFeeRate) belowCount++; else belowCount = 0;
-        st.mqlLastPos[key] = { pool, name, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
+        st.mqlLastPos[key] = { pool, name, wallet, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
           firstSeen: (prevSnap && prevSnap.firstSeen) || Date.now(),
           entryFeeRate, belowCount };
         const pnl = Number(pos.pnlSolPctChange);
@@ -1014,21 +1077,24 @@ async function watchPositions() {
   try {
     const lp = st.mqlLastPos || {};
     const inPortfolio = new Set(pools);
-    const processed = new Set(pools.slice(0, 6));
+    const processed = new Set(walletPools.map((wp) => wp[1]));
     const closed = [];
     for (const k of Object.keys(lp)) {
       if (seen[k]) { if (lp[k]) lp[k].miss = 0; continue; }
       const rec = lp[k];
       const poolOfK = (rec && rec.pool) || k.split(':')[0];
       if (failedPools.has(poolOfK)) continue;                       // API error: unknown
+      if (rec && rec.wallet && failedWallets.has(rec.wallet)) continue;   // whole wallet unreadable: unknown
+      if (!rec.wallet && failedWallets.size > 0) continue;               // pre-tag snapshot + any wallet down: play safe
       if (inPortfolio.has(poolOfK) && !processed.has(poolOfK)) continue;  // truncated (>6 pools): unknown
       // pool absent from a SUCCESSFUL portfolio response = positively gone -> count it
       rec.miss = (rec.miss || 0) + 1;
       if (rec.miss >= 3) closed.push(k);
     }
     if (closed.length) {
-      const jr = await chrome.storage.local.get({ mqlTradeLog: [] });
+      const jr = await chrome.storage.local.get({ mqlTradeLog: [], mqlOverrideJournal: [] });
       const logArr = jr.mqlTradeLog || [];
+      const ovrAll = jr.mqlOverrideJournal || [];
       const bl = { mqlPosBaseline: posBaseAll };
       for (const k of closed) {
         const rec = lp[k];
@@ -1052,8 +1118,29 @@ async function watchPositions() {
             }
           }
         } catch (e) { /* fall back to last-seen */ }
-        logArr.push({ pool: rec.pool, name: rec.name, lastSeenPnlPct: rec.pnl,
+        // ---- ENTRY-CONTEXT JOIN: stitch the entry-time signal snapshot into the
+        // close row so the journal is a calibration dataset (trade-origin-tagged
+        // per the standing rule), not just a diary.
+        let entryOrigin = 'untracked', entryCls = null, entryEdge = null, entrySigma = null, entrySigmaSource = null;
+        try {
+          const planC = plans[rec.pool] || null;
+          const ovrsC = ovrAll.filter((o) => o.pool === rec.pool && Date.now() - (o.ts || 0) < 7 * 86400e3);
+          const ovrC = ovrsC.length ? ovrsC[ovrsC.length - 1] : null;
+          if (ovrC && (!planC || (ovrC.ts || 0) >= (planC.ts || 0))) {
+            entryOrigin = 'override'; entryCls = ovrC.cls || null;
+            entryEdge = (ovrC.edge != null) ? ovrC.edge : null;
+            entrySigma = (ovrC.sigma != null) ? ovrC.sigma : null;
+          } else if (planC) {
+            entryOrigin = 'signal'; entryCls = planC.cls || null;
+            entryEdge = (planC.entryEdge != null) ? planC.entryEdge : null;
+            entrySigma = (planC.entrySigma != null) ? planC.entrySigma : null;
+            entrySigmaSource = planC.entrySigmaSource || null;
+          }
+        } catch (e) {}
+        logArr.push({ pool: rec.pool, name: rec.name, wallet: rec.wallet || null, lastSeenPnlPct: rec.pnl,
           realizedPnlPct, realizedPnlUsd, feesUsd,
+          entryOrigin, entryCls, entryEdge, entrySigma, entrySigmaSource,
+          entryFeeRateAtOpen: (rec.entryFeeRate != null ? Math.round(rec.entryFeeRate * 100) / 100 : null),
           openedFirstSeen: rec.firstSeen, closedDetected: Date.now(),
           holdMinutes: Math.round((Date.now() - rec.firstSeen) / 60e3) });
         delete lp[k];
@@ -1105,13 +1192,28 @@ async function radarAlertScan() {
 }
 
 chrome.alarms.create('mql-watch', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions(); radarAlertScan(); } });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions(); radarAlertScan(); healthCheck(); } });
 chrome.runtime.onInstalled.addListener(() => chrome.alarms.create('mql-watch', { periodInMinutes: 1 }));
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== 'object') {
     sendResponse({ ok: false, error: 'invalid message' });
     return false;
+  }
+
+  if (msg.type === 'domSelfTest') {
+    (async () => {
+      try {
+        const cfg = await chrome.storage.sync.get({ webhookUrl: '' });
+        const st = await chrome.storage.local.get({ mqlDomPingTs: 0 });
+        if (cfg.webhookUrl && Date.now() - (st.mqlDomPingTs || 0) > 24 * 3600e3) {
+          await postDiscord(cfg.webhookUrl, '\ud83d\udd27 **Meteora Lens \u2014 selectors broke**: ' + (msg.what || 'DOM hook') + ' no longer matches Meteora\'s UI (site redeploy?). Width-math and form features are degraded until the extension is updated.');
+          await chrome.storage.local.set({ mqlDomPingTs: Date.now() });
+        }
+        sendResponse({ ok: true });
+      } catch (e) { sendResponse({ ok: false }); }
+    })();
+    return true;
   }
 
   if (msg.type === 'testWebhook') {
@@ -1146,9 +1248,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const cfg = await chrome.storage.sync.get({ walletAddress: '' });
         if (!cfg.walletAddress || !msg.pool) { sendResponse({ ok: true, has: false }); return; }
-        const r = await fetchJson(DATAPI + '/positions/' + msg.pool + '/pnl?user=' + cfg.walletAddress.trim() + '&status=open');
-        if (!r.ok || !r.json.positions || !r.json.positions.length) { sendResponse({ ok: true, has: false }); return; }
-        sendResponse(summarizePositions(r.json.positions));
+        const merged = [];
+        for (const w of parseWallets(cfg.walletAddress)) {
+          try {
+            const r = await fetchJson(DATAPI + '/positions/' + msg.pool + '/pnl?user=' + w + '&status=open');
+            if (r.ok && r.json.positions && r.json.positions.length) merged.push(...r.json.positions);
+          } catch (e) {}
+        }
+        if (!merged.length) { sendResponse({ ok: true, has: false }); return; }
+        sendResponse(summarizePositions(merged));
       } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
     })();
     return true;
