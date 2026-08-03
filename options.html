@@ -27,6 +27,11 @@
       <div class="actions">
         
     <div class="field">
+      <label for="heliusApiKey">Helius API key (wallet-truth PnL, optional)</label>
+      <input type="password" id="heliusApiKey" placeholder="paste key — enables all-in SOL PnL + daily wallet recon" />
+      <p class="hint">Free key at <strong>dashboard.helius.dev</strong>. Adds the all-in per-trade SOL PnL (swap slippage, fees, rent included) and a daily wallet-vs-ledger reconciliation line to the journal.</p>
+    </div>
+    <div class="field">
       <label for="webhookUrl">Discord webhook URL (remote alerts)</label>
       <input type="password" id="webhookUrl" placeholder="https://discord.com/api/webhooks/..." />
       <p class="hint">Channel → ⚙ Edit Channel → Integrations → Webhooks → New Webhook → Copy URL. Discord mobile app pushes these to your phone.</p>
@@ -58,6 +63,8 @@
       <table class="jr-table" id="jrOpens"><thead><tr><th>opened</th><th>pool</th><th>SOL</th><th>depth</th><th>bid-ask share</th></tr></thead><tbody></tbody></table>
       <h3>Discretionary overrides (entered on WAIT)</h3>
       <table class="jr-table" id="jrOverrides"><thead><tr><th>when</th><th>pool</th><th>class</th><th>edge</th><th>σ</th><th>fee%/d</th><th>gates ignored</th></tr></thead><tbody></tbody></table>
+      <h3>Daily wallet recon (Helius)</h3>
+      <table class="jr-table" id="jrRecon"><thead><tr><th>day</th><th>wallet</th><th>SOL start → end</th><th>Δ wallet</th><th>Σ settled trades</th><th>drift</th></tr></thead><tbody></tbody></table>
       <div class="actions"><button id="jrExport" type="button">Export CSV</button></div>
     </section>
   </main>

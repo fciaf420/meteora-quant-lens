@@ -1102,6 +1102,7 @@ async function watchPositions() {
         // closed-pnl rollup which lags): removes + fee claims - adds, in USD.
         // lastSeen kept as fallback (watcher's final 1-min-tick observation).
         let realizedPnlUsd = null, realizedPnlPct = null, feesUsd = null, ownerAddress = null;
+        let evSigs = null, evTokenMint = null, evWindow = null;
         const posAddr = k.split(':')[1] || null;
         try {
           if (posAddr) {
@@ -1109,6 +1110,12 @@ async function watchPositions() {
             const evs = (hev.ok && hev.json && hev.json.events) || [];
             if (evs.length) {
               ownerAddress = evs[0].userAddress || null;  // on-chain owner: the key the closed-pnl rollup indexes by
+              // signatures + token mint + time window: consumed by the Helius wallet-truth
+              // pass to attribute wallet SOL flows to THIS trade (overlap-proof)
+              evSigs = [...new Set(evs.map((ev) => ev.signature).filter(Boolean))].slice(0, 40);
+              evTokenMint = evs[0].tokenX || null;
+              const bts = evs.map((ev) => Number(ev.blockTime)).filter((t) => t > 0);
+              if (bts.length) evWindow = { start: Math.min(...bts), end: Math.max(...bts) };
               const su = { add: 0, remove: 0, claim_fee: 0, claim_reward: 0 };
               for (const ev of evs) { if (su[ev.eventType] != null) su[ev.eventType] += Number(ev.totalUsd || 0); }
               if (su.add > 0) {
@@ -1139,6 +1146,7 @@ async function watchPositions() {
           }
         } catch (e) {}
         logArr.push({ pool: rec.pool, name: rec.name, wallet: rec.wallet || null, positionAddress: posAddr, ownerAddress,
+          evSigs, evTokenMint, evWindow,
           settled: false, lastSeenPnlPct: rec.pnl,
           realizedPnlPct, realizedPnlUsd, feesUsd,
           entryOrigin, entryCls, entryEdge, entrySigma, entrySigmaSource,
@@ -1227,7 +1235,136 @@ async function reconcileJournal() {
     await chrome.storage.local.set({ mqlTradeLog: arr });
   } catch (e) {}
 }
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions(); radarAlertScan(); healthCheck(); reconcileJournal(); } });
+// ---- WALLET-TRUTH (Helius): the all-in per-trade PnL in SOL, friction included ----
+// Meteora's official number is position-scoped: it excludes entry-swap slippage, the
+// exit zap back to SOL, priority fees, and the rent cycle. Wallet SOL flows matched
+// BY SIGNATURE (position txs) + swap txs touching the trade's token mint inside the
+// trade window = the true round trip, immune to overlapping-trade contamination.
+const SOL_NATIVE = 'So11111111111111111111111111111111111111111';   // 11 ones: native pseudo-mint
+const SOL_WRAPPED = 'So11111111111111111111111111111111111111112';  // 12 ones: wSOL (swap legs often use this)
+// Method: balance-at BRACKETING of the trade window (validated live: a 4-trade
+// cluster reconciled to within 0.0007 SOL of the official sum). Same-owner trades
+// with overlapping windows merge into one cluster (per-trade split is impossible
+// on-chain when they interleave). Pure-SOL transfer txs (funding in/out) inside
+// the bracket are subtracted. A sanity gate refuses to stamp a number when the
+// residual is too large (other wallet activity in the window, e.g. selling
+// pre-existing token inventory bought elsewhere) - 'unattributable' beats wrong.
+async function walletTruth(row, heliusKey, allRows) {
+  const wallet = row.ownerAddress || row.wallet;
+  if (!wallet || !row.evWindow) { row.walletTruth = 'missing-context'; return; }
+  // cluster = SESSION: same-owner trades chained transitively when gaps between
+  // their event windows are under 10 min. Back-to-back scalp runs cannot be
+  // separated on-chain (each trade's bracket contains its neighbors' flows);
+  // the session is the smallest well-defined attribution unit.
+  const GAP = 600;
+  const pool9 = allRows.filter((x) => x.closedDetected && x.evWindow && (x.ownerAddress || x.wallet) === wallet);
+  const cluster = [row];
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const x of pool9) {
+      if (cluster.includes(x)) continue;
+      if (cluster.some((c) => x.evWindow.start < c.evWindow.end + GAP && x.evWindow.end > c.evWindow.start - GAP)) {
+        cluster.push(x); grew = true;
+      }
+    }
+  }
+  const startRaw = Math.min(...cluster.map((x) => x.evWindow.start));
+  const endRaw = Math.max(...cluster.map((x) => x.evWindow.end));
+  const bal = async (t) => {
+    const r = await fetchJson('https://api.helius.xyz/v1/wallet/' + wallet + '/balance-at?mint=' + SOL_NATIVE + '&time=' + Math.floor(t) + '&api-key=' + heliusKey);
+    return (r.ok && r.json && r.json.balance !== undefined) ? Number(r.json.balance) : null;
+  };
+  // transfers fetched once over the widest bracket (external-funding correction)
+  const PADS = [300, 90, 45];
+  const wideStart = startRaw - PADS[0], wideEnd = endRaw + PADS[0];
+  const trs = [];
+  try {
+    let cursor = null;
+    for (let pg = 0; pg < 5; pg++) {
+      const r = await fetchJson('https://api.helius.xyz/v1/wallet/' + wallet + '/transfers?limit=100&api-key=' + heliusKey + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+      if (!r.ok) break;
+      const batch = (r.json && r.json.data) || [];
+      trs.push(...batch);
+      const oldest = batch.length ? batch[batch.length - 1].timestamp : 0;
+      if (!r.json.pagination || !r.json.pagination.hasMore || oldest < wideStart) break;
+      cursor = r.json.pagination.nextCursor;
+    }
+  } catch (e) {}
+  const officialSum = cluster.reduce((s, x) => s + (x.officialPnlSol || 0), 0);
+  // adaptive pads: prefer the widest bracket (captures entry/exit swaps = true
+  // friction) but shrink when neighboring activity contaminates it; gate the rest
+  for (const pad of PADS) {
+    const s9 = startRaw - pad, e9 = endRaw + pad;
+    const b0 = await bal(s9), b1 = await bal(e9);
+    if (b0 == null || b1 == null) { row.walletTruth = 'helius-error'; return; }
+    let extNet = 0;
+    const bySig = {};
+    for (const t of trs) { if (t.timestamp >= s9 && t.timestamp <= e9) (bySig[t.signature] = bySig[t.signature] || []).push(t); }
+    for (const legs of Object.values(bySig)) {
+      if (legs.some((l) => l.mint !== SOL_NATIVE && l.mint !== SOL_WRAPPED)) continue;
+      extNet += legs.reduce((s, l) => s + (l.direction === 'in' ? 1 : -1) * Number(l.amount || 0), 0);
+    }
+    const allIn = Math.round((b1 - b0 - extNet) * 1e6) / 1e6;
+    if (Math.abs(allIn - officialSum) <= Math.max(0.05, 3 * Math.abs(officialSum))) {
+      for (const x of cluster) {
+        x.walletTruth = (cluster.length > 1 ? 'cluster(' + cluster.length + ')' : 'ok') + (pad < PADS[0] ? ' pad' + pad : '');
+        x.walletPnlSol = allIn;
+        x.frictionSol = Math.round((allIn - officialSum) * 1e6) / 1e6;
+      }
+      return;
+    }
+  }
+  for (const x of cluster) x.walletTruth = 'unattributable';
+}
+async function walletTruthPass() {
+  try {
+    const cfgH = await chrome.storage.sync.get({ heliusApiKey: '' });
+    if (!cfgH.heliusApiKey) return;
+    const jr = await chrome.storage.local.get({ mqlTradeLog: [] });
+    const arr = jr.mqlTradeLog || [];
+    const closesAll = arr.filter((x) => x.closedDetected);
+    const cand = closesAll.find((x) => x.settled === true && x.walletTruth === undefined && x.evWindow);
+    if (!cand) return;
+    await walletTruth(cand, cfgH.heliusApiKey, closesAll);
+    await chrome.storage.local.set({ mqlTradeLog: arr });
+  } catch (e) {}
+}
+// ---- DAILY WALLET RECON: trial balance vs ledger. Wallet SOL at UTC midnight vs
+// midnight (Helius balance-at, exact and cacheable) compared against the sum of that
+// day's settled trade PnLs. Drift = untracked leakage (dust, failed swaps, unjournaled
+// mobile trades). Runs once per UTC day per wallet.
+async function dailyRecon() {
+  try {
+    const cfgH = await chrome.storage.sync.get({ heliusApiKey: '', walletAddress: '' });
+    if (!cfgH.heliusApiKey || !cfgH.walletAddress) return;
+    const today = new Date().toISOString().slice(0, 10);
+    const st = await chrome.storage.local.get({ mqlDailyReconDone: '', mqlTradeLog: [] });
+    if (st.mqlDailyReconDone === today) return;
+    const y = new Date(Date.now() - 86400e3).toISOString().slice(0, 10);
+    const arr = st.mqlTradeLog || [];
+    // recon the ON-CHAIN wallets: configured addresses plus any owner seen in
+    // recent journal rows (UI-alias wallets return 0 forever on Helius)
+    const reconWallets = new Set(parseWallets(cfgH.walletAddress));
+    for (const x of arr) { if (x.ownerAddress && x.closedDetected && Date.now() - x.closedDetected < 7 * 86400e3) reconWallets.add(x.ownerAddress); }
+    for (const wallet of [...reconWallets].slice(0, 4)) {
+      const bal = async (d) => {
+        const r = await fetchJson('https://api.helius.xyz/v1/wallet/' + wallet + '/balance-at?mint=' + SOL_NATIVE + '&datetime=' + d + '&api-key=' + cfgH.heliusApiKey);
+        return r.ok ? Number(r.json.balance || 0) : null;
+      };
+      const [b0, b1] = [await bal(y), await bal(today)];
+      if (b0 == null || b1 == null) continue;
+      const dayStart = Date.parse(y + 'T00:00:00Z'), dayEnd = Date.parse(today + 'T00:00:00Z');
+      const settledSum = arr.filter((x) => x.closedDetected >= dayStart && x.closedDetected < dayEnd && x.officialPnlSol != null && (!x.wallet || x.wallet === wallet))
+        .reduce((s, x) => s + x.officialPnlSol, 0);
+      arr.push({ kind: 'daily_recon', date: y, wallet, startSol: b0, endSol: b1,
+        deltaSol: Math.round((b1 - b0) * 1e6) / 1e6,
+        settledTradeSol: Math.round(settledSum * 1e6) / 1e6, ts: Date.now() });
+    }
+    await chrome.storage.local.set({ mqlTradeLog: arr.slice(-200), mqlDailyReconDone: today });
+  } catch (e) {}
+}
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions(); radarAlertScan(); healthCheck(); reconcileJournal(); walletTruthPass(); dailyRecon(); } });
 chrome.runtime.onInstalled.addListener(() => chrome.alarms.create('mql-watch', { periodInMinutes: 1 }));
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

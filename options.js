@@ -12,9 +12,10 @@ function showToast(text, isError) {
 
 function load() {
   try {
-    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '', radarAlerts: false }, (items) => {
+    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '', radarAlerts: false, heliusApiKey: '' }, (items) => {
       if (chrome.runtime.lastError) return;
       $('jupApiKey').value = (items && items.jupApiKey) ? items.jupApiKey : '';
+      if ($('heliusApiKey')) $('heliusApiKey').value = items.heliusApiKey || '';
       const w = (items && items.mqlWidthPct != null) ? items.mqlWidthPct : 20;
       $('mqlWidthPct').value = w;
       if ($('webhookUrl')) $('webhookUrl').value = items.webhookUrl || '';
@@ -32,10 +33,11 @@ function save(e) {
   const webhookUrl = $('webhookUrl') ? $('webhookUrl').value.trim() : '';
   const walletAddress = $('walletAddress') ? $('walletAddress').value.trim() : '';
   const radarAlerts = $('radarAlerts') ? $('radarAlerts').checked : false;
+  const heliusApiKey = $('heliusApiKey') ? $('heliusApiKey').value.trim() : '';
   let mqlWidthPct = parseFloat($('mqlWidthPct').value);
   if (!isFinite(mqlWidthPct) || mqlWidthPct <= 0) mqlWidthPct = 20;
   try {
-    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress, radarAlerts }, () => {
+    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress, radarAlerts, heliusApiKey }, () => {
       if (chrome.runtime.lastError) {
         showToast('Save failed: ' + chrome.runtime.lastError.message, true);
       } else {
@@ -69,6 +71,14 @@ function loadJournal() {
       const log = st.mqlTradeLog || [], ovr = st.mqlOverrideJournal || [];
       jrRaw = { log, ovr };
       const closes = log.filter((x) => x.closedDetected != null).slice().reverse();
+      const recons = log.filter((x) => x.kind === 'daily_recon').slice().reverse();
+      for (const x of recons.slice(0, 14)) {
+        const drift = Math.round((x.deltaSol - x.settledTradeSol) * 1e6) / 1e6;
+        const tr2 = row($('jrRecon'), [x.date, x.wallet.slice(0, 6) + '…', Number(x.startSol).toFixed(3) + ' → ' + Number(x.endSol).toFixed(3),
+          (x.deltaSol >= 0 ? '+' : '') + Number(x.deltaSol).toFixed(4), (x.settledTradeSol >= 0 ? '+' : '') + Number(x.settledTradeSol).toFixed(4),
+          (drift >= 0 ? '+' : '') + drift.toFixed(4) + (Math.abs(drift) > 0.01 ? ' ⚠' : ' ✓')]);
+        if (Math.abs(drift) > 0.01) tr2.children[5].className = 'jr-neg';
+      }
       const opens = log.filter((x) => x.type === 'COMBO_OPEN').slice().reverse();
       // grade order: official settled (SOL-denominated, Meteora's own rollup) >
       // event-derived provisional (USD) > watcher's last-seen guess
@@ -82,7 +92,11 @@ function loadJournal() {
       for (const x of closes.slice(0, 50)) {
         const pnl = bestPnl(x);
         let pnlTxt = isFinite(pnl) ? (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%' : '—';
-        if (x.officialPnlSolPct != null) pnlTxt += ' SOL (' + (x.officialPnlSol >= 0 ? '+' : '') + Number(x.officialPnlSol).toFixed(4) + ' ◎) ✓settled' + (x.reconMismatch ? ' ⚠' : '');
+        if (x.officialPnlSolPct != null) {
+          pnlTxt += ' SOL (' + (x.officialPnlSol >= 0 ? '+' : '') + Number(x.officialPnlSol).toFixed(4) + ' ◎) ✓settled' + (x.reconMismatch ? ' ⚠' : '');
+          if (x.walletPnlSol != null) pnlTxt += ' · ' + (String(x.walletTruth).indexOf('cluster') === 0 ? x.walletTruth + ' all-in ' : 'all-in ') + (x.walletPnlSol >= 0 ? '+' : '') + Number(x.walletPnlSol).toFixed(4) + ' ◎ (friction ' + (x.frictionSol >= 0 ? '+' : '') + Number(x.frictionSol || 0).toFixed(4) + ')';
+          else if (x.walletTruth === 'unattributable') pnlTxt += ' · wallet-truth: n/a (other wallet activity in window)';
+        }
         else if (x.realizedPnlUsd != null) pnlTxt += ' ($' + (x.realizedPnlUsd >= 0 ? '+' : '') + Number(x.realizedPnlUsd).toFixed(2) + ') · provisional';
         else if (isFinite(pnl)) pnlTxt += ' (last seen)';
         var entryTxt = '—';
