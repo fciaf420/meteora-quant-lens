@@ -70,7 +70,9 @@ function loadJournal() {
       jrRaw = { log, ovr };
       const closes = log.filter((x) => x.closedDetected != null).slice().reverse();
       const opens = log.filter((x) => x.type === 'COMBO_OPEN').slice().reverse();
-      const bestPnl = (x) => Number(x.realizedPnlPct != null ? x.realizedPnlPct : x.lastSeenPnlPct);
+      // grade order: official settled (SOL-denominated, Meteora's own rollup) >
+      // event-derived provisional (USD) > watcher's last-seen guess
+      const bestPnl = (x) => Number(x.officialPnlSolPct != null ? x.officialPnlSolPct : (x.realizedPnlPct != null ? x.realizedPnlPct : x.lastSeenPnlPct));
       const pnls = closes.map(bestPnl).filter(isFinite);
       const wins = pnls.filter((p) => p > 0).length;
       const sum = pnls.reduce((a, b) => a + b, 0);
@@ -80,7 +82,8 @@ function loadJournal() {
       for (const x of closes.slice(0, 50)) {
         const pnl = bestPnl(x);
         let pnlTxt = isFinite(pnl) ? (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%' : '—';
-        if (x.realizedPnlUsd != null) pnlTxt += ' ($' + (x.realizedPnlUsd >= 0 ? '+' : '') + Number(x.realizedPnlUsd).toFixed(2) + ')';
+        if (x.officialPnlSolPct != null) pnlTxt += ' SOL (' + (x.officialPnlSol >= 0 ? '+' : '') + Number(x.officialPnlSol).toFixed(4) + ' ◎) ✓settled' + (x.reconMismatch ? ' ⚠' : '');
+        else if (x.realizedPnlUsd != null) pnlTxt += ' ($' + (x.realizedPnlUsd >= 0 ? '+' : '') + Number(x.realizedPnlUsd).toFixed(2) + ') · provisional';
         else if (isFinite(pnl)) pnlTxt += ' (last seen)';
         var entryTxt = '—';
         if (x.entryOrigin === 'override') entryTxt = (x.entryCls || '?') + ' OVERRIDE' + (x.entryEdge != null ? ' @ ' + Number(x.entryEdge).toFixed(2) : '');
@@ -99,12 +102,12 @@ function loadJournal() {
 }
 function exportCsv() {
   const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-  const lines = ['kind,ts,pool,name,pnlPct,realizedPnlPct,realizedPnlUsd,feesUsd,holdMinutes,entryOrigin,entryCls,entryEdge,entrySigma,entrySigmaSource,entryFeeRateAtOpen,totalSol,depth,share,cls,edge,sigma,feeRate1h,ignoredGates'];
+  const lines = ['kind,ts,pool,name,pnlPct,realizedPnlPct,realizedPnlUsd,feesUsd,officialPnlSolPct,officialPnlSol,officialPnlUsd,settled,holdMinutes,entryOrigin,entryCls,entryEdge,entrySigma,entrySigmaSource,entryFeeRateAtOpen,totalSol,depth,share,cls,edge,sigma,feeRate1h,ignoredGates'];
   for (const x of jrRaw.log) {
-    if (x.closedDetected != null) lines.push(['close', new Date(x.closedDetected).toISOString(), x.pool, x.name, x.lastSeenPnlPct, x.realizedPnlPct, x.realizedPnlUsd, x.feesUsd, x.holdMinutes, x.entryOrigin, x.entryCls, x.entryEdge, x.entrySigma, x.entrySigmaSource, x.entryFeeRateAtOpen, '', '', '', '', '', '', '', ''].map(esc).join(','));
-    else if (x.type === 'COMBO_OPEN') lines.push(['combo_open', new Date(x.finishedAt || x.startedAt).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', x.totalSol, x.depth, x.share, '', '', '', '', ''].map(esc).join(','));
+    if (x.closedDetected != null) lines.push(['close', new Date(x.closedDetected).toISOString(), x.pool, x.name, x.lastSeenPnlPct, x.realizedPnlPct, x.realizedPnlUsd, x.feesUsd, x.officialPnlSolPct, x.officialPnlSol, x.officialPnlUsd, x.settled, x.holdMinutes, x.entryOrigin, x.entryCls, x.entryEdge, x.entrySigma, x.entrySigmaSource, x.entryFeeRateAtOpen, '', '', '', '', '', '', '', ''].map(esc).join(','));
+    else if (x.type === 'COMBO_OPEN') lines.push(['combo_open', new Date(x.finishedAt || x.startedAt).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', x.totalSol, x.depth, x.share, '', '', '', '', ''].map(esc).join(','));
   }
-  for (const x of jrRaw.ovr) lines.push(['override', new Date(x.ts).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', x.cls, x.edge, x.sigma, x.feeRate1h, (x.ignoredGates || []).join('|')].map(esc).join(','));
+  for (const x of jrRaw.ovr) lines.push(['override', new Date(x.ts).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', x.cls, x.edge, x.sigma, x.feeRate1h, (x.ignoredGates || []).join('|')].map(esc).join(','));
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);

@@ -1101,19 +1101,20 @@ async function watchPositions() {
         // TRUE realized PnL from on-chain events (indexed in seconds, unlike the
         // closed-pnl rollup which lags): removes + fee claims - adds, in USD.
         // lastSeen kept as fallback (watcher's final 1-min-tick observation).
-        let realizedPnlUsd = null, realizedPnlPct = null, feesUsd = null;
+        let realizedPnlUsd = null, realizedPnlPct = null, feesUsd = null, ownerAddress = null;
+        const posAddr = k.split(':')[1] || null;
         try {
-          const posAddr = k.split(':')[1];
           if (posAddr) {
             const hev = await fetchJson(DATAPI + '/positions/' + posAddr + '/historical?page_size=100');
             const evs = (hev.ok && hev.json && hev.json.events) || [];
             if (evs.length) {
-              const su = { add: 0, remove: 0, claim_fee: 0 };
+              ownerAddress = evs[0].userAddress || null;  // on-chain owner: the key the closed-pnl rollup indexes by
+              const su = { add: 0, remove: 0, claim_fee: 0, claim_reward: 0 };
               for (const ev of evs) { if (su[ev.eventType] != null) su[ev.eventType] += Number(ev.totalUsd || 0); }
               if (su.add > 0) {
-                realizedPnlUsd = Math.round((su.remove + su.claim_fee - su.add) * 100) / 100;
-                realizedPnlPct = Math.round((su.remove + su.claim_fee - su.add) / su.add * 10000) / 100;
-                feesUsd = Math.round(su.claim_fee * 100) / 100;
+                realizedPnlUsd = Math.round((su.remove + su.claim_fee + su.claim_reward - su.add) * 100) / 100;
+                realizedPnlPct = Math.round((su.remove + su.claim_fee + su.claim_reward - su.add) / su.add * 10000) / 100;
+                feesUsd = Math.round((su.claim_fee + su.claim_reward) * 100) / 100;
               }
             }
           }
@@ -1137,7 +1138,8 @@ async function watchPositions() {
             entrySigmaSource = planC.entrySigmaSource || null;
           }
         } catch (e) {}
-        logArr.push({ pool: rec.pool, name: rec.name, wallet: rec.wallet || null, lastSeenPnlPct: rec.pnl,
+        logArr.push({ pool: rec.pool, name: rec.name, wallet: rec.wallet || null, positionAddress: posAddr, ownerAddress,
+          settled: false, lastSeenPnlPct: rec.pnl,
           realizedPnlPct, realizedPnlUsd, feesUsd,
           entryOrigin, entryCls, entryEdge, entrySigma, entrySigmaSource,
           entryFeeRateAtOpen: (rec.entryFeeRate != null ? Math.round(rec.entryFeeRate * 100) / 100 : null),
@@ -1192,7 +1194,40 @@ async function radarAlertScan() {
 }
 
 chrome.alarms.create('mql-watch', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions(); radarAlertScan(); healthCheck(); } });
+// ---- JOURNAL SETTLEMENT: reconcile provisional (event-derived) close rows against
+// Meteora's official closed-position rollup once it indexes (30min+ lag observed;
+// keyed by the ON-CHAIN owner address from the events, not the watched wallet).
+// Two-phase books: fast provisional at close, official SOL+USD numbers stamped later.
+async function reconcileJournal() {
+  try {
+    const jr = await chrome.storage.local.get({ mqlTradeLog: [] });
+    const arr = jr.mqlTradeLog || [];
+    const now = Date.now();
+    const cands = arr.filter((x) => x.closedDetected && x.settled === false && x.positionAddress && (x.ownerAddress || x.wallet)
+      && now - x.closedDetected > 30 * 60e3);
+    if (!cands.length) return;
+    cands.sort((a, b) => (a.reconLastTry || 0) - (b.reconLastTry || 0));
+    const cand = cands[0];
+    cand.reconLastTry = now;
+    if (now - cand.closedDetected > 48 * 3600e3) { cand.settled = 'timeout'; await chrome.storage.local.set({ mqlTradeLog: arr }); return; }
+    const owner = cand.ownerAddress || cand.wallet;
+    const r = await fetchJson(DATAPI + '/positions/' + cand.pool + '/pnl?user=' + owner + '&status=closed&page_size=50');
+    if (r.ok) {
+      const hit = (r.json.positions || []).find((p) => p.positionAddress === cand.positionAddress);
+      if (hit) {
+        cand.officialPnlUsd = Math.round(Number(hit.pnlUsd) * 100) / 100;
+        cand.officialPnlSol = Math.round(Number(hit.pnlSol) * 1e6) / 1e6;
+        cand.officialPnlPct = Math.round(Number(hit.pnlPctChange) * 100) / 100;        // USD-denominated %
+        cand.officialPnlSolPct = Math.round(Number(hit.pnlSolPctChange) * 100) / 100;  // SOL-denominated % (the user's accounting)
+        cand.settled = true;
+        // sanity: event math vs official USD% should agree closely
+        if (cand.realizedPnlPct != null && Math.abs(cand.realizedPnlPct - cand.officialPnlPct) > 0.5) cand.reconMismatch = true;
+      }
+    }
+    await chrome.storage.local.set({ mqlTradeLog: arr });
+  } catch (e) {}
+}
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions(); radarAlertScan(); healthCheck(); reconcileJournal(); } });
 chrome.runtime.onInstalled.addListener(() => chrome.alarms.create('mql-watch', { periodInMinutes: 1 }));
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
