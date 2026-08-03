@@ -251,7 +251,9 @@ function buildRecommendation(s) {
   const W = Math.round(clamp((s.sigma || 60) / 4, 12, 30));
   // TP anchored to earnable PnL for two-sided Spot: capped appreciation (W/4) + ~half-day fee take.
   // (A clean pump-out of a +-W band only yields ~W/4 + traversal fees; chop/fees are the real engine.)
-  const tp = Math.round(clamp(W / 4 + (s.feeRate1h || 0) * 0.5, 8, 25));
+  // CAP-AWARE (mirror of dlmm-quant): min clamp 8->4 - a low-fee entry can only earn
+  // ~W/4+fees, and a TP above that is fictional (OOR-UP books the pump-out anyway).
+  const tp = Math.round(clamp(W / 4 + (s.feeRate1h || 0) * 0.5, 4, 25));
   // SL just inside the structural band-break value (~ -0.75W when fully exited below).
   const sl = Math.round(clamp(0.75 * W + 2, 8, 20));
   // hard warnings first
@@ -271,32 +273,37 @@ function buildRecommendation(s) {
     ];
   } else if (s.verdict && s.verdict.class === 'BASING') {
     r.params = { strategy: 'Spot', minPct: -18, maxPct: 18, mode: 'two' };
-    r.plan = { cls: 'BASING', tp: 20, sl: 15, widthPct: 18, stopPrice: (s.dayLow ? s.dayLow * 0.98 : null) };
+    // cap-aware: 18/4=4.5 appreciation cap + ~1 day of fees
+    const tpB = Math.min(20, Math.max(6, Math.round(4.5 + (s.feeRate1h || 0))));
+    r.plan = { cls: 'BASING', tp: tpB, sl: 15, widthPct: 18, stopPrice: (s.dayLow ? s.dayLow * 0.98 : null) };
     r.action = 'REVERSION'; r.headline = 'Crash is over, base is forming, real buyers absorbing — straddle the base.';
     r.steps = [
       'Two-sided Spot centered, width ±18%',
       'Stop: price below ' + (s.dayLow ? (s.dayLow * 0.98).toExponential(3) : 'the base low') + ' (thesis dead)',
-      'Brackets: TP +20% / SL -15%',
+      'Brackets: TP +' + tpB + '% / SL -15% (TP = W/4 cap + ~1 day of fees)',
       'Exit if the fee rate halves from here'
     ];
   } else if (s.verdict && s.verdict.class === 'CARRY') {
     r.params = { strategy: 'Spot', minPct: -35, maxPct: 35, mode: 'two' };
-    r.plan = { cls: 'CARRY', tp: 15, sl: 12, widthPct: 35 };
+    // cap-aware: 35/4=8.75 appreciation cap + ~2 days of fees (carries are multi-day)
+    const tpC = Math.min(15, Math.max(6, Math.round(8.75 + (s.feeRate1h || 0) * 2)));
+    r.plan = { cls: 'CARRY', tp: tpC, sl: 12, widthPct: 35 };
     r.action = 'CARRY'; r.headline = 'Calm, mature, organic-buying pool that overpays for its risk — park and ride.';
     r.steps = [
       'Two-sided Spot, WIDE: ±35% (durability over density)',
-      'Brackets: TP +15% / SL -12%',
+      'Brackets: TP +' + tpC + '% / SL -12% (TP = W/4 cap + ~2 days of fees)',
       'Exit when the fee rate falls below 50% of today\'s ' + (s.feeRate1h || 0).toFixed(1) + '%/day',
       'No re-centering — carries ride'
     ];
   } else if (s.verdict && s.verdict.class === 'SQUEEZE') {
     const Wq = s.squeezeW || 20;
     r.params = { strategy: 'Bid Ask', minPct: -Wq, maxPct: Wq, mode: 'two' };
-    r.plan = { cls: 'SQUEEZE', tp: Math.round(Wq/3 + (s.feeRate1h||0)*0.5), sl: Math.round(0.7*Wq+2), widthPct: Wq };
+    const tpQ = Math.min(25, Math.max(5, Math.round(Wq/3 + (s.feeRate1h||0)*0.5)));
+    r.plan = { cls: 'SQUEEZE', tp: tpQ, sl: Math.round(0.7*Wq+2), widthPct: Wq };
     r.action = 'SQUEEZE'; r.headline = 'Vol coiled to ' + (s.sigmaRatio ? Math.round(s.sigmaRatio*100) + '%' : '<60%') + ' of its norm \u2014 bet on range expansion, either direction.';
     r.steps = [
       'Two-sided BID-ASK, width \u00b1' + Wq + '% (edges loaded, center thin \u2014 pays on the breakout)',
-      'Brackets: TP +' + Math.round(Wq/3 + (s.feeRate1h||0)*0.5) + '% / SL -' + Math.round(0.7*Wq+2) + '%',
+      'Brackets: TP +' + tpQ + '% / SL -' + Math.round(0.7*Wq+2) + '%',
       'Time-stop: if unresolved in ~24h, take capital back (dead coil)',
       'This is the LONG-vol play \u2014 opposite book to Spot classes; it loses to endless chop, wins on the rip'
     ];
