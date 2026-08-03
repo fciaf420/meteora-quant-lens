@@ -789,6 +789,31 @@ async function getRadar() {
     } catch (e) {}
   }
   items.sort((a, b) => (a.kind === b.kind ? (b.edge || 0) - (a.edge || 0) : a.kind === 'FULL' ? -1 : 1));
+  // SHADOW LOG (mirror of dlmm-quant): persist every fresh radar evaluation for
+  // counterfactual replay. Chrome is open far more than the daemon runs, so this
+  // is the primary collector. Export from Options -> drop into the CLI folder ->
+  // node replay.cjs. Capped FIFO ~15k rows (~2 weeks at 3-min builds).
+  try {
+    const shRows = [];
+    for (const rp of results) {
+      if (!rp || !rp.d || !rp.d.ok) continue;
+      const d = rp.d;
+      shRows.push({ t: Date.now(), pool: d.pool.address, name: d.pool.name, tvl: Math.round(d.pool.tvl || 0),
+        fr: +(d.feeRate1h || 0).toFixed(2), sg: +(d.surge || 0).toFixed(2), ac: +(d.accel || 0).toFixed(2),
+        sigma: d.sigma != null ? +d.sigma.toFixed(1) : null, src: d.sigmaSource === 'rv5m' ? 'rv' : 'lg',
+        edge: d.edge != null ? +d.edge.toFixed(3) : null, ofi: d.ofi1h != null ? +d.ofi1h.toFixed(2) : null,
+        ofi6: d.ofi6h != null ? +d.ofi6h.toFixed(2) : null, org: Math.round(d.organicScore || 0), path: d.path,
+        ageH: d.tokenAgeHours != null ? +d.tokenAgeHours.toFixed(1) : null,
+        dd: d.ddHigh != null ? Math.round(d.ddHigh) : null,
+        sig: (d.verdict && d.verdict.class !== 'NONE') ? d.verdict.class : null,
+        w: (d.recommendation && d.recommendation.plan && d.recommendation.plan.widthPct) || null });
+    }
+    if (shRows.length) {
+      const shSt = await chrome.storage.local.get({ mqlShadow: [] });
+      const shAll = (shSt.mqlShadow || []).concat(shRows);
+      await chrome.storage.local.set({ mqlShadow: shAll.slice(-15000) });
+    }
+  } catch (e) {}
   const kept = items.slice(0, 6);
   // oldestDataTs = true age of the stalest per-pool snapshot inside this build
   // (poolCache can serve reads up to 60s older than the radar build itself)

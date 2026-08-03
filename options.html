@@ -65,7 +65,8 @@
       <table class="jr-table" id="jrOverrides"><thead><tr><th>when</th><th>pool</th><th>class</th><th>edge</th><th>σ</th><th>fee%/d</th><th>gates ignored</th></tr></thead><tbody></tbody></table>
       <h3>Daily wallet recon (Helius)</h3>
       <table class="jr-table" id="jrRecon"><thead><tr><th>day</th><th>wallet</th><th>SOL start → end</th><th>Δ wallet</th><th>Σ settled trades</th><th>drift</th></tr></thead><tbody></tbody></table>
-      <div class="actions"><button id="jrExport" type="button">Export CSV</button></div>
+      <div class="actions"><button id="jrExport" type="button">Export CSV</button> <button id="shExport" type="button">Export shadow log (JSONL)</button> <span id="shCount" class="hint"></span></div>
+      <p class="hint">Shadow log = every radar evaluation (signal or not). Drop the JSONL into your dlmm-quant folder and run <strong>node replay.cjs</strong> for entry-gate calibration curves.</p>
     </section>
   </main>
   <script src="options.js"></script>

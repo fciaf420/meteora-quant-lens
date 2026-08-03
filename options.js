@@ -130,12 +130,27 @@ function exportCsv() {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
+function exportShadow() {
+  chrome.storage.local.get({ mqlShadow: [] }, (st) => {
+    const rows = st.mqlShadow || [];
+    if (!rows.length) { showToast('Shadow log is empty — it fills as the radar runs', true); return; }
+    const blob = new Blob([rows.map((r) => JSON.stringify(r)).join('\n') + '\n'], { type: 'application/x-ndjson' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'shadow-lens-' + new Date().toISOString().slice(0, 10) + '.jsonl';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   load();
   loadJournal();
   const form = $('mql-form');
   if (form) form.addEventListener('submit', save);
   if ($('jrExport')) $('jrExport').addEventListener('click', exportCsv);
+  if ($('shExport')) $('shExport').addEventListener('click', exportShadow);
+  try { chrome.storage.local.get({ mqlShadow: [] }, (st) => { if ($('shCount')) $('shCount').textContent = (st.mqlShadow || []).length + ' observations collected'; }); } catch (e) {}
 });
 
 document.addEventListener('DOMContentLoaded', () => {
