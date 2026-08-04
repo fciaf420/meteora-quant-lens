@@ -1024,7 +1024,10 @@ async function watchPositions() {
         // [plan - 15min, plan + 6h]. Intent is not execution.
         const posCreatedMs = Number(pos.createdAt || 0) * 1000;
         const planRaw9 = plans[pool] && (Date.now() - (plans[pool].ts || 0) < 7 * 86400e3) ? plans[pool] : null;
-        const planEarly = (planRaw9 && (!posCreatedMs || (posCreatedMs >= (planRaw9.ts || 0) - 900e3 && posCreatedMs - (planRaw9.ts || 0) < 6 * 3600e3))) ? planRaw9 : null;
+        // structural guard on top of the time window: a plan whose planned width is
+        // wildly different from the actual band is someone else's trade
+        const wOK9 = !planRaw9 || !planRaw9.widthPct || !isFinite(W) || Math.abs(W - planRaw9.widthPct) <= Math.max(12, planRaw9.widthPct * 0.6);
+        const planEarly = (planRaw9 && wOK9 && (!posCreatedMs || (posCreatedMs >= (planRaw9.ts || 0) - 900e3 && posCreatedMs - (planRaw9.ts || 0) < 6 * 3600e3))) ? planRaw9 : null;
         const hudBase = posBaseAll[pool];
         const entryFeeRate = (planEarly && planEarly.entryFeeRate > 0) ? planEarly.entryFeeRate
           : (hudBase && hudBase.entryFeeRate > 0) ? hudBase.entryFeeRate
@@ -1214,6 +1217,14 @@ async function watchPositions() {
           holdMinutes: Math.round((Date.now() - rec.firstSeen) / 60e3) });
         delete lp[k];
         if (bl.mqlPosBaseline && bl.mqlPosBaseline[rec.pool]) delete bl.mqlPosBaseline[rec.pool];
+        // PLAN CONSUMED ON CLOSE: a plan that predates the trade that just closed
+        // belonged to THAT trade - it must not survive to bind a later position
+        // (caught live: a BASING plan outlived its +1.9%% win and poisoned the
+        // next position's baseline 37 minutes later).
+        if (plans[rec.pool] && (plans[rec.pool].ts || 0) <= (rec.firstSeen || Date.now()) + 600e3) {
+          delete plans[rec.pool];
+          await chrome.storage.local.set({ mqlEntryPlan: plans });
+        }
         const pnlShow = (realizedPnlPct != null) ? realizedPnlPct : rec.pnl;
         const pnlTag = (realizedPnlPct != null) ? 'realized' : 'last seen';
         await postDiscord(cfg.webhookUrl, '**Meteora Lens** \u00b7 \ud83d\udccb Position closed: ' + rec.name + ' \u2014 ' + pnlTag + ' PnL ' + (pnlShow >= 0 ? '+' : '') + pnlShow.toFixed(1) + '%' + (realizedPnlUsd != null ? ' ($' + (realizedPnlUsd >= 0 ? '+' : '') + realizedPnlUsd.toFixed(2) + (feesUsd ? ', fees $' + feesUsd.toFixed(2) : '') + ')' : '') + ' after ~' + Math.round((Date.now() - rec.firstSeen) / 60e3) + 'min. Journaled.');

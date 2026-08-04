@@ -736,6 +736,12 @@
   // after the plan was journaled (intent is not execution)
   function planMatchesPos(plan) {
     if (!plan) return false;
+    // STRUCTURE GUARD (the decisive one): an Apply CLICK journals intent minutes
+    // before a differently-shaped position can open, so time windows alone can't
+    // reject it - but a plan whose width is wildly different from the actual band
+    // is a different trade. (Caught live: BASING ±18 plan vs a -1..-72%% ladder.)
+    var wp = state.apiPos && state.apiPos.widthPct;
+    if (plan.widthPct && wp && isFinite(wp) && Math.abs(wp - plan.widthPct) > Math.max(12, plan.widthPct * 0.6)) return false;
     var ca = state.apiPos && state.apiPos.createdAt;
     if (!ca || !isFinite(ca)) return true;  // no creation data: keep old behavior
     var t = ca * 1000;
