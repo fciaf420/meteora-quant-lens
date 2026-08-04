@@ -892,8 +892,14 @@ function summarizePositions(ps) {
   }
   const aggPnl = (weighted && vsum > 0) ? (wsum / vsum)
     : legs.reduce((s, l) => s + (isFinite(l.pnlPct) ? l.pnlPct : 0), 0) / Math.max(legs.length, 1);
-  // accumulation profile: whole book sits at/below price, or price already fell through
-  const accum = isFinite(cur) && (maxAll <= cur * 1.05 || cur < minAll);
+  // accumulation profile: DEPOSIT COMPOSITION is the truth (caught live: the old
+  // geometry check "band top at/above price" flips FALSE once price falls >5% INTO
+  // the band - i.e. the accumulation working as designed - and the scalp rulebook
+  // then fires EXIT on FREEFALL). A book whose deposits were ~100% SOL is a
+  // below-price ladder, permanently, regardless of where price sits now.
+  const depAcc = ps.map(depositAccum).filter((v) => v != null);
+  const accum = depAcc.length ? depAcc.every((v) => v === true)
+    : (isFinite(cur) && (maxAll <= cur * 1.05 || cur < minAll));  // geometry fallback
   let fillSum = 0, fillN = 0, fillMethod = null;
   for (let i = 0; i < ps.length; i++) {
     const f = positionFill(ps[i], cur);
@@ -909,6 +915,7 @@ function summarizePositions(ps) {
     combo: legs.length > 1,
     depositsSol: Math.round(depSum * 1e6) / 1e6,
     accum, fillPct, fillMethod,
+    createdAt: Math.min(...ps.map((p) => Number(p.createdAt || 0)).filter((t) => t > 0).concat([Infinity])) || null,
     minPrice: minAll, maxPrice: maxAll,
     legs
   };
@@ -951,6 +958,18 @@ async function healthCheck() {
 
 function parseWallets(s) {
   return String(s || '').split(/[\s,;]+/).map((w) => w.trim()).filter(Boolean).slice(0, 3);
+}
+// deposit-composition accum test: <5% of all-time deposits on the token side
+// = single-sided SOL ladder (time-invariant, unlike band-vs-price geometry)
+function depositAccum(pos) {
+  try {
+    const dep = pos.allTimeDeposits || pos.all_time_deposits;
+    if (!dep) return null;
+    const xU = Number((dep.tokenX && dep.tokenX.usd) || (dep.token_x && dep.token_x.usd) || 0);
+    const tU = Number((dep.total && dep.total.usd) || 0);
+    if (!(tU > 0)) return null;
+    return xU / tU < 0.05;
+  } catch (e) { return null; }
 }
 async function watchPositions() {
   const cfg = await chrome.storage.sync.get({ webhookUrl: '', walletAddress: '' });
@@ -999,7 +1018,13 @@ async function watchPositions() {
         const prevSnap = st.mqlLastPos[key];
         // Baseline preference: Apply-time (journaled) > HUD first-seen store > own
         // rolling snapshot > current rate. Keeps HUD and background on ONE baseline.
-        const planEarly = plans[pool] && (Date.now() - (plans[pool].ts || 0) < 7 * 86400e3) ? plans[pool] : null;
+        // PLAN-BINDING GUARD (caught live: a BASING plan journaled at Apply-click but
+        // never executed poisoned a LATER accum position's baseline, firing a fake
+        // 65% fee-decay EXIT): a plan only binds if the position was CREATED within
+        // [plan - 15min, plan + 6h]. Intent is not execution.
+        const posCreatedMs = Number(pos.createdAt || 0) * 1000;
+        const planRaw9 = plans[pool] && (Date.now() - (plans[pool].ts || 0) < 7 * 86400e3) ? plans[pool] : null;
+        const planEarly = (planRaw9 && (!posCreatedMs || (posCreatedMs >= (planRaw9.ts || 0) - 900e3 && posCreatedMs - (planRaw9.ts || 0) < 6 * 3600e3))) ? planRaw9 : null;
         const hudBase = posBaseAll[pool];
         const entryFeeRate = (planEarly && planEarly.entryFeeRate > 0) ? planEarly.entryFeeRate
           : (hudBase && hudBase.entryFeeRate > 0) ? hudBase.entryFeeRate
@@ -1051,7 +1076,9 @@ async function watchPositions() {
         // ---- ACCUMULATION profile: own rulebook (priors pending calibration) ----
         // detected once at first sight (band at/below price) and persisted; scalp
         // TP/SL alerts don't apply to a bag-building band.
-        const isAccum = (prevSnap && typeof prevSnap.accum === 'boolean')
+        const daPos = depositAccum(pos);
+        const isAccum = (daPos != null) ? daPos   // deposit truth outranks stale persistence
+          : (prevSnap && typeof prevSnap.accum === 'boolean')
           ? prevSnap.accum
           : (isFinite(maxP) && isFinite(cur) && (maxP <= cur * 1.05 || cur < minP));
         st.mqlLastPos[key].accum = isAccum;

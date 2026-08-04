@@ -587,6 +587,21 @@
 
   var startCombo = safe(function startCombo(depth, share, totalSol) {
     var startCount = (state.apiPos && state.apiPos.count) || 0;
+    // journal the combo's OWN entry plan: correct class label, correct fee baseline
+    // (previously the combo wrote no plan, so a stale Apply-click plan could bind)
+    try {
+      chrome.storage.local.get({ mqlEntryPlan: {} }, safe(function (jr9) {
+        var plans9 = jr9.mqlEntryPlan || {};
+        plans9[state.pool] = { cls: 'ACCUM', pool: state.pool, ts: Date.now(),
+          widthPct: Math.round(depth / 2), accum: true,
+          entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null,
+          entryEdge: (state.data && state.data.edge != null) ? Math.round(state.data.edge * 100) / 100 : null,
+          entrySigma: (state.data && state.data.sigma != null) ? Math.round(state.data.sigma * 10) / 10 : null,
+          entrySigmaSource: (state.data && state.data.sigmaSource) || null };
+        chrome.storage.local.set({ mqlEntryPlan: plans9 });
+        state.entryPlan = plans9[state.pool];
+      }));
+    } catch (e) {}
     comboFlow.st = { poolAddr: state.pool, depth: depth, share: share, totalSol: totalSol,
       leg: 1, startedAt: Date.now(), startCount: startCount, lastCount: startCount,
       startDeposits: (state.apiPos && state.apiPos.depositsSol != null ? Number(state.apiPos.depositsSol) : 0),
@@ -717,6 +732,16 @@
     }
   });
 
+  // a journaled plan binds to a position only if the position was CREATED shortly
+  // after the plan was journaled (intent is not execution)
+  function planMatchesPos(plan) {
+    if (!plan) return false;
+    var ca = state.apiPos && state.apiPos.createdAt;
+    if (!ca || !isFinite(ca)) return true;  // no creation data: keep old behavior
+    var t = ca * 1000;
+    return t >= (plan.ts || 0) - 900e3 && t - (plan.ts || 0) < 6 * 3600e3;
+  }
+
   function pollMyPosition() {
     if (ctxDead) return;
     try {
@@ -754,9 +779,11 @@
         st.mqlPosBaseline[state.pool] = base;
         chrome.storage.local.set({ mqlPosBaseline: st.mqlPosBaseline });
       }
-      // Apply-time baseline outranks first-seen (parity with the background watcher)
+      // Apply-time baseline outranks first-seen (parity with the background watcher).
+      // PLAN-BINDING GUARD: only when the position was created within [plan-15m, plan+6h]
+      // — an Apply click without a signed trade must never bind to a later position.
       if (state.entryPlan && state.entryPlan.pool === state.pool && state.entryPlan.entryFeeRate > 0 &&
-          Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3) {
+          Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3 && planMatchesPos(state.entryPlan)) {
         base = Object.assign({}, base, { entryFeeRate: state.entryPlan.entryFeeRate });
       }
       // real position width: parse the range prices from the position row (handles 0.0\u2084426-style subscripts)
@@ -859,7 +886,7 @@
           var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
           // entry plan (journaled at Apply) outranks generic width-math
           var plan = (state.entryPlan && state.entryPlan.pool === state.pool &&
-                      Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3) ? state.entryPlan : null;
+                      Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3 && planMatchesPos(state.entryPlan)) ? state.entryPlan : null;
           var tpB = plan && plan.tp ? plan.tp : Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
           var slB = plan && plan.sl ? plan.sl : Math.round(clampN(0.75 * Wp + 2, 8, 20));
           var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;  // API only — DOM rows contain unrelated %s
