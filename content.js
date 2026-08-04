@@ -595,6 +595,7 @@
         plans9[state.pool] = { cls: 'ACCUM', pool: state.pool, ts: Date.now(),
           widthPct: Math.round(depth / 2), accum: true,
           entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null,
+          entryFeeRate24h: (state.data && state.data.feeRate24h > 0) ? state.data.feeRate24h : null,
           entryEdge: (state.data && state.data.edge != null) ? Math.round(state.data.edge * 100) / 100 : null,
           entrySigma: (state.data && state.data.sigma != null) ? Math.round(state.data.sigma * 10) / 10 : null,
           entrySigmaSource: (state.data && state.data.sigmaSource) || null };
@@ -781,7 +782,7 @@
       document.documentElement.setAttribute("data-mql-pw", "storage-cb");
       var base = st.mqlPosBaseline[state.pool];
       if (!base) {
-        base = { entryFeeRate: d.feeRate1h, sigma: d.sigma, ts: Date.now() };
+        base = { entryFeeRate: d.feeRate1h, feeRate24h: d.feeRate24h, sigma: d.sigma, ts: Date.now() };
         st.mqlPosBaseline[state.pool] = base;
         chrome.storage.local.set({ mqlPosBaseline: st.mqlPosBaseline });
       }
@@ -790,8 +791,10 @@
       // — an Apply click without a signed trade must never bind to a later position.
       if (state.entryPlan && state.entryPlan.pool === state.pool && state.entryPlan.entryFeeRate > 0 &&
           Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3 && planMatchesPos(state.entryPlan)) {
-        base = Object.assign({}, base, { entryFeeRate: state.entryPlan.entryFeeRate });
+        base = Object.assign({}, base, { entryFeeRate: state.entryPlan.entryFeeRate, feeRate24h: state.entryPlan.entryFeeRate24h || base.feeRate24h });
       }
+      // spike-bias guard: decay must ALSO be below the pool's normal (24h at entry)
+      var normFee = (base.feeRate24h > 0) ? base.feeRate24h : Infinity;
       // real position width: parse the range prices from the position row (handles 0.0\u2084426-style subscripts)
       var Wp = (state.apiPos && state.apiPos.widthPct) ? state.apiPos.widthPct : 20;
       try {
@@ -825,7 +828,7 @@
       var verdict = "HOLD", cls = "mql-pw-hold", reasons = [];
       if (isAccum) {
         // ACCUM profile: scalp TP/SL/TIGHTEN don't apply (priors pending calibration)
-        var decayFire = d.feeRate1h < 0.5 * base.entryFeeRate && base.entryFeeRate > 2;
+        var decayFire = d.feeRate1h < 0.5 * base.entryFeeRate && d.feeRate1h < normFee && base.entryFeeRate > 2;
         var flowFire = d.ofi1h != null && d.ofi1h > 3 && d.pc1h != null && d.pc1h < -15;
         if (decayFire && flowFire) {
           verdict = "EXIT"; cls = "mql-pw-exit";
@@ -840,9 +843,13 @@
         }
         if (d.path === "FREEFALL" && verdict !== "EXIT") reasons.push("FREEFALL: band filling fast — that is the design; the kill-switch is fee-decay + flow-flip, not price");
       } else {
-      if (d.feeRate1h < 0.5 * base.entryFeeRate && base.entryFeeRate > 2) {
+      if (d.feeRate1h < 0.5 * base.entryFeeRate && d.feeRate1h < normFee && base.entryFeeRate > 2) {
         verdict = "EXIT"; cls = "mql-pw-exit";
-        reasons.push("fee engine decayed " + Math.round(decayPct) + "% from your baseline (" + fmtNum(base.entryFeeRate,1) + " → " + fmtNum(d.feeRate1h,1) + "%/d) — the fees were the trade");
+        reasons.push("fee engine decayed " + Math.round(decayPct) + "% from your baseline (" + fmtNum(base.entryFeeRate,1) + " → " + fmtNum(d.feeRate1h,1) + "%/d) and is below the pool's normal (" + fmtNum(base.feeRate24h,1) + ") — the fees were the trade");
+      }
+      if (d.feeRate1h < 0.5 * base.entryFeeRate && d.feeRate1h >= normFee && verdict === "HOLD") {
+        verdict = "WATCH"; cls = "mql-pw-warn";
+        reasons.push("entry fee spike has passed (" + fmtNum(base.entryFeeRate,1) + " → " + fmtNum(d.feeRate1h,1) + ") but rate is still above the pool's normal " + fmtNum(base.feeRate24h,1) + "%/d — spike over, engine alive");
       }
       if (d.ofi1h != null && d.ofi1h > 3 && d.pc1h != null && d.pc1h < -15) {
         verdict = "EXIT"; cls = "mql-pw-exit";
@@ -1206,6 +1213,7 @@
                   // baseline at the moment you actually entered — Position Watch prefers
                   // this over the first-seen snapshot (which can catch a spike or a lull)
                   entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null,
+                  entryFeeRate24h: (state.data && state.data.feeRate24h > 0) ? state.data.feeRate24h : null,
                   // full entry-time signal snapshot: joined into the close journal row
                   // so every round trip is origin-tagged for calibration
                   entryEdge: (state.data && state.data.edge != null) ? Math.round(state.data.edge * 100) / 100 : null,

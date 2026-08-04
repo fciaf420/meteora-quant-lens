@@ -1032,14 +1032,20 @@ async function watchPositions() {
         const entryFeeRate = (planEarly && planEarly.entryFeeRate > 0) ? planEarly.entryFeeRate
           : (hudBase && hudBase.entryFeeRate > 0) ? hudBase.entryFeeRate
           : (prevSnap && prevSnap.entryFeeRate != null) ? prevSnap.entryFeeRate : feeRate;
+        // pool's NORMAL fee level at entry (spike-bias guard for DECAY)
+        const norm24 = (planEarly && planEarly.entryFeeRate24h > 0) ? planEarly.entryFeeRate24h
+          : (hudBase && hudBase.feeRate24h > 0) ? hudBase.feeRate24h
+          : (prevSnap && prevSnap.entryFeeRate24h > 0) ? prevSnap.entryFeeRate24h
+          : ((pd && pd.ok && pd.feeRate24h > 0) ? pd.feeRate24h : null);
         if (!hudBase && feeRate > 0) {
-          posBaseAll[pool] = { entryFeeRate, sigma: (pd && pd.ok) ? pd.sigma : null, ts: Date.now() };
+          posBaseAll[pool] = { entryFeeRate, feeRate24h: norm24, sigma: (pd && pd.ok) ? pd.sigma : null, ts: Date.now() };
         }
         let belowCount = (prevSnap && prevSnap.belowCount) || 0;
-        if (entryFeeRate > 2 && feeRate < 0.5 * entryFeeRate) belowCount++; else belowCount = 0;
+        // spike-bias guard: decay must be below entry-relative threshold AND the pool's normal
+        if (entryFeeRate > 2 && feeRate < 0.5 * entryFeeRate && (!norm24 || feeRate < norm24)) belowCount++; else belowCount = 0;
         st.mqlLastPos[key] = { pool, name, wallet, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
           firstSeen: (prevSnap && prevSnap.firstSeen) || Date.now(),
-          entryFeeRate, belowCount };
+          entryFeeRate, entryFeeRate24h: norm24, belowCount };
         const pnl = Number(pos.pnlSolPctChange);
         const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice), cur = Number(pos.poolActivePrice);
         const mid = (minP + maxP) / 2;
