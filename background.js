@@ -272,16 +272,31 @@ function buildRecommendation(s) {
       'Size small — this is a fee harvest, not a conviction bet'
     ];
   } else if (s.verdict && s.verdict.class === 'BASING') {
-    r.params = { strategy: 'Spot', minPct: -18, maxPct: 18, mode: 'two' };
-    // cap-aware: 18/4=4.5 appreciation cap + ~1 day of fees
-    const tpB = Math.min(20, Math.max(6, Math.round(4.5 + (s.feeRate1h || 0))));
-    r.plan = { cls: 'BASING', tp: tpB, sl: 15, widthPct: 18, stopPrice: (s.dayLow ? s.dayLow * 0.98 : null) };
+    // BASE-ANCHORED BAND: the thesis is "price is chopping on a floor", so the band's
+    // BOTTOM is placed AT that floor (recent consolidation low). Leaving the band
+    // downward then IS the base breaking - the structural stop and the range agree
+    // instead of contradicting. Previously: fixed +-18%% with a stop at the DAY low,
+    // which on a crash-then-rally chart sat multiples below the base (unreachable),
+    // leaving a -15%% PnL stop to end every trade well before the thesis died.
+    const pxB = num(s.currentPrice, 0);
+    const floorB = (s.low6h > 0 && s.low6h < pxB) ? s.low6h
+      : ((s.dayLow > 0 && s.dayLow < pxB) ? s.dayLow : pxB * 0.85);
+    const rawWB = pxB > 0 ? ((pxB - floorB) / pxB) * 100 : 18;
+    const Wb = Math.min(30, Math.max(8, Math.round(rawWB)));
+    const stopB = pxB > 0 ? pxB * (1 - Wb / 100) * 0.98 : null;
+    const tpB = Math.min(20, Math.max(6, Math.round(Wb / 4 + (s.feeRate1h || 0))));
+    // PnL SL is a BACKSTOP below the band-break loss (~0.75W), not the primary rule:
+    // a mean-reversion straddle is structurally long the dip, so a tight PnL stop
+    // fights its own premise.
+    const slB = Math.min(25, Math.max(10, Math.round(0.75 * Wb + 5)));
+    r.params = { strategy: 'Spot', minPct: -Wb, maxPct: Wb, mode: 'two' };
+    r.plan = { cls: 'BASING', tp: tpB, sl: slB, widthPct: Wb, stopPrice: stopB };
     r.action = 'REVERSION'; r.headline = 'Crash is over, base is forming, real buyers absorbing — straddle the base.';
     r.steps = [
-      'Two-sided Spot centered, width ±18%',
-      'Stop: price below ' + (s.dayLow ? (s.dayLow * 0.98).toExponential(3) : 'the base low') + ' (thesis dead)',
-      'Brackets: TP +' + tpB + '% / SL -15% (TP = W/4 cap + ~1 day of fees)',
-      'Exit if the fee rate halves from here'
+      'Two-sided Spot centered, width ±' + Wb + '% — bottom sits ON the base (' + (floorB ? floorB.toExponential(3) : '?') + ')',
+      'Stop: price below ' + (stopB ? stopB.toExponential(3) : 'the base') + ' — the base broke, thesis dead',
+      'Brackets: TP +' + tpB + '% / SL -' + slB + '% (SL is a backstop; the base break is the real exit)',
+      'Exit if the fee rate falls below the pool\'s normal'
     ];
   } else if (s.verdict && s.verdict.class === 'CARRY') {
     r.params = { strategy: 'Spot', minPct: -35, maxPct: 35, mode: 'two' };
@@ -463,7 +478,7 @@ async function buildPoolData(address, settings) {
   const accel = (v30m * 48) / Math.max(v4h * 6, 1);
 
   // --- OHLCV (best effort) ---
-  let ddHigh = null, rangePos = null, dayLow = null;
+  let ddHigh = null, rangePos = null, dayLow = null, low6h = null;
   let candleClose = null;
   let rvSigma = null;
   let trailOut = null;   // recent sigma/fee trail (exported for the HUD sparkline)
@@ -487,6 +502,15 @@ async function buildPoolData(address, settings) {
         if (isFinite(h) && h > hi) hi = h;
         if (isFinite(l) && l > 0 && l < lo) lo = l;
       }
+      // consolidation floor: lowest low of the recent 5m window (the base a BASING
+      // setup is straddling) - distinct from the DAY low, which on a crash-then-rally
+      // chart can sit multiples below the base and make a structural stop unreachable
+      let lo6 = Infinity;
+      for (const c of rvC) {
+        const l = num(pick(c, 'low', 'l', 'Low'), NaN);
+        if (isFinite(l) && l > 0 && l < lo6) lo6 = l;
+      }
+      if (lo6 < Infinity) low6h = lo6;
       const closeSrc = rvC.length ? rvC : dayC;
       const close = closeSrc.length ? num(pick(closeSrc[closeSrc.length - 1], 'close', 'c', 'Close'), NaN) : NaN;
       if (isFinite(hi) && isFinite(close) && hi > 0) ddHigh = (hi - close) / hi * 100;
@@ -652,7 +676,7 @@ async function buildPoolData(address, settings) {
     verdict.reasons = ['\u2713 \u03c3 compressed to ' + Math.round(sigmaRatio * 100) + '% of trailing median (' + Math.round(sigmaTrail) + ' \u2192 ' + Math.round(sigma) + ')',
       '\u2713 CHOP mid-range, balanced organic flow', '\u2713 data-gated: ' + '6+ readings over 45+ min'];
   }
-  const recommendation = buildRecommendation({ verdict, squeezeW, sigmaTrail, sigmaRatio, edge, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl });
+  const recommendation = buildRecommendation({ verdict, squeezeW, sigmaTrail, sigmaRatio, edge, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, low6h, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl });
   // Edge quoted at the RECIPE's width, not the generic default W: edge scales
   // linearly with band width, so a CARRY judged at +-20 math is ~1.75x better at
   // its real +-35 band. Display-level only; verdict gates untouched (calibration).
@@ -670,7 +694,7 @@ async function buildPoolData(address, settings) {
     orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
     tokenAgeHours: ageH,
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
-    path, ddHigh, rangePos, dayLow,
+    path, ddHigh, rangePos, dayLow, low6h,
     pc1h: pc1, pc5m: pc5,
     sigmaTrail, sigmaRatio,
     verdict,
