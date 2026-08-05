@@ -244,6 +244,9 @@ function computePath(pc5, pc1, ddHigh, rangePos) {
 }
 
 
+// BASING requires a consolidation floor within this % of price (see the gate below)
+const BASING_MAX_FLOOR = 25;
+
 // ---- recommendation engine: turns signals into a concrete play ----
 function buildRecommendation(s) {
   const r = { action: 'WAIT', headline: '', steps: [], watch: [] };
@@ -393,7 +396,12 @@ function computeVerdict(m) {
     gate('ofi1h<=1.0', ofi1h <= 1.0),
     gate('organicScore>=60', organicScore >= 60),
     gate('feeRate1h>=15', feeRate1h >= 15),
-    gate('edge>=0.5', edge >= 0.5)
+    gate('edge>=0.5', edge >= 0.5),
+    // TIGHT-BASE GATE: a "base" is a level price is chopping ON. If the nearest
+    // consolidation floor is a third of the way down there is no base to straddle -
+    // the token just hasn't found one yet. Those setups produced the worst losses
+    // (band clamped to max, structure meaningless).
+    gate('floor within ' + BASING_MAX_FLOOR + '%', m.floorPct != null && m.floorPct <= BASING_MAX_FLOOR)
   ];
   const basPass = bas.every((g) => g.pass);
 
@@ -624,9 +632,12 @@ async function buildPoolData(address, settings) {
 
   const path = computePath(pc5, pc1, ddHigh == null ? 0 : ddHigh, rangePos == null ? 0 : rangePos);
 
+  // distance from price down to the recent consolidation floor (BASING's tight-base gate)
+  const floorPct = (low6h > 0 && currentPrice > 0 && low6h < currentPrice)
+    ? ((currentPrice - low6h) / currentPrice) * 100 : null;
   const verdict = computeVerdict({
     edge, surge, accel, organicScore, path, ageH, ofi1h, ofi6h,
-    feeRate1h, tvl, sigma, mintAuthorityDisabled, freezeAuthorityDisabled
+    feeRate1h, tvl, sigma, mintAuthorityDisabled, freezeAuthorityDisabled, floorPct
   });
 
   // ---- delta history + squeeze detection (data-gated) ----
@@ -694,7 +705,7 @@ async function buildPoolData(address, settings) {
     orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
     tokenAgeHours: ageH,
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
-    path, ddHigh, rangePos, dayLow, low6h,
+    path, ddHigh, rangePos, dayLow, low6h, floorPct,
     pc1h: pc1, pc5m: pc5,
     sigmaTrail, sigmaRatio,
     verdict,
