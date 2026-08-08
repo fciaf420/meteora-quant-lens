@@ -1526,6 +1526,88 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg.type === 'getTradeMarks') {
+    (async () => {
+      try {
+        if (!msg.pool) { sendResponse({ ok: false, error: 'missing pool' }); return; }
+        const sc9 = await sessionCacheGet('mqlc:marks:' + msg.pool, 5 * 60e3);
+        if (sc9) { sendResponse(sc9.data); return; }
+        const cfg = await chrome.storage.sync.get({ walletAddress: '', heliusApiKey: '' });
+        const jr = await chrome.storage.local.get({ mqlTradeLog: [] });
+        // candidate on-chain wallets: configured + any owner discovered by the journal
+        const wallets = new Set(parseWallets(cfg.walletAddress));
+        for (const t of jr.mqlTradeLog) if (t.ownerAddress) wallets.add(t.ownerAddress);
+        const pd = await fetchJson(DATAPI + '/pools/' + msg.pool);
+        const tokenMint = pd.ok ? pick(pd.json, 'token_x.address', 'tokenX.address', 'mint_x') : null;
+        const marks = [];
+        const posSigs = new Set();
+        // DLMM entries/exits: every position (open+closed) in this pool per wallet
+        for (const w of [...wallets].slice(0, 3)) {
+          for (const status of ['open', 'closed']) {
+            try {
+              const r = await fetchJson(DATAPI + '/positions/' + msg.pool + '/pnl?user=' + w + '&status=' + status + '&page_size=20');
+              for (const p of ((r.ok && r.json.positions) || [])) {
+                try {
+                  const hev = await fetchJson(DATAPI + '/positions/' + p.positionAddress + '/historical?page_size=100');
+                  for (const ev of ((hev.ok && hev.json.events) || [])) {
+                    posSigs.add(ev.signature);
+                    const t = Math.floor(Number(ev.blockTime) / 1000);
+                    const usd = Number(ev.totalUsd || 0);
+                    if (ev.eventType === 'add')    marks.push({ t, side: 'entry', usd, text: 'LP+ $' + usd.toFixed(0) });
+                    if (ev.eventType === 'remove') marks.push({ t, side: 'exit',  usd, text: 'LP\u2212 $' + usd.toFixed(0) });
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+          }
+        }
+        // spot buys/sells of the token (Helius transfers), excluding position txs
+        if (cfg.heliusApiKey && tokenMint) {
+          for (const w of [...wallets].slice(0, 3)) {
+            try {
+              let cursor = null;
+              for (let pg = 0; pg < 3; pg++) {
+                const r = await fetchJson('https://api.helius.xyz/v1/wallet/' + w + '/transfers?limit=100&api-key=' + cfg.heliusApiKey + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+                if (!r.ok) break;
+                const batch = (r.json && r.json.data) || [];
+                for (const tr of batch) {
+                  if (tr.mint !== tokenMint || posSigs.has(tr.signature)) continue;
+                  marks.push({ t: tr.timestamp, side: tr.direction === 'in' ? 'buy' : 'sell', amt: Number(tr.amount),
+                    text: (tr.direction === 'in' ? 'B ' : 'S ') + Number(tr.amount).toLocaleString(undefined, { maximumFractionDigits: 0 }) });
+                }
+                if (!r.json.pagination || !r.json.pagination.hasMore) break;
+                cursor = r.json.pagination.nextCursor;
+              }
+            } catch (e) {}
+          }
+        }
+        // collapse same-second duplicates (multi-leg txs) and price every mark in SOL
+        marks.sort((a, b) => a.t - b.t);
+        const dedup = [];
+        for (const m of marks) {
+          const prev = dedup[dedup.length - 1];
+          if (prev && prev.side === m.side && Math.abs(prev.t - m.t) <= 2) { prev.usd = (prev.usd || 0) + (m.usd || 0); continue; }
+          dedup.push(m);
+        }
+        // nearest-candle SOL price for vertical placement (chart calibrates units itself)
+        const nowS = Math.floor(Date.now() / 1000);
+        const span = dedup.length ? Math.max(nowS - dedup[0].t + 3600, 6 * 3600) : 24 * 3600;
+        const oh = await fetchJson(DATAPI + '/pools/' + msg.pool + '/ohlcv?timeframe=30m&start_time=' + (nowS - Math.min(span, 7 * 86400)) + '&end_time=' + nowS);
+        const candles = (oh.ok && oh.json.data) || [];
+        const priceAt = (t) => {
+          let best = null, bd = Infinity;
+          for (const c of candles) { const d = Math.abs(c.timestamp - t); if (d < bd) { bd = d; best = c; } }
+          return best ? Number(best.close) : null;
+        };
+        const out = { ok: true, lastSol: candles.length ? Number(candles[candles.length - 1].close) : null,
+          marks: dedup.map((m) => ({ t: m.t, side: m.side, text: m.text, pSol: priceAt(m.t) })).filter((m) => m.pSol > 0) };
+        sessionCacheSet('mqlc:marks:' + msg.pool, out);
+        sendResponse(out);
+      } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+    })();
+    return true;
+  }
+
   if (msg.type === 'getMyPosition') {
     (async () => {
       try {

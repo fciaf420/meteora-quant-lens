@@ -152,7 +152,10 @@
           }), 3000);
         })(12);
         renderFeeBadge();
-        renderGuard(); // guard uses feeRate for the breakeven-vs-pays line context
+        if (marksState.pool !== state.pool) { marksState.tries = 0; pushMarksToChart(); }
+        // renderGuard last + isolated: it can throw (see debug 2026-08-06) and
+        // must never take down the rest of the render chain with it
+        try { renderGuard(); } catch (eG) { window.postMessage({ mql: 'tv-push-debug', why: 'guard-threw', err: String(eG && eG.message || eG) }, '*'); }
       } else if (!ctxDead) {
         renderHUDError(resp && resp.error);
       }
@@ -748,6 +751,31 @@
     var t = ca * 1000;
     return t >= (plan.ts || 0) - 900e3 && t - (plan.ts || 0) < 6 * 3600e3;
   }
+
+  // ---- TRADE MARKS on Meteora's own TradingView chart ----------------------
+  // Data (swaps + LP entries/exits) comes from the background; drawing happens in
+  // the MAIN-world tv-bridge (the widget instance is a page variable). The chart
+  // library itself repositions execution shapes on zoom/pan, so nothing drifts.
+  var marksState = { pool: null, tries: 0 };
+  function pushMarksToChart() {
+    if (ctxDead || !state.pool) { window.postMessage({ mql: 'tv-push-debug', why: 'dead-or-no-pool' }, '*'); return; }
+    window.postMessage({ mql: 'tv-push-debug', why: 'requesting', pool: state.pool }, '*');
+    sendMessage({ type: 'getTradeMarks', pool: state.pool }).then(safe(function (r) {
+      if (!r || !r.ok || !r.marks || !r.marks.length) {
+        window.postMessage({ mql: 'tv-push-debug', why: 'empty-or-error', ok: r && r.ok, err: r && r.error, n: r && r.marks && r.marks.length }, '*');
+        return;
+      }
+      marksState.pool = state.pool;
+      window.postMessage({ mql: 'tv-draw', marks: r.marks, lastSol: r.lastSol }, '*');
+    }));
+  }
+  window.addEventListener('message', safe(function (ev) {
+    if (ev.source !== window || !ev.data || ev.data.mql !== 'tv-status') return;
+    if (ev.data.ready === false && marksState.tries < 6) {
+      marksState.tries++;
+      setTimeout(safe(pushMarksToChart), 5000);   // chart not up yet - retry
+    }
+  }));
 
   function pollMyPosition() {
     if (ctxDead) return;
@@ -1650,7 +1678,11 @@
   // ========================================================================
   // SPA NAVIGATION HANDLING
   // ========================================================================
+  function teardownForNavigationMarks() {
+    try { window.postMessage({ mql: 'tv-clear' }, '*'); marksState.pool = null; } catch (e) {}
+  }
   function teardownForNavigation() {
+    teardownForNavigationMarks();
     stopPolling();
     ["mql-hud", "mql-feebadge", "mql-guard", "mql-combo-banner"].forEach(function (id) {
       var n = document.getElementById(id);
