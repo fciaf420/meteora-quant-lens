@@ -1561,22 +1561,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             } catch (e) {}
           }
         }
-        // spot buys/sells of the token (Helius transfers), excluding position txs
+        // spot buys/sells of the token via Helius ENHANCED transactions.
+        // (v1 wallet/transfers silently misses swap/DLMM token legs - confirmed
+        // live 2026-08-08: a Jupiter buy and a position deposit both absent.)
         if (cfg.heliusApiKey && tokenMint) {
           for (const w of [...wallets].slice(0, 3)) {
             try {
-              let cursor = null;
+              let before = null;
               for (let pg = 0; pg < 3; pg++) {
-                const r = await fetchJson('https://api.helius.xyz/v1/wallet/' + w + '/transfers?limit=100&api-key=' + cfg.heliusApiKey + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
-                if (!r.ok) break;
-                const batch = (r.json && r.json.data) || [];
-                for (const tr of batch) {
-                  if (tr.mint !== tokenMint || posSigs.has(tr.signature)) continue;
-                  marks.push({ t: tr.timestamp, side: tr.direction === 'in' ? 'buy' : 'sell', amt: Number(tr.amount),
-                    text: (tr.direction === 'in' ? 'B ' : 'S ') + Number(tr.amount).toLocaleString(undefined, { maximumFractionDigits: 0 }) });
+                const r = await fetchJson('https://api.helius.xyz/v0/addresses/' + w + '/transactions?api-key=' + cfg.heliusApiKey + '&type=SWAP&limit=100' + (before ? '&before=' + before : ''));
+                if (!r.ok || !Array.isArray(r.json) || !r.json.length) break;
+                for (const tx of r.json) {
+                  if (posSigs.has(tx.signature)) continue;
+                  // net flow of the token for this wallet in this tx
+                  let net = 0;
+                  for (const tt of (tx.tokenTransfers || [])) {
+                    if (tt.mint !== tokenMint) continue;
+                    if (tt.toUserAccount === w) net += Number(tt.tokenAmount) || 0;
+                    if (tt.fromUserAccount === w) net -= Number(tt.tokenAmount) || 0;
+                  }
+                  if (!net) continue;
+                  const amt = Math.abs(net);
+                  marks.push({ t: tx.timestamp, side: net > 0 ? 'buy' : 'sell', amt,
+                    text: (net > 0 ? 'B ' : 'S ') + amt.toLocaleString(undefined, { maximumFractionDigits: 0 }) });
                 }
-                if (!r.json.pagination || !r.json.pagination.hasMore) break;
-                cursor = r.json.pagination.nextCursor;
+                before = r.json[r.json.length - 1].signature;
+                if (r.json.length < 100) break;
               }
             } catch (e) {}
           }
