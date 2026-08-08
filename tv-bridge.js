@@ -131,15 +131,13 @@
   // drawings API is available in this tier: shapes anchored to (time, price)
   // that the chart itself repositions on zoom/pan.
   //
-  // fomo.family-style bubbles floating above the candle: a white halo ring
-  // behind a colored circled-glyph icon (FontAwesome, baked into the TV lib).
-  //   buy  = arrow-circle-up  (f0aa)   sell = arrow-circle-down (f0ab)
-  //   LP+  = plus-circle      (f055)   LP-  = minus-circle      (f056)
+  // fomo.family-style bubbles floating above the candle: plain solid circles
+  // (no glyphs - user preference), color-coded, white halo ring for contrast.
   var STYLE9 = {
-    buy:   { icon: 0xf0aa, color: '#16a34a' },
-    sell:  { icon: 0xf0ab, color: '#dc2626' },
-    entry: { icon: 0xf055, color: '#0ea5e9' },
-    exit:  { icon: 0xf056, color: '#f59e0b' }
+    buy:   { icon: 0xf111, color: '#16a34a' },
+    sell:  { icon: 0xf111, color: '#dc2626' },
+    entry: { icon: 0xf111, color: '#0ea5e9' },
+    exit:  { icon: 0xf111, color: '#f59e0b' }
   };
   function bubbleSize(usd) {
     if (!usd || usd <= 0) return 15;
