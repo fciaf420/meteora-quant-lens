@@ -131,17 +131,28 @@
   // drawings API is available in this tier: shapes anchored to (time, price)
   // that the chart itself repositions on zoom/pan.
   //
-  // fomo.family-style bubbles floating above the candle: plain solid circles
-  // (no glyphs - user preference), color-coded, white halo ring for contrast.
+  // fomo.family-style bubbles floating just above the candle. Premium look is
+  // faked with concentric layers (the icon API is flat): soft outer glow, mid
+  // glow, crisp dark rim, then a bright solid core - neon badge on dark chart.
   var STYLE9 = {
-    buy:   { icon: 0xf111, color: '#16a34a' },
-    sell:  { icon: 0xf111, color: '#dc2626' },
-    entry: { icon: 0xf111, color: '#0ea5e9' },
-    exit:  { icon: 0xf111, color: '#f59e0b' }
+    buy:   { color: '#22c55e', glow: '34,197,94' },
+    sell:  { color: '#ef4444', glow: '239,68,68' },
+    entry: { color: '#38bdf8', glow: '56,189,248' },
+    exit:  { color: '#fbbf24', glow: '251,191,36' }
   };
+  var RIM = '#0d1117';   // matches Meteora's dark chart background
   function bubbleSize(usd) {
     if (!usd || usd <= 0) return 15;
     return Math.max(13, Math.min(30, Math.round(9 + 4.5 * Math.log10(usd))));
+  }
+  function circle(chart, pt, color, size) {
+    var id = chart.createShape(pt, {
+      shape: 'icon', icon: 0xf111, lock: true,
+      disableSelection: true, disableSave: true, disableUndo: true,
+      zOrder: 'top', overrides: { color: color, size: size }
+    });
+    if (id) shapes.push({ id: id });
+    return id;
   }
   function place(chart, marks, scale) {
     var drawn = 0;
@@ -149,23 +160,14 @@
       var m = marks[i];
       var st = STYLE9[m.side] || STYLE9.buy;
       var sz = bubbleSize(m.usd);
-      // float above the candle: anchor on the bar's high plus a small headroom
+      // float just above the candle top
       var base = (m.pHigh || m.pSol) * scale;
-      var pt = { time: Math.floor(m.t), price: base * 1.035 };
+      var pt = { time: Math.floor(m.t), price: base * 1.008 };
       try {
-        // halo ring first (drawn underneath), then the glyph on top
-        var halo = chart.createShape(pt, {
-          shape: 'icon', icon: 0xf111, lock: true,
-          disableSelection: true, disableSave: true, disableUndo: true,
-          zOrder: 'top', overrides: { color: '#ffffff', size: sz + 6 }
-        });
-        if (halo) shapes.push({ id: halo });
-        var id = chart.createShape(pt, {
-          shape: 'icon', icon: st.icon, lock: true,
-          disableSelection: true, disableSave: true, disableUndo: true,
-          zOrder: 'top', overrides: { color: st.color, size: sz }
-        });
-        if (id) { shapes.push({ id: id }); drawn++; }
+        circle(chart, pt, 'rgba(' + st.glow + ',0.16)', sz + 14);  // soft outer glow
+        circle(chart, pt, 'rgba(' + st.glow + ',0.35)', sz + 7);   // mid glow
+        circle(chart, pt, RIM, sz + 3);                             // crisp dark rim
+        if (circle(chart, pt, st.color, sz)) drawn++;               // solid core
       } catch (e) { lastErr = 'shape: ' + e.message; }
     }
     window.postMessage({ mql: 'tv-status', ready: true, drawn: drawn, err: lastErr }, '*');

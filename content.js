@@ -152,7 +152,7 @@
           }), 3000);
         })(12);
         renderFeeBadge();
-        if (marksState.pool !== state.pool) { marksState.tries = 0; pushMarksToChart(); }
+        if (MARKS_ENABLED && marksState.pool !== state.pool) { marksState.tries = 0; pushMarksToChart(); }
         // renderGuard last + isolated: it can throw (see debug 2026-08-06) and
         // must never take down the rest of the render chain with it
         try { renderGuard(); } catch (eG) { window.postMessage({ mql: 'tv-push-debug', why: 'guard-threw', err: String(eG && eG.message || eG) }, '*'); }
@@ -756,8 +756,13 @@
   // Data (swaps + LP entries/exits) comes from the background; drawing happens in
   // the MAIN-world tv-bridge (the widget instance is a page variable). The chart
   // library itself repositions execution shapes on zoom/pan, so nothing drifts.
+  // Feature flag: trade-mark bubbles on the TV chart (v0.7.1-0.7.7). Parked at
+  // user request 2026-08-08 - flip to true to re-enable the whole feature
+  // (bridge, background handler, and styling are all intact behind this gate).
+  var MARKS_ENABLED = false;
   var marksState = { pool: null, tries: 0 };
   function pushMarksToChart() {
+    if (!MARKS_ENABLED) return;
     if (ctxDead || !state.pool) { window.postMessage({ mql: 'tv-push-debug', why: 'dead-or-no-pool' }, '*'); return; }
     window.postMessage({ mql: 'tv-push-debug', why: 'requesting', pool: state.pool }, '*');
     sendMessage({ type: 'getTradeMarks', pool: state.pool }).then(safe(function (r) {
