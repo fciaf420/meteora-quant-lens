@@ -1530,8 +1530,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         if (!msg.pool) { sendResponse({ ok: false, error: 'missing pool' }); return; }
-        const sc9 = await sessionCacheGet('mqlc:marks:' + msg.pool, 5 * 60e3);
-        if (sc9) { sendResponse(sc9.data); return; }
         const cfg = await chrome.storage.sync.get({ walletAddress: '', heliusApiKey: '' });
         const jr = await chrome.storage.local.get({ mqlTradeLog: [] });
         // candidate on-chain wallets: configured + any owner discovered by the journal
@@ -1539,14 +1537,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         for (const t of jr.mqlTradeLog) if (t.ownerAddress) wallets.add(t.ownerAddress);
         const pd = await fetchJson(DATAPI + '/pools/' + msg.pool);
         const tokenMint = pd.ok ? pick(pd.json, 'token_x.address', 'tokenX.address', 'mint_x') : null;
+        // cache: long TTL, but a cheap staleness probe on every hit - if a new
+        // swap of THIS token or a position change happened since the build,
+        // fall through to a full rebuild. Fresh trades appear on next refresh.
+        const sc9 = await sessionCacheGet('mqlc:marks:' + msg.pool, 60 * 60e3);
+        if (sc9 && sc9.data && sc9.data.ok) {
+          let stale = false;
+          const builtAt = Math.floor((sc9.ts || 0) / 1000);
+          const w0 = [...wallets][0];
+          try {
+            if (cfg.heliusApiKey && tokenMint && w0) {
+              const pr = await fetchJson('https://api.helius.xyz/v0/addresses/' + w0 + '/transactions?api-key=' + cfg.heliusApiKey + '&type=SWAP&limit=10');
+              for (const tx of (Array.isArray(pr.json) ? pr.json : [])) {
+                if (tx.timestamp > builtAt && (tx.tokenTransfers || []).some((tt) => tt.mint === tokenMint)) { stale = true; break; }
+              }
+            }
+            if (!stale && w0) {
+              const op = await fetchJson(DATAPI + '/positions/' + msg.pool + '/pnl?user=' + w0 + '&status=open&page_size=20');
+              const posKey = ((op.ok && op.json.positions) || []).map((p) => p.positionAddress).sort().join(',');
+              if (posKey !== (sc9.data.posKey || '')) stale = true;
+            }
+          } catch (e) {}
+          if (!stale) { sendResponse(sc9.data); return; }
+        }
         const marks = [];
         const posSigs = new Set();
+        const openPosKey = [];
         // DLMM entries/exits: every position (open+closed) in this pool per wallet
         for (const w of [...wallets].slice(0, 3)) {
           for (const status of ['open', 'closed']) {
             try {
               const r = await fetchJson(DATAPI + '/positions/' + msg.pool + '/pnl?user=' + w + '&status=' + status + '&page_size=20');
               for (const p of ((r.ok && r.json.positions) || [])) {
+                if (status === 'open') openPosKey.push(p.positionAddress);
                 try {
                   const hev = await fetchJson(DATAPI + '/positions/' + p.positionAddress + '/historical?page_size=100');
                   for (const ev of ((hev.ok && hev.json.events) || [])) {
@@ -1610,6 +1633,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return best ? { close: Number(best.close), high: Number(best.high || best.close) } : null;
         };
         const out = { ok: true, lastSol: candles.length ? Number(candles[candles.length - 1].close) : null,
+          posKey: openPosKey.sort().join(','),
           marks: dedup.map((m) => { const c = priceAt(m.t); return { t: m.t, side: m.side, text: m.text, usd: m.usd, pSol: c && c.close, pHigh: c && c.high }; }).filter((m) => m.pSol > 0) };
         sessionCacheSet('mqlc:marks:' + msg.pool, out);
         sendResponse(out);
