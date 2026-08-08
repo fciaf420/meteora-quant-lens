@@ -131,25 +131,41 @@
   // drawings API is available in this tier: shapes anchored to (time, price)
   // that the chart itself repositions on zoom/pan.
   //
-  // fomo.family-style bubbles: solid circle icons (FontAwesome 0xf111) on the
-  // candle, color by side, size by trade notional.
-  var COLORS = { buy: '#22c55e', sell: '#ef4444', entry: '#38bdf8', exit: '#f59e0b' };
+  // fomo.family-style bubbles floating above the candle: a white halo ring
+  // behind a colored circled-glyph icon (FontAwesome, baked into the TV lib).
+  //   buy  = arrow-circle-up  (f0aa)   sell = arrow-circle-down (f0ab)
+  //   LP+  = plus-circle      (f055)   LP-  = minus-circle      (f056)
+  var STYLE9 = {
+    buy:   { icon: 0xf0aa, color: '#16a34a' },
+    sell:  { icon: 0xf0ab, color: '#dc2626' },
+    entry: { icon: 0xf055, color: '#0ea5e9' },
+    exit:  { icon: 0xf056, color: '#f59e0b' }
+  };
   function bubbleSize(usd) {
-    if (!usd || usd <= 0) return 14;
-    return Math.max(11, Math.min(28, Math.round(8 + 4 * Math.log10(usd))));
+    if (!usd || usd <= 0) return 15;
+    return Math.max(13, Math.min(30, Math.round(9 + 4.5 * Math.log10(usd))));
   }
   function place(chart, marks, scale) {
     var drawn = 0;
     for (var i = 0; i < marks.length; i++) {
       var m = marks[i];
-      var color = COLORS[m.side] || COLORS.buy;
-      var pt = { time: Math.floor(m.t), price: m.pSol * scale };
+      var st = STYLE9[m.side] || STYLE9.buy;
+      var sz = bubbleSize(m.usd);
+      // float above the candle: anchor on the bar's high plus a small headroom
+      var base = (m.pHigh || m.pSol) * scale;
+      var pt = { time: Math.floor(m.t), price: base * 1.035 };
       try {
+        // halo ring first (drawn underneath), then the glyph on top
+        var halo = chart.createShape(pt, {
+          shape: 'icon', icon: 0xf111, lock: true,
+          disableSelection: true, disableSave: true, disableUndo: true,
+          zOrder: 'top', overrides: { color: '#ffffff', size: sz + 6 }
+        });
+        if (halo) shapes.push({ id: halo });
         var id = chart.createShape(pt, {
-          shape: 'icon', icon: 0xf111,   // solid circle
-          lock: true, disableSelection: true, disableSave: true, disableUndo: true,
-          zOrder: 'top',
-          overrides: { color: color, size: bubbleSize(m.usd) }
+          shape: 'icon', icon: st.icon, lock: true,
+          disableSelection: true, disableSave: true, disableUndo: true,
+          zOrder: 'top', overrides: { color: st.color, size: sz }
         });
         if (id) { shapes.push({ id: id }); drawn++; }
       } catch (e) { lastErr = 'shape: ' + e.message; }

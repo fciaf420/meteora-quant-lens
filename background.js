@@ -1597,10 +1597,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const priceAt = (t) => {
           let best = null, bd = Infinity;
           for (const c of candles) { const d = Math.abs(c.timestamp - t); if (d < bd) { bd = d; best = c; } }
-          return best ? Number(best.close) : null;
+          return best ? { close: Number(best.close), high: Number(best.high || best.close) } : null;
         };
         const out = { ok: true, lastSol: candles.length ? Number(candles[candles.length - 1].close) : null,
-          marks: dedup.map((m) => ({ t: m.t, side: m.side, text: m.text, pSol: priceAt(m.t) })).filter((m) => m.pSol > 0) };
+          marks: dedup.map((m) => { const c = priceAt(m.t); return { t: m.t, side: m.side, text: m.text, usd: m.usd, pSol: c && c.close, pHigh: c && c.high }; }).filter((m) => m.pSol > 0) };
         sessionCacheSet('mqlc:marks:' + msg.pool, out);
         sendResponse(out);
       } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
