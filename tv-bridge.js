@@ -130,26 +130,27 @@
   // Library tier - confirmed live: "only available on Trading Platform"). The
   // drawings API is available in this tier: shapes anchored to (time, price)
   // that the chart itself repositions on zoom/pan.
-  var STYLE = {
-    buy:   { shape: 'arrow_up',   color: '#22c55e' },
-    sell:  { shape: 'arrow_down', color: '#ef4444' },
-    entry: { shape: 'arrow_up',   color: '#38bdf8' },
-    exit:  { shape: 'arrow_down', color: '#f59e0b' }
-  };
+  //
+  // fomo.family-style bubbles: solid circle icons (FontAwesome 0xf111) on the
+  // candle, color by side, size by trade notional.
+  var COLORS = { buy: '#22c55e', sell: '#ef4444', entry: '#38bdf8', exit: '#f59e0b' };
+  function bubbleSize(usd) {
+    if (!usd || usd <= 0) return 14;
+    return Math.max(11, Math.min(28, Math.round(8 + 4 * Math.log10(usd))));
+  }
   function place(chart, marks, scale) {
     var drawn = 0;
     for (var i = 0; i < marks.length; i++) {
       var m = marks[i];
-      var st = STYLE[m.side] || STYLE.buy;
+      var color = COLORS[m.side] || COLORS.buy;
+      var pt = { time: Math.floor(m.t), price: m.pSol * scale };
       try {
-        var id = chart.createShape(
-          { time: Math.floor(m.t), price: m.pSol * scale },
-          { shape: st.shape, text: m.text || '', lock: true,
-            disableSelection: true, disableSave: true, disableUndo: true,
-            zOrder: 'top',
-            overrides: { color: st.color, textcolor: st.color, fontsize: 10,
-                         arrowColor: st.color, backgroundColor: st.color } }
-        );
+        var id = chart.createShape(pt, {
+          shape: 'icon', icon: 0xf111,   // solid circle
+          lock: true, disableSelection: true, disableSave: true, disableUndo: true,
+          zOrder: 'top',
+          overrides: { color: color, size: bubbleSize(m.usd) }
+        });
         if (id) { shapes.push({ id: id }); drawn++; }
       } catch (e) { lastErr = 'shape: ' + e.message; }
     }
