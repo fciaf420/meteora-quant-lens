@@ -14,9 +14,13 @@ const DATAPI = 'https://dlmm.datapi.meteora.ag';
 const JUP = 'https://api.jup.ag';
 const CACHE_TTL_MS = 60 * 1000;
 const FETCH_TIMEOUT_MS = 8000;
+const SUPPORTED_SOL_MINT = 'So11111111111111111111111111111111111111112';
+const BID_ASK_FRESH_MS = 2 * 60 * 1000;
 
 // per-pool cache: address -> { ts, data }
 const poolCache = new Map();  // L1: dies with the MV3 service worker (~30s idle)
+const jupTokenCache = new Map();
+const jupTokenInflight = new Map();
 
 // L2 cache in chrome.storage.session: survives service-worker unloads. Without
 // it every 1-min alarm woke a COLD worker and refetched the whole board
@@ -105,7 +109,23 @@ function getSettings() {
 // Raw data fetching
 // ---------------------------------------------------------------------------
 
-async function fetchPoolRaw(address) {
+function usablePoolSeed(address, p) {
+  if (!p || String(p.address || '') !== String(address)) return false;
+  const pair = getPoolPairMeta(p);
+  const ftr = pick(p, 'fee_tvl_ratio', 'feeTvlRatio') || {};
+  const vol = pick(p, 'volume', 'volumes') || {};
+  return !!pair.tokenX.address && !!pair.tokenY.address
+    && pick(p, 'current_price', 'currentPrice', 'price') !== undefined
+    && pick(p, 'tvl', 'liquidity', 'pool_tvl') !== undefined
+    && pick(ftr, '1h', '1H', 'h1') !== undefined && pick(ftr, '24h', '24H', 'h24') !== undefined
+    && pick(vol, '30m', '30M', 'm30') !== undefined && pick(vol, '4h', '4H', 'h4') !== undefined
+    && pick(p, 'dynamic_fee_pct', 'dynamic_fee_percentage', 'dynamicFeePct') !== undefined
+    && (pick(p.pool_config || {}, 'base_fee_pct', 'baseFeePct') !== undefined
+      || pick(p, 'base_fee_pct', 'base_fee_percentage', 'baseFeePct') !== undefined);
+}
+
+async function fetchPoolRaw(address, seed) {
+  if (usablePoolSeed(address, seed)) return { ok: true, json: seed, source: 'board' };
   return fetchJson(DATAPI + '/pools/' + encodeURIComponent(address));
 }
 
@@ -156,8 +176,27 @@ function computeRealizedVol(candles) {
 
 async function fetchJupToken(tokenAddress, apiKey) {
   if (!tokenAddress || !apiKey) return { ok: false, error: 'no key or token address' };
-  const url = JUP + '/tokens/v2/search?query=' + encodeURIComponent(tokenAddress);
-  return fetchJson(url, { 'x-api-key': apiKey });
+  const key = String(tokenAddress);
+  const cached = jupTokenCache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.value;
+  if (jupTokenInflight.has(key)) return jupTokenInflight.get(key);
+  const pending = (async () => {
+    const stored = await sessionCacheGet('mqlc:jup:' + key, CACHE_TTL_MS);
+    if (stored) {
+      jupTokenCache.set(key, { ts: stored.ts, value: stored.data });
+      return stored.data;
+    }
+    const url = JUP + '/tokens/v2/search?query=' + encodeURIComponent(tokenAddress);
+    const value = await fetchJson(url, { 'x-api-key': apiKey });
+    if (value && value.ok) {
+      jupTokenCache.set(key, { ts: Date.now(), value });
+      sessionCacheSet('mqlc:jup:' + key, value);
+    }
+    return value;
+  })();
+  jupTokenInflight.set(key, pending);
+  try { return await pending; }
+  finally { jupTokenInflight.delete(key); }
 }
 
 // pull the latest OHLCV candle out of whatever shape datapi returns
@@ -227,6 +266,108 @@ function computeEdge(feeRate1h, sigma, W) {
   return numer / denom;
 }
 
+function getPoolPairMeta(p) {
+  const x = pick(p, 'token_x', 'tokenX') || {};
+  const y = pick(p, 'token_y', 'tokenY') || {};
+  const tokenX = {
+    address: pick(x, 'address', 'mint') || pick(p, 'mint_x', 'mintX', 'token_x_mint') || null,
+    symbol: pick(x, 'symbol', 'token_symbol') || null,
+    name: pick(x, 'name', 'token_name') || null
+  };
+  const tokenY = {
+    address: pick(y, 'address', 'mint') || pick(p, 'mint_y', 'mintY', 'token_y_mint') || null,
+    symbol: pick(y, 'symbol', 'token_symbol') || null,
+    name: pick(y, 'name', 'token_name') || null
+  };
+  return {
+    tokenX,
+    tokenY,
+    supportedSolPair: !!tokenX.address && tokenX.address !== SUPPORTED_SOL_MINT && tokenY.address === SUPPORTED_SOL_MINT
+  };
+}
+
+function ignitionWidth(sigma) {
+  return Math.round(Math.min(30, Math.max(12, num(sigma, 60) / 4)));
+}
+
+function basingGeometry(s) {
+  const px = num(s.currentPrice, 0);
+  const floor = (s.low6h > 0 && s.low6h < px) ? s.low6h
+    : ((s.dayLow > 0 && s.dayLow < px) ? s.dayLow : px * 0.85);
+  const rawW = px > 0 ? ((px - floor) / px) * 100 : 18;
+  const widthPct = Math.min(30, Math.max(8, Math.round(rawW)));
+  return { floor, widthPct, stopPrice: px > 0 ? px * (1 - widthPct / 100) * 0.98 : null };
+}
+
+function computeRecipeEdges(m) {
+  return {
+    IGNITION: computeEdge(m.feeRate1h, m.sigma, ignitionWidth(m.sigma)),
+    BASING: computeEdge(m.feeRate1h, m.sigma, basingGeometry(m).widthPct),
+    CARRY: computeEdge(m.feeRate1h, m.sigma, 35)
+  };
+}
+
+function computeBidAskSignal(d, now) {
+  now = isFinite(now) ? now : Date.now();
+  d = d || {};
+  const finite = (v) => typeof v === 'number' && isFinite(v);
+  const pairOK = d.supportedSolPair !== undefined ? d.supportedSolPair === true
+    : !!(d.pool && d.pool.supportedSolPair === true);
+  const knownPath = ['FREEFALL', 'BASING', 'BLOWOFF', 'GRIND-UP', 'CHOP'].includes(d.path);
+  const complete = d.ok === true && finite(d.ts) && finite(d.topHoldersPct) && d.topHoldersPct >= 0
+    && finite(d.orgBuy1h) && d.orgBuy1h >= 0 && finite(d.feeRate1h) && d.feeRate1h >= 0
+    && finite(d.feeRate24h) && d.feeRate24h >= 0 && finite(d.ofi1h) && d.ofi1h >= 0
+    && finite(d.sigma) && d.sigma > 0 && knownPath
+    && typeof d.mintAuthorityDisabled === 'boolean' && typeof d.freezeAuthorityDisabled === 'boolean';
+  const gates = [
+    gate('fresh', finite(d.ts) && now >= d.ts && now - d.ts <= BID_ASK_FRESH_MS),
+    gate('complete inputs', complete),
+    gate('token X / SOL Y pair', pairOK),
+    gate('mint+freeze disabled', d.mintAuthorityDisabled === true && d.freezeAuthorityDisabled === true),
+    gate('top10<=35%', finite(d.topHoldersPct) && d.topHoldersPct <= 35),
+    gate('organic buyers present', finite(d.orgBuy1h) && d.orgBuy1h > 0),
+    gate('fee persistence', finite(d.feeRate1h) && finite(d.feeRate24h) && d.feeRate24h >= 8 && d.feeRate1h >= 0.5 * d.feeRate24h),
+    gate('no unbought freefall', typeof d.path === 'string' && finite(d.ofi1h) && !(d.path === 'FREEFALL' && d.ofi1h >= 1.43))
+  ];
+  const ready = gates.every((g) => g.pass);
+  const missing = [];
+  if (d.ok !== true) missing.push('pool data');
+  if (!finite(d.ts)) missing.push('snapshot time');
+  if (!finite(d.sigma) || d.sigma <= 0) missing.push('volatility');
+  if (!finite(d.ofi1h) || d.ofi1h < 0) missing.push('organic flow');
+  if (!finite(d.orgBuy1h) || d.orgBuy1h < 0) missing.push('organic buy volume');
+  if (!finite(d.feeRate1h) || !finite(d.feeRate24h)) missing.push('fee rates');
+  if (!finite(d.topHoldersPct)) missing.push('holder concentration');
+  if (!knownPath) missing.push('price path');
+  let depthPct = null, bidAskPct = null;
+  if (finite(d.sigma) && d.sigma > 0) {
+    const sig = d.sigma;
+    let depth = sig >= 150 ? 75 : (sig <= 80 ? 60 : 60 + ((sig - 80) / 70) * 15);
+    if (finite(d.ddHigh) && d.ddHigh < 20) depth = Math.min(75, depth + 5);
+    if (finite(d.ddHigh) && d.ddHigh > 50) depth = Math.max(60, depth - 5);
+    depthPct = Math.round(depth);
+    let share = 0.55 + (sig - 100) / 1000 + (d.ofi1h > 1 ? 0.05 : 0) + (d.path === 'FREEFALL' ? 0.05 : 0);
+    share = Math.min(0.80, Math.max(0.60, share));
+    bidAskPct = Math.round((Math.round(share * 20) / 20) * 100);
+  }
+  return {
+    name: 'BID ASK',
+    profile: 'ACCUM',
+    state: ready ? 'READY' : 'WAIT',
+    ready,
+    manual: true,
+    heuristic: true,
+    strategy: 'Bid-Ask + Spot',
+    depthPct,
+    allocation: bidAskPct == null ? null : { bidAskPct, spotPct: 100 - bidAskPct },
+    gates: gates.map((g, i) => ({ key: ['fresh','data','pair','auth','top10','flow','fees','path'][i], label: g.label, pass: g.pass })),
+    reasons: ready ? ['all accumulation gates pass; manual wallet approval required']
+      : (!pairOK ? ['Unsupported orientation: BID ASK requires a non-SOL token X and wrapped SOL token Y.']
+        : (missing.length ? ['Waiting for current ' + missing.join(', ') + ' data.']
+          : gates.filter((g) => !g.pass).map((g) => '\u2717 ' + g.label)))
+  };
+}
+
 // breakevenFeePerDay = sigma*sigma/(8*W) / 0.9 * 1.0
 function computeBreakeven(sigma, W) {
   const s = num(sigma);
@@ -251,7 +392,8 @@ const BASING_MAX_FLOOR = 25;
 function buildRecommendation(s) {
   const r = { action: 'WAIT', headline: '', steps: [], watch: [] };
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-  const W = Math.round(clamp((s.sigma || 60) / 4, 12, 30));
+  const W = ignitionWidth(s.sigma);
+  const recipeEdges = s.recipeEdges || computeRecipeEdges(s);
   // TP anchored to earnable PnL for two-sided Spot: capped appreciation (W/4) + ~half-day fee take.
   // (A clean pump-out of a +-W band only yields ~W/4 + traversal fees; chop/fees are the real engine.)
   // CAP-AWARE (mirror of dlmm-quant): min clamp 8->4 - a low-fee entry can only earn
@@ -266,7 +408,8 @@ function buildRecommendation(s) {
 
   if (s.verdict && s.verdict.class === 'IGNITION') {
     r.params = (s.ofi1h > 2) ? { strategy: 'Spot', minPct: -W, maxPct: 0, mode: 'single' } : { strategy: 'Spot', minPct: -W, maxPct: W, mode: 'two' };
-    r.plan = { cls: 'IGNITION', tp: tp, sl: sl, widthPct: W };
+    r.plan = { cls: 'IGNITION', profile: 'TRADE', tp: tp, sl: sl, widthPct: W,
+      minPct: r.params.minPct, maxPct: r.params.maxPct, mode: r.params.mode };
     r.action = 'SCALP'; r.headline = 'Event-driven scalp — fees overpay for risk AND a catalyst is live.';
     r.steps = [
       (s.ofi1h > 2 ? 'Single-sided SOL below price (flow is sell-skewed)' : 'Two-sided Spot centered on price') + ', width ±' + W + '%',
@@ -274,6 +417,7 @@ function buildRecommendation(s) {
       'Exit early if the 1h fee rate halves or surge decays below ~1.05x',
       'Size small — this is a fee harvest, not a conviction bet'
     ];
+    if (r.params.mode === 'single') r.watch.push('Single-sided inventory path is not modeled by EDGE; the displayed value remains a pool-wide symmetric fee/IL proxy.');
   } else if (s.verdict && s.verdict.class === 'BASING') {
     // BASE-ANCHORED BAND: the thesis is "price is chopping on a floor", so the band's
     // BOTTOM is placed AT that floor (recent consolidation low). Leaving the band
@@ -281,19 +425,15 @@ function buildRecommendation(s) {
     // instead of contradicting. Previously: fixed +-18%% with a stop at the DAY low,
     // which on a crash-then-rally chart sat multiples below the base (unreachable),
     // leaving a -15%% PnL stop to end every trade well before the thesis died.
-    const pxB = num(s.currentPrice, 0);
-    const floorB = (s.low6h > 0 && s.low6h < pxB) ? s.low6h
-      : ((s.dayLow > 0 && s.dayLow < pxB) ? s.dayLow : pxB * 0.85);
-    const rawWB = pxB > 0 ? ((pxB - floorB) / pxB) * 100 : 18;
-    const Wb = Math.min(30, Math.max(8, Math.round(rawWB)));
-    const stopB = pxB > 0 ? pxB * (1 - Wb / 100) * 0.98 : null;
+    const bg = basingGeometry(s);
+    const floorB = bg.floor, Wb = bg.widthPct, stopB = bg.stopPrice;
     const tpB = Math.min(20, Math.max(6, Math.round(Wb / 4 + (s.feeRate1h || 0))));
     // PnL SL is a BACKSTOP below the band-break loss (~0.75W), not the primary rule:
     // a mean-reversion straddle is structurally long the dip, so a tight PnL stop
     // fights its own premise.
     const slB = Math.min(25, Math.max(10, Math.round(0.75 * Wb + 5)));
     r.params = { strategy: 'Spot', minPct: -Wb, maxPct: Wb, mode: 'two' };
-    r.plan = { cls: 'BASING', tp: tpB, sl: slB, widthPct: Wb, stopPrice: stopB };
+    r.plan = { cls: 'BASING', profile: 'TRADE', tp: tpB, sl: slB, widthPct: Wb, stopPrice: stopB, minPct: -Wb, maxPct: Wb, mode: 'two' };
     r.action = 'REVERSION'; r.headline = 'Crash is over, base is forming, real buyers absorbing — straddle the base.';
     r.steps = [
       'Two-sided Spot centered, width ±' + Wb + '% — bottom sits ON the base (' + (floorB ? floorB.toExponential(3) : '?') + ')',
@@ -305,7 +445,7 @@ function buildRecommendation(s) {
     r.params = { strategy: 'Spot', minPct: -35, maxPct: 35, mode: 'two' };
     // cap-aware: 35/4=8.75 appreciation cap + ~2 days of fees (carries are multi-day)
     const tpC = Math.min(15, Math.max(6, Math.round(8.75 + (s.feeRate1h || 0) * 2)));
-    r.plan = { cls: 'CARRY', tp: tpC, sl: 12, widthPct: 35 };
+    r.plan = { cls: 'CARRY', profile: 'TRADE', tp: tpC, sl: 12, widthPct: 35, minPct: -35, maxPct: 35, mode: 'two' };
     r.action = 'CARRY'; r.headline = 'Calm, mature, organic-buying pool that overpays for its risk — park and ride.';
     r.steps = [
       'Two-sided Spot, WIDE: ±35% (durability over density)',
@@ -313,50 +453,43 @@ function buildRecommendation(s) {
       'Exit when the fee rate falls below 50% of today\'s ' + (s.feeRate1h || 0).toFixed(1) + '%/day',
       'No re-centering — carries ride'
     ];
-  } else if (s.verdict && s.verdict.class === 'SQUEEZE') {
-    const Wq = s.squeezeW || 20;
-    r.params = { strategy: 'Bid Ask', minPct: -Wq, maxPct: Wq, mode: 'two' };
-    const tpQ = Math.min(25, Math.max(5, Math.round(Wq/3 + (s.feeRate1h||0)*0.5)));
-    r.plan = { cls: 'SQUEEZE', tp: tpQ, sl: Math.round(0.7*Wq+2), widthPct: Wq };
-    r.action = 'SQUEEZE'; r.headline = 'Vol coiled to ' + (s.sigmaRatio ? Math.round(s.sigmaRatio*100) + '%' : '<60%') + ' of its norm \u2014 bet on range expansion, either direction.';
-    r.steps = [
-      'Two-sided BID-ASK, width \u00b1' + Wq + '% (edges loaded, center thin \u2014 pays on the breakout)',
-      'Brackets: TP +' + tpQ + '% / SL -' + Math.round(0.7*Wq+2) + '%',
-      'Time-stop: if unresolved in ~24h, take capital back (dead coil)',
-      'This is the LONG-vol play \u2014 opposite book to Spot classes; it loses to endless chop, wins on the rip'
-    ];
   } else {
     // WAIT: find the closest class and say what would flip it
     const flips = [];
     const near = [];
     const igGates = [
-      ['edge ' + fmt2(s.edge) + ' → need ≥1.0 (fees must beat expected IL)', s.edge >= 1.0],
+      ['recipe edge ' + fmt2(recipeEdges.IGNITION) + ' → need ≥1.0 (pool-wide fee/IL heuristic at the recommended width)', recipeEdges.IGNITION >= 1.0],
       ['surge ' + fmt2(s.surge) + 'x → need ≥1.25x (no catalyst yet)', s.surge >= 1.25],
       ['accel ' + fmt2(s.accel) + 'x → need ≥1.2x (volume not accelerating)', s.accel >= 1.2]
     ];
     const igFails = igGates.filter(g => !g[1]);
     if (igFails.length && igFails.length <= 2) { near.push('SCALP'); igFails.forEach(g => flips.push(g[0])); }
     if (s.path !== 'BASING' && s.ddHigh != null && s.ddHigh >= 40) flips.push('down ' + Math.round(s.ddHigh) + '% from high — becomes a BASING entry once the 5m flattens and 1h > -15%');
-    if (s.edge >= 1.3 && s.ofi6h != null && s.ofi6h >= 1.0) flips.push('CARRY blocked only by flow: 6h organic sellers ' + fmt2(s.ofi6h) + ':1 → flips when < 1.0');
-    if (s.edge >= 1.3 && s.ofi6h != null && s.ofi6h < 1.0 && s.feeRate1h < 2) flips.push('CARRY-grade quality but fees ' + fmt2(s.feeRate1h) + '%/day too thin — flips if activity picks up');
+    if (recipeEdges.CARRY >= 1.3 && s.ofi6h != null && s.ofi6h >= 1.0) flips.push('CARRY blocked only by flow: 6h organic sellers ' + fmt2(s.ofi6h) + ':1 → flips when < 1.0');
+    if (recipeEdges.CARRY >= 1.3 && s.ofi6h != null && s.ofi6h < 1.0 && s.feeRate1h < 2) flips.push('CARRY-grade quality but fees ' + fmt2(s.feeRate1h) + '%/day too thin — flips if activity picks up');
     r.headline = near.length ? 'Close to a ' + near.join('/') + ' setup — not there yet.' : 'Nothing pays for its risk here right now.';
     // override support: nearest-class params + which gates would be ignored
     if (near.indexOf('SCALP') >= 0 && s.path !== 'FREEFALL') {
       r.override = {
         cls: 'SCALP',
         params: (s.ofi1h > 2) ? { strategy: 'Spot', minPct: -W, maxPct: 0, mode: 'single' } : { strategy: 'Spot', minPct: -W, maxPct: W, mode: 'two' },
+        plan: { cls: 'IGNITION_OVERRIDE', profile: 'TRADE', widthPct: W, tp: tp, sl: sl },
         ignoredGates: igFails.map(function (g) { return g[0]; }),
         sizeNote: 'half size — you are trading without the gates'
       };
-    } else if (s.edge >= 1.3 && s.ofi6h != null && s.path !== 'FREEFALL') {
+    } else if (recipeEdges.CARRY >= 1.3 && s.ofi6h != null && s.path !== 'FREEFALL') {
       r.override = {
         cls: 'CARRY',
         params: { strategy: 'Spot', minPct: -35, maxPct: 35, mode: 'two' },
+        plan: { cls: 'CARRY_OVERRIDE', profile: 'TRADE', widthPct: 35, tp: Math.min(15, Math.max(6, Math.round(8.75 + (s.feeRate1h || 0) * 2))), sl: 12 },
         ignoredGates: flips.slice(0, 2),
         sizeNote: 'half size — carry gates not met'
       };
     }
     r.steps = flips.length ? flips.slice(0, 3) : ['This pool needs a volume/fee event or a vol collapse before any entry makes sense.'];
+  }
+  if (s.squeezeDiagnostic && s.squeezeDiagnostic.compressed) {
+    r.watch.push('Volatility compression detected. Informational only: Bid-Ask remains passive liquidity with inventory risk, not a long-vol breakout trade.');
   }
   return r;
 }
@@ -377,10 +510,13 @@ function computeVerdict(m) {
     edge, surge, accel, organicScore, path, ageH, ofi1h, ofi6h,
     feeRate1h, tvl, sigma, mintAuthorityDisabled, freezeAuthorityDisabled
   } = m;
+  const recipeEdges = m.recipeEdges || computeRecipeEdges(m);
+  const pairOK = m.supportedSolPair === true;
 
   // IGNITION gates
   const ign = [
-    gate('edge>=1.0', edge >= 1.0),
+    gate('token X / SOL Y pair', pairOK),
+    gate('recipe edge>=1.0', recipeEdges.IGNITION >= 1.0),
     gate('surge>=1.25', surge >= 1.25),
     gate('accel>=1.2', accel >= 1.2),
     gate('organicScore>=40', organicScore >= 40),
@@ -392,11 +528,12 @@ function computeVerdict(m) {
 
   // BASING gates
   const bas = [
+    gate('token X / SOL Y pair', pairOK),
     gate('path==BASING', path === 'BASING'),
     gate('ofi1h<=1.0', ofi1h <= 1.0),
     gate('organicScore>=60', organicScore >= 60),
     gate('feeRate1h>=15', feeRate1h >= 15),
-    gate('edge>=0.5', edge >= 0.5),
+    gate('recipe edge>=0.5', recipeEdges.BASING >= 0.5),
     // TIGHT-BASE GATE: a "base" is a level price is chopping ON. If the nearest
     // consolidation floor is a third of the way down there is no base to straddle -
     // the token just hasn't found one yet. Those setups produced the worst losses
@@ -407,10 +544,11 @@ function computeVerdict(m) {
 
   // CARRY gates
   const feeCarry = (feeRate1h >= 2)
-    || (feeRate1h >= 1.2 && edge >= 2)
-    || (feeRate1h >= 0.6 && edge >= 3 && sigma < 10);
+    || (feeRate1h >= 1.2 && recipeEdges.CARRY >= 2)
+    || (feeRate1h >= 0.6 && recipeEdges.CARRY >= 3 && sigma < 10);
   const car = [
-    gate('edge>=1.3', edge >= 1.3),
+    gate('token X / SOL Y pair', pairOK),
+    gate('recipe edge>=1.3', recipeEdges.CARRY >= 1.3),
     gate('ofi6h<1.0', ofi6h < 1.0),
     gate('organicScore>=60', organicScore >= 60),
     gate('tvl>=100000', tvl >= 100000),
@@ -448,16 +586,17 @@ function computeVerdict(m) {
 // Assemble full pool payload
 // ---------------------------------------------------------------------------
 
-async function buildPoolData(address, settings) {
+async function buildPoolData(address, settings, poolSeed) {
   const W = num(settings.mqlWidthPct, 20) || 20;
   const hasKey = !!settings.jupApiKey;
 
   // --- Meteora datapi (required) ---
-  const poolResp = await fetchPoolRaw(address);
+  const poolResp = await fetchPoolRaw(address, poolSeed);
   if (!poolResp.ok) {
     return { ok: false, error: 'datapi pool fetch failed: ' + (poolResp.error || poolResp.status) };
   }
   const p = poolResp.json || {};
+  const pair = getPoolPairMeta(p);
 
   // pool descriptors (defensive field names)
   const name = pick(p, 'name', 'pool_name', 'poolName') || address;
@@ -465,6 +604,8 @@ async function buildPoolData(address, settings) {
   const binStep = num(pick(p.pool_config || {}, 'bin_step', 'binStep'), 0) || num(pick(p, 'bin_step', 'binStep'), 0);
   const baseFeePct = num(pick(p, 'pool_config.base_fee_pct', 'base_fee_pct', 'base_fee_percentage', 'baseFeePct'), 0);
   const currentPrice = num(pick(p, 'current_price', 'currentPrice', 'price'), 0);
+  const poolMeta = { name, address, tvl, binStep, baseFeePct, currentPrice,
+    tokenX: pair.tokenX, tokenY: pair.tokenY, supportedSolPair: pair.supportedSolPair };
 
   const ftr = pick(p, 'fee_tvl_ratio', 'feeTvlRatio') || {};
   const feeRate24h = num(pick(ftr, '24h', '24H', 'h24'), 0); // already %/day
@@ -540,18 +681,29 @@ async function buildPoolData(address, settings) {
   };
 
   let jup = null;
-  if (hasKey) {
-    const tokenAddr = pick(p, 'token_x.address', 'tokenX.address', 'mint_x', 'mintX', 'token_x_mint');
+  if (hasKey && pair.supportedSolPair) {
+    const tokenAddr = pair.tokenX.address;
     const jResp = await fetchJupToken(tokenAddr, settings.jupApiKey);
     if (jResp.ok) {
       jup = pickJupToken(jResp.json, tokenAddr);
     }
   }
 
+  if (!pair.supportedSolPair) {
+    const unsupported = Object.assign({}, jupNullPayload, {
+      verdict: { class: 'NONE', reasons: ['SOL recipes require a non-SOL token X and wrapped SOL token Y'] }
+    });
+    return finalize({
+      ok: true, pool: poolMeta, supportedSolPair: false,
+      feeRate1h, feeRate24h, trend, surge, accel,
+      ddHigh, rangePos, dayLow, ts: Date.now()
+    }, unsupported);
+  }
+
   if (!hasKey) {
     return finalize({
       ok: true,
-      pool: { name, address, tvl, binStep, baseFeePct, currentPrice },
+      pool: poolMeta, supportedSolPair: true,
       feeRate1h, feeRate24h, trend, surge, accel,
       ddHigh, rangePos, dayLow,
       ts: Date.now()
@@ -564,7 +716,7 @@ async function buildPoolData(address, settings) {
     degraded.verdict = { class: 'NONE', reasons: ['Jupiter token lookup failed'] };
     return finalize({
       ok: true,
-      pool: { name, address, tvl, binStep, baseFeePct, currentPrice },
+      pool: poolMeta, supportedSolPair: true,
       feeRate1h, feeRate24h, trend, surge, accel,
       ddHigh, rangePos, dayLow,
       ts: Date.now()
@@ -635,9 +787,11 @@ async function buildPoolData(address, settings) {
   // distance from price down to the recent consolidation floor (BASING's tight-base gate)
   const floorPct = (low6h > 0 && currentPrice > 0 && low6h < currentPrice)
     ? ((currentPrice - low6h) / currentPrice) * 100 : null;
+  const recipeEdges = computeRecipeEdges({ feeRate1h, sigma, currentPrice, low6h, dayLow });
   const verdict = computeVerdict({
     edge, surge, accel, organicScore, path, ageH, ofi1h, ofi6h,
-    feeRate1h, tvl, sigma, mintAuthorityDisabled, freezeAuthorityDisabled, floorPct
+    feeRate1h, tvl, sigma, mintAuthorityDisabled, freezeAuthorityDisabled, floorPct,
+    currentPrice, low6h, dayLow, recipeEdges, supportedSolPair: pair.supportedSolPair
   });
 
   // ---- delta history + squeeze detection (data-gated) ----
@@ -677,20 +831,21 @@ async function buildPoolData(address, settings) {
       chrome.storage.local.set({ mqlHistory: (typeof H !== 'undefined' ? H : undefined) || undefined });
     }
   } catch (e) {}
-  let squeezeW = null;
+  let squeezeDiagnostic = null;
   if (verdict.class === 'NONE' && sigmaRatioPersisted && path === 'CHOP'
       && (rangePos == null || (rangePos >= 0.35 && rangePos <= 0.65))
       && ofi1h != null && ofi1h >= 0.5 && ofi1h <= 2 && organicScore >= 60 && ageH >= 24
       && tvl >= 80000 && feeRate1h >= 1) {
-    squeezeW = Math.min(30, Math.max(15, Math.round(sigmaTrail / 4)));
-    verdict.class = 'SQUEEZE';
-    verdict.reasons = ['\u2713 \u03c3 compressed to ' + Math.round(sigmaRatio * 100) + '% of trailing median (' + Math.round(sigmaTrail) + ' \u2192 ' + Math.round(sigma) + ')',
-      '\u2713 CHOP mid-range, balanced organic flow', '\u2713 data-gated: ' + '6+ readings over 45+ min'];
+    squeezeDiagnostic = {
+      compressed: true,
+      ratio: sigmaRatio,
+      note: 'Volatility compression is informational only; passive Bid-Ask liquidity is not a long-vol breakout payoff.'
+    };
   }
-  const recommendation = buildRecommendation({ verdict, squeezeW, sigmaTrail, sigmaRatio, edge, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, low6h, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl });
-  // Edge quoted at the RECIPE's width, not the generic default W: edge scales
-  // linearly with band width, so a CARRY judged at +-20 math is ~1.75x better at
-  // its real +-35 band. Display-level only; verdict gates untouched (calibration).
+  const recommendation = buildRecommendation({ verdict, squeezeDiagnostic, sigmaTrail, sigmaRatio, edge, recipeEdges, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, low6h, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl });
+  // Keep the configured-width yardstick and expose the selected recipe-width quote.
+  // Verdict gates above use the same recipe-width value; both remain pool-wide
+  // heuristics and do not model a position's bin shape, share, or execution costs.
   const recipeW = (recommendation && recommendation.plan && recommendation.plan.widthPct) ? recommendation.plan.widthPct : null;
   const edgeRecipe = (recipeW && recipeW !== W) ? Math.round(edge * recipeW / W * 100) / 100 : null;
   // health: legacy sigma on a mature (>1h) token should not happen when candles flow
@@ -698,16 +853,16 @@ async function buildPoolData(address, settings) {
 
   const data = {
     ok: true,
-    pool: { name, address, tvl, binStep, baseFeePct, currentPrice },
+    pool: poolMeta, supportedSolPair: true,
     feeRate1h, feeRate24h, trend, surge, accel,
-    sigma, sigmaRaw, sigmaSource: (rvSigma != null ? 'rv5m' : 'legacy'), edge, edgeRecipe, recipeW, trail: trailOut,
+    sigma, sigmaRaw, sigmaSource: (rvSigma != null ? 'rv5m' : 'legacy'), edge, edgeRecipe, recipeEdges, recipeW, trail: trailOut,
     ofi1h, ofi6h, organicScore,
     orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
     tokenAgeHours: ageH,
     mintAuthorityDisabled, freezeAuthorityDisabled, topHoldersPct,
     path, ddHigh, rangePos, dayLow, low6h, floorPct,
     pc1h: pc1, pc5m: pc5,
-    sigmaTrail, sigmaRatio,
+    sigmaTrail, sigmaRatio, squeezeDiagnostic,
     verdict,
     recommendation,
     ts: Date.now()
@@ -715,6 +870,7 @@ async function buildPoolData(address, settings) {
   // stash sigma+W for breakeven reuse (not part of contract but harmless)
   data._sigma = sigma;
   data._W = W;
+  data.bidAsk = computeBidAskSignal(data);
   return data;
 }
 
@@ -722,6 +878,7 @@ async function buildPoolData(address, settings) {
 function finalize(base, jupPayload) {
   const out = Object.assign({}, base, jupPayload);
   out._sigma = null;
+  out.bidAsk = computeBidAskSignal(out);
   return out;
 }
 
@@ -729,7 +886,7 @@ function finalize(base, jupPayload) {
 // Cache-aware getters
 // ---------------------------------------------------------------------------
 
-async function getPoolData(address) {
+async function getPoolData(address, poolSeed) {
   const cached = poolCache.get(address);
   if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
     return cached.data;
@@ -740,7 +897,7 @@ async function getPoolData(address) {
     return sc.data;
   }
   const settings = await getSettings();
-  const data = await buildPoolData(address, settings);
+  const data = await buildPoolData(address, settings, poolSeed);
   if (data && data.ok) {
     poolCache.set(address, { ts: Date.now(), data });
     sessionCacheSet('mqlc:pool:' + address, data);
@@ -785,10 +942,27 @@ async function getBreakeven(address, widthPct) {
 
 // ---- RADAR: board-wide scan for actionable pools ----
 let radarCache = { ts: 0, data: null };
+function freshRadarSnapshot(r) {
+  if (!r || !Array.isArray(r.items)) return r;
+  const fresh = (arr) => (arr || []).filter((it) => it.kind !== 'BID_ASK' || Date.now() - num(it.dataTs, 0) <= BID_ASK_FRESH_MS);
+  return Object.assign({}, r, { items: fresh(r.items), alertItems: fresh(r.alertItems || r.items).filter((it) => it.kind === 'FULL' || it.kind === 'BID_ASK') });
+}
+function selectRadarPayload(items, now) {
+  now = isFinite(now) ? now : Date.now();
+  const actionable = items.filter((it) => (it.kind === 'FULL' || it.kind === 'BID_ASK')
+    && (it.kind !== 'BID_ASK' || now - num(it.dataTs, 0) <= BID_ASK_FRESH_MS));
+  const visible = items.slice(0, 6);
+  const firstBidAsk = actionable.find((it) => it.kind === 'BID_ASK');
+  if (firstBidAsk && !visible.some((it) => it.kind === 'BID_ASK')) {
+    if (visible.length >= 6) visible[visible.length - 1] = firstBidAsk;
+    else visible.push(firstBidAsk);
+  }
+  return { items: visible, alertItems: actionable };
+}
 async function getRadar() {
-  if (radarCache.data && Date.now() - radarCache.ts < 180e3) return radarCache.data;
+  if (radarCache.data && Date.now() - radarCache.ts < 180e3) return freshRadarSnapshot(radarCache.data);
   const scr = await sessionCacheGet('mqlc:radar', 180e3);
-  if (scr) { radarCache = { ts: scr.ts, data: scr.data }; return scr.data; }
+  if (scr) { radarCache = { ts: scr.ts, data: scr.data }; return freshRadarSnapshot(scr.data); }
   const boardResp = await fetchJson(DATAPI + '/pools?sort_by=volume_24h:desc&page_size=100');
   if (!boardResp.ok) return { ok: false, error: 'board fetch failed' };
   const arr = (boardResp.json.data || boardResp.json.pools || boardResp.json || []).filter(
@@ -802,7 +976,7 @@ async function getRadar() {
   const top8 = arr.slice(0, 8);
   const results = [];
   for (let ci = 0; ci < top8.length; ci += 4) {
-    const chunk = await Promise.all(top8.slice(ci, ci + 4).map((p) => getPoolData(p.address).then((d) => ({ p, d })).catch(() => null)));
+    const chunk = await Promise.all(top8.slice(ci, ci + 4).map((p) => getPoolData(p.address, p).then((d) => ({ p, d })).catch(() => null)));
     results.push(...chunk);
   }
   for (const rp of results) {
@@ -812,7 +986,10 @@ async function getRadar() {
       if (!d || !d.ok) continue;
       if (d.verdict && d.verdict.class !== 'NONE') {
         items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: d.verdict.class, edge: d.edge, feeRate1h: d.feeRate1h, kind: 'FULL', rec: d.recommendation, dataTs: d.ts });
-      } else if (d.path !== 'FREEFALL') {
+      }
+      if (d.bidAsk && d.bidAsk.ready && Date.now() - d.ts <= BID_ASK_FRESH_MS) {
+        items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: 'BID ASK', feeRate1h: d.feeRate1h, kind: 'BID_ASK', bidAsk: d.bidAsk, dataTs: d.ts });
+      } else if ((!d.verdict || d.verdict.class === 'NONE') && d.path !== 'FREEFALL') {
         const fails = [];
         if (d.edge < 1.0) fails.push('edge ' + (Math.round(d.edge * 100) / 100));
         if (d.surge < 1.25) fails.push('surge ' + (Math.round(d.surge * 100) / 100));
@@ -823,7 +1000,8 @@ async function getRadar() {
       }
     } catch (e) {}
   }
-  items.sort((a, b) => (a.kind === b.kind ? (b.edge || 0) - (a.edge || 0) : a.kind === 'FULL' ? -1 : 1));
+  const rank = { FULL: 0, BID_ASK: 1, NEAR: 2 };
+  items.sort((a, b) => (a.kind === b.kind ? (b.edge || b.feeRate1h || 0) - (a.edge || a.feeRate1h || 0) : rank[a.kind] - rank[b.kind]));
   // SHADOW LOG (mirror of dlmm-quant): persist every fresh radar evaluation for
   // counterfactual replay. Chrome is open far more than the daemon runs, so this
   // is the primary collector. Export from Options -> drop into the CLI folder ->
@@ -840,7 +1018,7 @@ async function getRadar() {
         ofi6: d.ofi6h != null ? +d.ofi6h.toFixed(2) : null, org: Math.round(d.organicScore || 0), path: d.path,
         ageH: d.tokenAgeHours != null ? +d.tokenAgeHours.toFixed(1) : null,
         dd: d.ddHigh != null ? Math.round(d.ddHigh) : null,
-        sig: (d.verdict && d.verdict.class !== 'NONE') ? d.verdict.class : null,
+        sig: (d.verdict && d.verdict.class !== 'NONE') ? d.verdict.class : (d.bidAsk && d.bidAsk.ready ? 'BID_ASK' : null),
         w: (d.recommendation && d.recommendation.plan && d.recommendation.plan.widthPct) || null });
     }
     if (shRows.length) {
@@ -849,11 +1027,12 @@ async function getRadar() {
       await chrome.storage.local.set({ mqlShadow: shAll.slice(-15000) });
     }
   } catch (e) {}
-  const kept = items.slice(0, 6);
+  const selected = selectRadarPayload(items, Date.now());
+  const kept = selected.items;
   // oldestDataTs = true age of the stalest per-pool snapshot inside this build
   // (poolCache can serve reads up to 60s older than the radar build itself)
   const oldestDataTs = kept.length ? Math.min(...kept.map((it) => it.dataTs || Date.now())) : Date.now();
-  const out = { ok: true, ts: Date.now(), oldestDataTs, items: kept };
+  const out = { ok: true, ts: Date.now(), oldestDataTs, items: kept, alertItems: selected.alertItems };
   radarCache = { ts: Date.now(), data: out };
   sessionCacheSet('mqlc:radar', out);
   return out;
@@ -897,7 +1076,7 @@ function positionFill(pos, cur) {
   return { fill: null, method: null };
 }
 
-function summarizePositions(ps) {
+function summarizePositions(ps, entryPlan) {
   const legs = [];
   let cur = NaN;
   let depSum = 0; // all-time deposits (SOL) across legs — combo leg-2 detection
@@ -932,9 +1111,18 @@ function summarizePositions(ps) {
   // the band - i.e. the accumulation working as designed - and the scalp rulebook
   // then fires EXIT on FREEFALL). A book whose deposits were ~100% SOL is a
   // below-price ladder, permanently, regardless of where price sits now.
+  const createdAt = Math.min(...ps.map((p) => Number(p.createdAt || 0)).filter((t) => t > 0).concat([Infinity])) || null;
+  const boundPlan = planMatchesPosition(entryPlan, wAll, createdAt, Date.now()) ? entryPlan : null;
   const depAcc = ps.map(depositAccum).filter((v) => v != null);
-  const accum = depAcc.length ? depAcc.every((v) => v === true)
-    : (isFinite(cur) && (maxAll <= cur * 1.05 || cur < minAll));  // geometry fallback
+  let profile;
+  if (boundPlan) {
+    profile = resolvePositionProfile(boundPlan, ps[0], null);
+  } else {
+    const inferredAccum = depAcc.length ? depAcc.every((v) => v === true)
+      : (isFinite(cur) && (maxAll <= cur * 1.05 || cur < minAll));
+    profile = inferredAccum ? 'ACCUM_INFERRED' : 'TRADE_INFERRED';
+  }
+  const accum = profile === 'ACCUM' || profile === 'ACCUM_INFERRED';
   let fillSum = 0, fillN = 0, fillMethod = null;
   for (let i = 0; i < ps.length; i++) {
     const f = positionFill(ps[i], cur);
@@ -949,8 +1137,8 @@ function summarizePositions(ps) {
     poolActivePrice: cur,
     combo: legs.length > 1,
     depositsSol: Math.round(depSum * 1e6) / 1e6,
-    accum, fillPct, fillMethod,
-    createdAt: Math.min(...ps.map((p) => Number(p.createdAt || 0)).filter((t) => t > 0).concat([Infinity])) || null,
+    accum, profile, profileInferred: /_INFERRED$/.test(profile), fillPct, fillMethod,
+    createdAt,
     minPrice: minAll, maxPrice: maxAll,
     legs
   };
@@ -1006,6 +1194,41 @@ function depositAccum(pos) {
     return xU / tU < 0.05;
   } catch (e) { return null; }
 }
+
+function positionWidthPct(pos) {
+  const minP = Number(pos && pos.minPrice), maxP = Number(pos && pos.maxPrice);
+  const mid = (minP + maxP) / 2;
+  return mid > 0 && isFinite(minP) && isFinite(maxP) ? ((maxP - minP) / 2 / mid) * 100 : 20;
+}
+
+function planMatchesPosition(plan, widthPct, createdAtSec, now) {
+  if (!plan) return false;
+  now = isFinite(now) ? now : Date.now();
+  if (now - num(plan.ts, 0) >= 7 * 86400e3) return false;
+  if (plan.widthPct && isFinite(widthPct)
+      && Math.abs(widthPct - plan.widthPct) > Math.max(12, plan.widthPct * 0.6)) return false;
+  const createdMs = Number(createdAtSec || 0) * 1000;
+  return !createdMs || (createdMs >= num(plan.ts, 0) - 900e3 && createdMs - num(plan.ts, 0) < 6 * 3600e3);
+}
+
+function resolvePositionProfile(plan, pos, previousProfile) {
+  if (plan && (plan.profile === 'ACCUM' || plan.cls === 'BID_ASK' || plan.accum === true)) return 'ACCUM';
+  if (plan && (plan.profile || ['IGNITION', 'BASING', 'CARRY', 'SQUEEZE', 'IGNITION_OVERRIDE', 'CARRY_OVERRIDE'].includes(plan.cls))) return 'TRADE';
+  if (typeof previousProfile === 'string' && ['ACCUM', 'TRADE', 'ACCUM_INFERRED', 'TRADE_INFERRED'].includes(previousProfile)) return previousProfile;
+  const inferred = depositAccum(pos);
+  if (inferred != null) return inferred ? 'ACCUM_INFERRED' : 'TRADE_INFERRED';
+  if (typeof previousProfile === 'boolean') return previousProfile ? 'ACCUM_INFERRED' : 'TRADE_INFERRED';
+  const minP = Number(pos && pos.minPrice), maxP = Number(pos && pos.maxPrice), cur = Number(pos && pos.poolActivePrice);
+  return (isFinite(maxP) && isFinite(cur) && (maxP <= cur * 1.05 || cur < minP)) ? 'ACCUM_INFERRED' : 'TRADE_INFERRED';
+}
+
+function evaluateAccumLifecycle(flags) {
+  flags = flags || {};
+  if (flags.dataReady === false) return 'WAIT';
+  if (flags.decay && flags.flow) return 'EXIT';
+  if (flags.decay || flags.flow || flags.soft) return 'WAIT';
+  return 'ACCUMULATING';
+}
 async function watchPositions() {
   const cfg = await chrome.storage.sync.get({ webhookUrl: '', walletAddress: '' });
   if (!cfg.webhookUrl || !cfg.walletAddress) return;
@@ -1044,6 +1267,10 @@ async function watchPositions() {
       const pc1h = (pd && pd.ok) ? pd.pc1h : null;
       const surgeV = (pd && pd.ok) ? pd.surge : null;
       const pathV = (pd && pd.ok) ? pd.path : null;
+      const positionSignalsReady = !!(pd && pd.ok && typeof pd.ts === 'number' && isFinite(pd.ts) && Date.now() - pd.ts <= BID_ASK_FRESH_MS
+        && typeof pd.feeRate1h === 'number' && isFinite(pd.feeRate1h)
+        && typeof pd.ofi1h === 'number' && isFinite(pd.ofi1h)
+        && typeof pd.pc1h === 'number' && isFinite(pd.pc1h));
       const poolFill = { sum: 0, n: 0 };   // aggregate fill across accumulation legs (COMBO-aware)
       for (const pos of pr.json.positions) {
         const key = pool + ':' + (pos.positionAddress || '');
@@ -1057,12 +1284,10 @@ async function watchPositions() {
         // never executed poisoned a LATER accum position's baseline, firing a fake
         // 65% fee-decay EXIT): a plan only binds if the position was CREATED within
         // [plan - 15min, plan + 6h]. Intent is not execution.
-        const posCreatedMs = Number(pos.createdAt || 0) * 1000;
-        const planRaw9 = plans[pool] && (Date.now() - (plans[pool].ts || 0) < 7 * 86400e3) ? plans[pool] : null;
-        // structural guard on top of the time window: a plan whose planned width is
-        // wildly different from the actual band is someone else's trade
-        const wOK9 = !planRaw9 || !planRaw9.widthPct || !isFinite(W) || Math.abs(W - planRaw9.widthPct) <= Math.max(12, planRaw9.widthPct * 0.6);
-        const planEarly = (planRaw9 && wOK9 && (!posCreatedMs || (posCreatedMs >= (planRaw9.ts || 0) - 900e3 && posCreatedMs - (planRaw9.ts || 0) < 6 * 3600e3))) ? planRaw9 : null;
+        const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice), cur = Number(pos.poolActivePrice);
+        const W = positionWidthPct(pos);
+        const planRaw9 = plans[pool] || null;
+        const planEarly = planMatchesPosition(planRaw9, W, pos.createdAt, Date.now()) ? planRaw9 : null;
         const hudBase = posBaseAll[pool];
         const entryFeeRate = (planEarly && planEarly.entryFeeRate > 0) ? planEarly.entryFeeRate
           : (hudBase && hudBase.entryFeeRate > 0) ? hudBase.entryFeeRate
@@ -1077,14 +1302,15 @@ async function watchPositions() {
         }
         let belowCount = (prevSnap && prevSnap.belowCount) || 0;
         // spike-bias guard: decay must be below entry-relative threshold AND the pool's normal
-        if (entryFeeRate > 2 && feeRate < 0.5 * entryFeeRate && (!norm24 || feeRate < norm24)) belowCount++; else belowCount = 0;
+        const feeDataTs = (pd && pd.ok && isFinite(pd.ts)) ? pd.ts : null;
+        const distinctFeeSample = positionSignalsReady && feeDataTs != null && (!prevSnap || prevSnap.feeDataTs !== feeDataTs);
+        if (distinctFeeSample) {
+          if (entryFeeRate > 2 && feeRate < 0.5 * entryFeeRate && (!norm24 || feeRate < norm24)) belowCount++; else belowCount = 0;
+        }
         st.mqlLastPos[key] = { pool, name, wallet, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
           firstSeen: (prevSnap && prevSnap.firstSeen) || Date.now(),
-          entryFeeRate, entryFeeRate24h: norm24, belowCount };
+          entryFeeRate, entryFeeRate24h: norm24, belowCount, feeDataTs: feeDataTs != null ? feeDataTs : (prevSnap && prevSnap.feeDataTs) };
         const pnl = Number(pos.pnlSolPctChange);
-        const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice), cur = Number(pos.poolActivePrice);
-        const mid = (minP + maxP) / 2;
-        const W = mid > 0 ? ((maxP - minP) / 2 / mid) * 100 : 20;
         // Entry plan (journaled by the HUD Apply button) outranks generic width-math:
         // the class brackets the user actually entered on (e.g. BASING +20/-15 + stop).
         const plan = planEarly;
@@ -1120,16 +1346,31 @@ async function watchPositions() {
         // ---- ACCUMULATION profile: own rulebook (priors pending calibration) ----
         // detected once at first sight (band at/below price) and persisted; scalp
         // TP/SL alerts don't apply to a bag-building band.
-        const daPos = depositAccum(pos);
-        const isAccum = (daPos != null) ? daPos   // deposit truth outranks stale persistence
-          : (prevSnap && typeof prevSnap.accum === 'boolean')
-          ? prevSnap.accum
-          : (isFinite(maxP) && isFinite(cur) && (maxP <= cur * 1.05 || cur < minP));
+        const profile = resolvePositionProfile(plan, pos, prevSnap && (prevSnap.profile || prevSnap.accum));
+        const isAccum = profile === 'ACCUM' || profile === 'ACCUM_INFERRED';
+        st.mqlLastPos[key].profile = profile;
         st.mqlLastPos[key].accum = isAccum;
         if (isAccum) {
           delete cond.HIT_TP; delete cond.NEAR_TP; delete cond.HIT_SL; delete cond.NEAR_SL;
           delete cond.TIGHTEN; delete cond.FREEFALL;  // accum: freefall is the design; scalp nudges don't apply
+          const accumDecay = cond.DECAY, accumFlow = cond.FLOW;
+          delete cond.DECAY; delete cond.FLOW;
+          cond.ACCUM_DATA_WAIT = !positionSignalsReady;
+          cond.ACCUM_WAIT_DECAY = false;
+          cond.ACCUM_WAIT_FLOW = false;
+          cond.ACCUM_EXIT = false;
+          if (!positionSignalsReady) {
+            msgs.ACCUM_DATA_WAIT = '⏸ BID ASK WAIT: ' + name + ' — current fee/organic-flow data is unavailable. No lifecycle decision is being inferred from missing inputs.';
+          } else {
+            const accumState = evaluateAccumLifecycle({ decay: accumDecay, flow: accumFlow, soft: false });
+            cond.ACCUM_WAIT_DECAY = accumState === 'WAIT' && accumDecay;
+            cond.ACCUM_WAIT_FLOW = accumState === 'WAIT' && accumFlow;
+            cond.ACCUM_EXIT = accumState === 'EXIT';
+          }
           cond.FULLY_FILLED = cond.OOR_DOWN; delete cond.OOR_DOWN;
+          msgs.ACCUM_WAIT_DECAY = '⏸ BID ASK WAIT: ' + name + ' — fee engine has decayed. Stop adding; EXIT arms only if organic flow also flips to hard distribution. PnL ' + pnl.toFixed(1) + '%';
+          msgs.ACCUM_WAIT_FLOW = '⏸ BID ASK WAIT: ' + name + ' — organic distribution is filling the band. Stop adding; EXIT arms only if the fee engine also dies. PnL ' + pnl.toFixed(1) + '%';
+          msgs.ACCUM_EXIT = '🛑 BID ASK EXIT: ' + name + ' — fee decay AND hard organic distribution both fired. The accumulation thesis is broken. PnL ' + pnl.toFixed(1) + '%';
           msgs.FULLY_FILLED = '🪣 FULLY FILLED: ' + name + ' — price fell through the whole accumulation band. You are 100% token now. Decide: hold the bag you built, or cut. PnL ' + pnl.toFixed(1) + '%';
           msgs.OOR_UP = '🟢 POPPED ABOVE BAND: ' + name + ' — price rose above your accumulation range: 100% SOL with fees banked. Re-arm lower if you still want the bag. PnL ' + pnl.toFixed(1) + '%';
           msgs.DECAY = '📉 DYING WHILE YOU ACCUMULATE: ' + name + ' — 1h fee rate ' + feeRate.toFixed(1) + '%/d, ~' + Math.round((1 - feeRate / entryFeeRate) * 100) + '% below entry. Volume is leaving the token you are buying — the one alert that matters on an accumulation. PnL ' + pnl.toFixed(1) + '%';
@@ -1297,16 +1538,26 @@ async function radarAlertScan() {
   const stx = await chrome.storage.local.get({ mqlRadarAlerted: {} });
   const alerted = stx.mqlRadarAlerted || {};
   const now = Date.now();
-  for (const it of r.items) {
-    if (it.kind !== 'FULL') continue;
-    if (alerted[it.address] && now - alerted[it.address] < 2 * 3600e3) continue; // 2h cooldown per pool
+  for (const it of (r.alertItems || r.items)) {
+    if (it.kind !== 'FULL' && it.kind !== 'BID_ASK') continue;
+    const alertKey = it.address + ':' + it.kind;
+    if (alerted[alertKey] && now - alerted[alertKey] < 2 * 3600e3) continue; // 2h cooldown per pool/signal
+    if (it.kind === 'BID_ASK') {
+      const ba = it.bidAsk || {};
+      if (!ba.ready || now - num(it.dataTs, 0) > BID_ASK_FRESH_MS || !ba.allocation || !ba.depthPct) continue;
+      const msgBA = '🪣 **Meteora Lens — BID ASK READY** · ' + it.name + '\nManual Bid-Ask + Spot accumulation · range 0% to -' + ba.depthPct + '% · allocation ' + ba.allocation.bidAskPct + '/' + ba.allocation.spotPct + '%. Choose your own SOL amount and approve both legs in your wallet. Heuristic priors; position costs are not modeled.\nhttps://www.meteora.ag/dlmm/' + it.address;
+      await postDiscord(cfg.webhookUrl, msgBA);
+      try { chrome.notifications.create('mqlba-' + now + '-' + it.address.slice(0,4), { type: 'basic', iconUrl: 'icon128.png', title: 'BID ASK READY', message: it.name + ' · manual Bid-Ask + Spot · 0% to -' + ba.depthPct + '%', priority: 2 }); } catch (e) {}
+      alerted[alertKey] = now;
+      continue;
+    }
     const rec = it.rec || {};
     const recipe = (rec.steps && rec.steps.length) ? rec.steps.slice(0, 2).join(' · ') : (rec.headline || '');
     const bs = it.binStep ? it.binStep + 'bps ' : '';
     const msg = '🔥 **Meteora Lens — signal** · ' + it.name + ' ' + bs + '· ' + it.cls + ' · edge ' + (Math.round(it.edge * 100) / 100) + '\n' + recipe + '\nhttps://www.meteora.ag/dlmm/' + it.address;
     await postDiscord(cfg.webhookUrl, msg);
     try { chrome.notifications.create('mqlr-' + now + '-' + it.address.slice(0,4), { type: 'basic', iconUrl: 'icon128.png', title: '🔥 ' + it.cls + ' signal', message: it.name + ' · edge ' + (Math.round(it.edge * 100) / 100), priority: 2 }); } catch (e) {}
-    alerted[it.address] = now;
+    alerted[alertKey] = now;
   }
   for (const k of Object.keys(alerted)) if (now - alerted[k] > 24 * 3600e3) delete alerted[k];
   await chrome.storage.local.set({ mqlRadarAlerted: alerted });
@@ -1655,7 +1906,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           } catch (e) {}
         }
         if (!merged.length) { sendResponse({ ok: true, has: false }); return; }
-        sendResponse(summarizePositions(merged));
+        const planState = await chrome.storage.local.get({ mqlEntryPlan: {} });
+        const entryPlan = planState.mqlEntryPlan && planState.mqlEntryPlan[msg.pool];
+        sendResponse(summarizePositions(merged, entryPlan));
       } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
     })();
     return true;

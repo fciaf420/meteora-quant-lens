@@ -33,6 +33,10 @@
     autofillTimer: null,
     lastRange: null,     // { min, max, bins }
     fetching: false,
+    accumDecayDataTs: 0,
+    accumDecayCount: 0,
+    accumPositionKey: null,
+    accumBaselineTs: 0,
   };
 
   // ---- tiny utils --------------------------------------------------------
@@ -242,6 +246,10 @@
   }
   var applySetup = safe(function applySetup(params, btn) {
     if (!params) return;
+    if (!state.data || state.data.supportedSolPair !== true) {
+      if (btn) btn.textContent = "✗ requires non-SOL token X / SOL token Y";
+      return;
+    }
     // 1) strategy button by exact text
     var stratWrap = document.querySelector('[data-sentry-component="StrategySelection"]');
     if (stratWrap) {
@@ -276,6 +284,18 @@
 
   function accumComboCheck(d) {
     if (!d || !d.ok) return null;
+    if (d.bidAsk) {
+      var ba = d.bidAsk;
+      var stale = !d.ts || Date.now() - d.ts > 120000;
+      if (ba.ready && ba.state === "READY" && !stale && d.supportedSolPair === true
+          && ba.depthPct > 0 && ba.allocation && ba.allocation.bidAskPct > 0) {
+        return { show: "full", state: "READY", depth: ba.depthPct,
+          share: ba.allocation.bidAskPct / 100, reasons: ba.reasons || [], signal: ba };
+      }
+      var reasons = (ba.reasons || []).slice();
+      if (stale) reasons.unshift("✗ data stale — wait for a fresh snapshot");
+      return { show: "wait", state: "WAIT", reasons: reasons, signal: ba };
+    }
     // hard gates — directional bag risk: safety outranks the edge math
     var gates = {
       auth: !!(d.mintAuthorityDisabled && d.freezeAuthorityDisabled),            // non-negotiable
@@ -314,13 +334,9 @@
   var renderAccumBlock = safe(function renderAccumBlock(hud, d) {
     var chk = accumComboCheck(d);
     if (!chk) return;
-    if (chk.show === "volnote") {
-      hud.appendChild(el("div", "mql-accum-note", chk.volMsg || "ACCUM: volume gate not met"));
-      return;
-    }
     var wrap = el("div", "mql-accum");
     var head = el("div", "mql-accum-head");
-    var title = el("span", "mql-accum-title", "🪣 ACCUM COMBO — safer long-term build");
+    var title = el("span", "mql-accum-title", "🪣 BID ASK · " + (chk.state || (chk.show === "full" ? "READY" : "WAIT")));
     tipify(title, "accum");
     head.appendChild(title);
     head.appendChild(el("span", "mql-accum-caret", comboUI.open ? "▾" : "▸"));
@@ -331,6 +347,14 @@
     wrap.appendChild(head);
     if (comboUI.open) {
       var body = el("div", "mql-accum-body");
+      body.appendChild(el("div", "mql-accum-line", "Bid-Ask + Spot accumulation · manual wallet-approved two-leg entry"));
+      if (chk.show !== "full") {
+        (chk.reasons || [chk.volMsg || "signal gates not met"]).slice(0, 4).forEach(function (reason) {
+          body.appendChild(el("div", "mql-accum-note", reason));
+        });
+        body.appendChild(el("div", "mql-accum-prior", "WAIT — waiting for a current, complete pool snapshot"));
+        wrap.appendChild(body); hud.appendChild(wrap); return;
+      }
       var rangeLine = el("div", "mql-accum-line", "range 0% → -" + chk.depth + "% (σ-scaled depth)");
       tipify(rangeLine, "accumdepth");
       body.appendChild(rangeLine);
@@ -347,7 +371,7 @@
       tipify(splitLine, "accumsplit");
       body.appendChild(splitLine);
       var totRow = el("div", "mql-accum-total");
-      totRow.appendChild(el("span", "", "total SOL"));
+      totRow.appendChild(el("span", "", "your chosen SOL amount"));
       var totInp = el("input", "");
       totInp.type = "number"; totInp.step = "0.1"; totInp.min = "0.01"; totInp.value = String(total);
       totInp.addEventListener("input", safe(function () {
@@ -364,8 +388,8 @@
         "σ " + fmtNum(d.sigma, 0) + "%/d → depth " + chk.depth + "% · fees 1h " + fmtNum(d.feeRate1h, 1) +
         " vs 24h " + fmtNum(d.feeRate24h, 1) + "%/d (persisting) · OFI " + fmtNum(d.ofi1h, 2)));
       body.appendChild(el("div", "mql-rec-warn", "⚠ directional bag risk: if the token dies you own it the whole way down — size for total loss"));
-      body.appendChild(el("div", "mql-accum-prior", "depth/split are structured priors pending calibration"));
-      var applyBtn = el("button", "mql-apply", "⚡ Apply Combo (2 legs)");
+      body.appendChild(el("div", "mql-accum-prior", "uncalibrated heuristic · pool-wide fees and position costs are not modeled"));
+      var applyBtn = el("button", "mql-apply", "⚡ Guide Bid-Ask + Spot (2 legs)");
       applyBtn.addEventListener("click", safe(function () {
         startCombo(chk.depth, chk.share, comboUI.total || 1.0);
       }));
@@ -400,6 +424,7 @@
   // mentioning SOL, else fall back to the 2nd of exactly two inputs (quote side).
   function fillSolAmount(amt) {
     try {
+      if (!state.data || state.data.supportedSolPair !== true) return false;
       // NESTED-WRAP TRAP (caught live on the Add Liquidity panel): AmountInput wraps
       // can NEST - a parent wrap contains BOTH the token and SOL sections, so its
       // textContent matches /SOL/ and querySelector('input') returns the FIRST input
@@ -419,14 +444,13 @@
         while (n && n !== document.body && n.querySelectorAll("input").length <= 1) { last = n; n = n.parentElement; }
         return (last.textContent || "");
       }
-      var solInputs = [], anyEnabled = [];
+      var solInputs = [];
       for (var k = 0; k < inputs.length; k++) {
         var lt = localText(inputs[k]);
         if (/\bSOL\b/.test(lt) && !/USDC|USDT/.test(lt)) solInputs.push(inputs[k]);
-        if (!inputs[k].disabled) anyEnabled.push(inputs[k]);
       }
-      var pick = solInputs.filter(function (x) { return !x.disabled; })[0] || solInputs[0]
-        || (inputs.length ? inputs[inputs.length - 1] : null);  // quote side renders last
+      var enabledSol = solInputs.filter(function (x) { return !x.disabled; });
+      var pick = enabledSol.length === 1 ? enabledSol[0] : null;
       if (pick) { setNativeInput(pick, String(amt)); return true; }
       return false;
     } catch (e) { return false; }
@@ -529,7 +553,7 @@
       try {
         chrome.storage.local.get({ mqlTradeLog: [] }, function (jr) {
           var logArr = jr.mqlTradeLog || [];
-          logArr.push({ type: "COMBO_OPEN", pool: st.poolAddr, depth: st.depth, share: st.share,
+          logArr.push({ type: "BID_ASK_OPEN", profile: "ACCUM", strategy: "Bid-Ask + Spot", pool: st.poolAddr, depth: st.depth, share: st.share,
             totalSol: st.totalSol, startedAt: st.startedAt, leg1At: st.leg1At || null,
             finishedAt: Date.now(), detectedBy: how });
           chrome.storage.local.set({ mqlTradeLog: logArr.slice(-200) });
@@ -538,7 +562,7 @@
       var b = document.getElementById("mql-combo-banner");
       if (b) {
         b.innerHTML = "";
-        b.appendChild(el("div", "mql-combo-step mql-good", "✅ COMBO DEPLOYED — one position: bid-ask base + spot layer. Position Watch is tracking fill %."));
+        b.appendChild(el("div", "mql-combo-step mql-good", "✅ BID ASK DEPLOYED — one position: Bid-Ask base + Spot layer. Position Watch is tracking fill %."));
         setTimeout(safe(function () { var n = document.getElementById("mql-combo-banner"); if (n) n.remove(); }), 9000);
       }
       comboFlow.st = null;
@@ -589,14 +613,18 @@
   }
 
   var startCombo = safe(function startCombo(depth, share, totalSol) {
+    var ba = state.data && state.data.bidAsk;
+    if (!ba || !ba.ready || ba.state !== 'READY' || state.data.supportedSolPair !== true
+        || !state.data.ts || Date.now() - state.data.ts > 120000) return;
     var startCount = (state.apiPos && state.apiPos.count) || 0;
     // journal the combo's OWN entry plan: correct class label, correct fee baseline
     // (previously the combo wrote no plan, so a stale Apply-click plan could bind)
     try {
       chrome.storage.local.get({ mqlEntryPlan: {} }, safe(function (jr9) {
         var plans9 = jr9.mqlEntryPlan || {};
-        plans9[state.pool] = { cls: 'ACCUM', pool: state.pool, ts: Date.now(),
-          widthPct: Math.round(depth / 2), accum: true,
+        plans9[state.pool] = { cls: 'BID_ASK', profile: 'ACCUM', strategy: 'Bid-Ask + Spot', pool: state.pool, ts: Date.now(),
+          widthPct: Math.round(depth / (2 - depth / 100)), minPct: -depth, maxPct: 0, mode: 'single',
+          depthPct: depth, bidAskPct: Math.round(share * 100), spotPct: Math.round((1 - share) * 100), accum: true,
           entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null,
           entryFeeRate24h: (state.data && state.data.feeRate24h > 0) ? state.data.feeRate24h : null,
           entryEdge: (state.data && state.data.edge != null) ? Math.round(state.data.edge * 100) / 100 : null,
@@ -642,7 +670,7 @@
   // ---- hover explainer tooltips ----
   var MQL_TIPS = {
     "verdict": "The bottom line. The Lens tests this pool against three entry playbooks (SCALP / REVERSION / CARRY). NO ENTRY means none of them clear their bars \u2014 whatever the APR looks like.",
-    "edge": "THE core number. LPing = selling insurance: fees are your premium, impermanent loss is the claims you pay when price moves. Edge = fees \u00f7 expected IL (with a 30% safety margin). Above 1.0 = you're being overpaid for the risk. Below 1 = the pool is farming YOU.",
+    "edge": "Pool-wide fee/IL heuristic at the shown width. It does not model your bin shape, active-liquidity share, one-sided inventory path, execution costs, or rewards. Use it as a screening gate, not a profit forecast.",
     "fee": "The truth about yield. The site's 24h number is backward-looking; the 1h rate is what the pool pays RIGHT NOW, annualized to %/day. \u25b2 HEATING = accelerating. \u25bc COOLING = the party already happened.",
     "sigma": "Realized volatility, %/day \u2014 EWMA over the last ~4h of 5m closes. A trailing ~ means the token is too fresh for candle data (<30 min): the number is the legacy single-print estimate, typically inflated on launches \u2014 trust it less. High \u03c3 means high IL risk: the same fees buy you much less safety.",
     "surge": "DLMM raises fees automatically during volatility (the accumulator). Surge = current dynamic fee \u00f7 base fee. \u22651.25x = the premium is elevated \u2014 the best moments to provide liquidity. ~0 = premium fully decayed.",
@@ -652,11 +680,11 @@
     "token": "Safety sheet: Organic Score (0-100, how real the trading is), token age, whether mint & freeze authority are burned (\u26a0\ufe0f live mint authority = team can print supply), and top-10 holder concentration.",
     "rec": "What to actually do, translated from all the signals: either a concrete recipe (shape, width, TP/SL brackets, exits) or WAIT with the exact conditions that would flip it to an entry.",
     "feebadge": "Live 1h fee run-rate \u2014 the number the native 24h stat hides. Green \u25b2 heating, red \u25bc cooling.",
-    "radar": "Board-wide scanner: every 3 min it screens the most active DLMM pools and pins the actionable ones here. \ud83d\udd25 = full signal (all gates green). \u26a0 = near-miss (1-2 gates short \u2014 override territory). Click a chip to jump to that pool. Click RADAR to collapse.",
+    "radar": "Bounded candidate scanner: every 3 min it analyzes up to eight high-fee pools selected from the top 100 by 24h volume. Fire = full trade signal, bucket = BID ASK READY, warning = near-miss. It is not an exhaustive market scan.",
     "pwbrackets": "Suggested exit brackets, anchored to what a two-sided Spot can ACTUALLY earn: TP = W/4 (capped appreciation of a \u00b1W band \u2014 a clean pump-out only yields ~W/4) + half a day of the fee rate (chop income is the real engine). SL sits just inside the structural band-break value (~-0.75W). \u2018Away\u2019 = how far your current PnL sits from each. These are guidance \u2014 the hard rules (fee-decay, flow-flip, freefall) fire on their own regardless.",
     "poswatch": "Exit intelligence for the position you hold in THIS pool: it snapshots the fee rate when it first sees your position, then applies the bot\u2019s exit rules \u2014 fee-decay (exit at 50% decay), organic flow-flip, freefall, surge-death. HOLD / WATCH / TIGHTEN / EXIT with the reason.",
     "breakeven": "IL-breakeven check for YOUR current range: at this pool's volatility, a range this wide must earn at least X%/day in fees just to offset expected impermanent loss. \u2713 = the pool pays more than that. \u2717 = your range loses money on expectation.",
-    "accum": "ACCUM COMBO — the long-term accumulation recipe: a deep single-sided SOL band below price, built as two legs in the SAME range — a Bid-Ask base (bottom-heavy: buys MORE as price falls deeper) + a Spot layer (uniform: shallow dips still fill and earn). You only buy dips, never tops, and earn fees while waiting. Directional: if the token dies you own it — which is why the gates (authorities, organic flow, volume persistence) outrank the math.",
+    "accum": "BID ASK is a manual accumulation signal: a deep single-sided SOL band below price, built as Bid-Ask (bottom-heavy) plus Spot (uniform) in the same range. READY means its uncalibrated safety and persistence gates pass; it is not a profit forecast. You choose the amount and approve both wallet transactions.",
     "accumdepth": "How deep the band goes, scaled from realized vol: \u03c3\u2265150%/day \u2192 -75%, \u03c3\u226480 \u2192 -60% (linear between), nudged deeper near ATH and shallower if already crashed. A -70% wick is a normal day for a high-\u03c3 memecoin \u2014 the band must survive it. Prior pending calibration.",
     "accumsplit": "Capital split between the two legs. The Bid-Ask share rises with \u03c3 and with sell-skewed flow (deep fills more likely), clamped 60-80%. Default lands \u2248 70/30. Prior pending calibration.",
     "accumfill": "How much of your accumulation band has converted from SOL into the token — the progress bar of the bag you're building. Value-based when the API provides amounts; otherwise \u2248 a linear price-traversal estimate (labeled)."
@@ -819,12 +847,13 @@
         st.mqlPosBaseline[state.pool] = base;
         chrome.storage.local.set({ mqlPosBaseline: st.mqlPosBaseline });
       }
+      var boundPlan = (state.entryPlan && state.entryPlan.pool === state.pool &&
+        Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3 && planMatchesPos(state.entryPlan)) ? state.entryPlan : null;
       // Apply-time baseline outranks first-seen (parity with the background watcher).
       // PLAN-BINDING GUARD: only when the position was created within [plan-15m, plan+6h]
       // — an Apply click without a signed trade must never bind to a later position.
-      if (state.entryPlan && state.entryPlan.pool === state.pool && state.entryPlan.entryFeeRate > 0 &&
-          Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3 && planMatchesPos(state.entryPlan)) {
-        base = Object.assign({}, base, { entryFeeRate: state.entryPlan.entryFeeRate, feeRate24h: state.entryPlan.entryFeeRate24h || base.feeRate24h });
+      if (boundPlan && boundPlan.entryFeeRate > 0) {
+        base = Object.assign({}, base, { entryFeeRate: boundPlan.entryFeeRate, feeRate24h: boundPlan.entryFeeRate24h || base.feeRate24h });
       }
       // spike-bias guard: decay must ALSO be below the pool's normal (24h at entry)
       var normFee = (base.feeRate24h > 0) ? base.feeRate24h : Infinity;
@@ -855,13 +884,35 @@
 
       var decayPct = base.entryFeeRate > 0 ? (1 - d.feeRate1h / base.entryFeeRate) * 100 : 0;
       var ap = state.apiPos;
-      var isAccum = !!(ap && ap.accum);
+      var posProfile = boundPlan && boundPlan.profile ? boundPlan.profile : (ap && ap.profile);
+      var isAccum = posProfile === "ACCUM" || (!posProfile && !!(ap && ap.accum)) || posProfile === "ACCUM_INFERRED";
+      var profileInferred = !boundPlan && !!(ap && ap.profileInferred);
       var isCombo = !!(ap && ap.combo);
       // exit rules (same as the bot manager) — accumulation books get their own rulebook
       var verdict = "HOLD", cls = "mql-pw-hold", reasons = [];
       if (isAccum) {
         // ACCUM profile: scalp TP/SL/TIGHTEN don't apply (priors pending calibration)
-        var decayFire = d.feeRate1h < 0.5 * base.entryFeeRate && d.feeRate1h < normFee && base.entryFeeRate > 2;
+        var accumPositionKey = ap && ap.legs ? ap.legs.map(function (leg) { return leg.sig; }).sort().join(",") : String(ap && ap.createdAt || "unknown");
+        if (state.accumPositionKey !== accumPositionKey || state.accumBaselineTs !== (base.ts || 0)) {
+          state.accumPositionKey = accumPositionKey;
+          state.accumBaselineTs = base.ts || 0;
+          state.accumDecayDataTs = 0;
+          state.accumDecayCount = 0;
+        }
+        var lifecycleDataReady = d.ok === true && d.ts && Date.now() - d.ts <= 120000
+          && typeof d.feeRate1h === "number" && isFinite(d.feeRate1h)
+          && typeof d.ofi1h === "number" && isFinite(d.ofi1h)
+          && typeof d.pc1h === "number" && isFinite(d.pc1h);
+        if (!lifecycleDataReady) {
+          verdict = "WATCH"; cls = "mql-pw-warn";
+          reasons.push("current fee and organic-flow data is unavailable — waiting for a fresh snapshot before changing the accumulation state");
+        } else {
+        var decayCandidate = d.feeRate1h < 0.5 * base.entryFeeRate && d.feeRate1h < normFee && base.entryFeeRate > 2;
+        if (d.ts && d.ts !== state.accumDecayDataTs) {
+          state.accumDecayDataTs = d.ts;
+          state.accumDecayCount = decayCandidate ? state.accumDecayCount + 1 : 0;
+        }
+        var decayFire = decayCandidate && state.accumDecayCount >= 2;
         var flowFire = d.ofi1h != null && d.ofi1h > 3 && d.pc1h != null && d.pc1h < -15;
         if (decayFire && flowFire) {
           verdict = "EXIT"; cls = "mql-pw-exit";
@@ -875,6 +926,7 @@
           reasons.push("accumulating as designed — volume alive (" + fmtNum(d.feeRate1h, 1) + "%/d), flow OFI " + fmtNum(d.ofi1h, 2));
         }
         if (d.path === "FREEFALL" && verdict !== "EXIT") reasons.push("FREEFALL: band filling fast — that is the design; the kill-switch is fee-decay + flow-flip, not price");
+        }
       } else {
       if (d.feeRate1h < 0.5 * base.entryFeeRate && d.feeRate1h < normFee && base.entryFeeRate > 2) {
         verdict = "EXIT"; cls = "mql-pw-exit";
@@ -913,14 +965,15 @@
       else if (verdict === "TIGHTEN") { doLine = "DO: claim accrued fees NOW (bank the harvest) and consider pulling partial size. Keep a runner."; assist = { kind: "claim", label: "→ show me the Claim button" }; }
       else if (verdict === "EXIT") { doLine = "DO: close 100% → Zap Out to SOL. Do not negotiate with a fired rule."; assist = { kind: "exit", label: "→ open the Withdraw panel" }; }
 
+      var displayVerdict = isAccum ? (verdict === "HOLD" ? "ACCUMULATING" : verdict === "WATCH" ? "WAIT" : verdict) : verdict;
       var card = existing || el("div", "mql-card");
       card.id = "mql-poswatch";
       card.innerHTML = "";
       var head = el("div", "mql-pw-head");
       head.appendChild(el("span", "mql-pw-title", "POSITION WATCH"));
       if (isCombo) head.appendChild(el("span", "mql-pw-combo", "COMBO ×" + ap.count));
-      if (isAccum) head.appendChild(el("span", "mql-pw-combo", "🪣 ACCUM"));
-      var pill = el("span", "mql-pw-pill " + cls, verdict);
+      if (isAccum) head.appendChild(el("span", "mql-pw-combo", "🪣 BID ASK" + (profileInferred ? " · inferred legacy" : "")));
+      var pill = el("span", "mql-pw-pill " + cls, displayVerdict);
       tipify(pill, "poswatch");
       head.appendChild(pill);
       card.appendChild(head);
@@ -931,8 +984,7 @@
         if (!isAccum) {
           var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
           // entry plan (journaled at Apply) outranks generic width-math
-          var plan = (state.entryPlan && state.entryPlan.pool === state.pool &&
-                      Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3 && planMatchesPos(state.entryPlan)) ? state.entryPlan : null;
+          var plan = boundPlan;
           var tpB = plan && plan.tp ? plan.tp : Math.round(clampN(Wp / 4 + (base.entryFeeRate || d.feeRate1h || 0) * 0.5, 8, 25));
           var slB = plan && plan.sl ? plan.sl : Math.round(clampN(0.75 * Wp + 2, 8, 20));
           var pnlNow = (state.apiPos && state.apiPos.pnlPct != null) ? state.apiPos.pnlPct : null;  // API only — DOM rows contain unrelated %s
@@ -1034,7 +1086,7 @@
     bar.appendChild(head);
     if (radarCollapsed) {
       var n = (r && r.items) ? r.items.length : 0;
-      var full = (r && r.items) ? r.items.filter(function(i){return i.kind==="FULL";}).length : 0;
+      var full = (r && r.items) ? r.items.filter(function(i){return i.kind==="FULL" || i.kind==="BID_ASK";}).length : 0;
       bar.appendChild(el("span", "mql-radar-empty", full > 0 ? full + "🔥 " + (n-full) + "⚠" : n + " watched"));
       return;
     }
@@ -1043,11 +1095,16 @@
       return;
     }
     r.items.forEach(function (it) {
-      var chip = el("button", "mql-chip " + (it.kind === "FULL" ? "mql-chip-full mql-chip-" + it.cls.toLowerCase() : "mql-chip-near"));
+      var isBidAsk = it.kind === "BID_ASK";
+      var chip = el("button", "mql-chip " + (it.kind === "FULL" ? "mql-chip-full mql-chip-" + it.cls.toLowerCase() : isBidAsk ? "mql-chip-full mql-chip-carry" : "mql-chip-near"));
       var bs = it.binStep ? (it.binStep + "bps ") : "";
-      var lbl = it.kind === "FULL" ? ("🔥 " + it.name + " " + bs + "· " + it.cls + " · edge " + fmtNum(it.edge, 2)) : ("⚠ " + it.name + " " + bs + "· edge " + fmtNum(it.edge, 2) + " · misses " + (it.fails || []).map(function(f){return f.split(" ")[0];}).join("+"));
+      var lbl = it.kind === "FULL" ? ("🔥 " + it.name + " " + bs + "· " + it.cls + " · edge " + fmtNum(it.edge, 2))
+        : isBidAsk ? ("🪣 " + it.name + " " + bs + "· BID ASK READY · 0→-" + (it.bidAsk && it.bidAsk.depthPct) + "%")
+        : ("⚠ " + it.name + " " + bs + "· edge " + fmtNum(it.edge, 2) + " · misses " + (it.fails || []).map(function(f){return f.split(" ")[0];}).join("+"));
       chip.textContent = lbl;
-      chip.title = it.kind === "FULL" ? "All gates green — full " + it.cls + " signal. Click to open." : "Near-miss (override-eligible): fails " + (it.fails || []).join(", ") + ". Click to open.";
+      chip.title = it.kind === "FULL" ? "All gates green — full " + it.cls + " signal. Click to open."
+        : isBidAsk ? "Fresh accumulation gates pass. Manual Bid-Ask + Spot guide; click to open."
+        : "Near-miss (override-eligible): fails " + (it.fails || []).join(", ") + ". Click to open.";
       chip.addEventListener("click", function () { window.location.href = "/dlmm/" + it.address; });
       bar.appendChild(chip);
     });
@@ -1150,7 +1207,7 @@
     bar.style.width = pct + "%";
     barWrap.appendChild(bar);
     hud.appendChild(barWrap);
-    hud.appendChild(el("div", "mql-sub", "fees vs IL-breakeven"));
+    hud.appendChild(el("div", "mql-sub", "pool-wide fee/IL heuristic · position shape and costs not modeled"));
 
     // Fee rate row
     var frRow = el("div", "mql-row");
@@ -1275,6 +1332,19 @@
           armed = false;
           applySetup(ov.params, ovBtn);
           try {
+            if (ov.plan && state.pool) {
+              chrome.storage.local.get({ mqlEntryPlan: {} }, function (ep) {
+                var plans = ep.mqlEntryPlan || {};
+                plans[state.pool] = Object.assign({}, ov.plan, { pool: state.pool, ts: Date.now(),
+                  entryFeeRate: state.data && state.data.feeRate1h > 0 ? state.data.feeRate1h : null,
+                  entryFeeRate24h: state.data && state.data.feeRate24h > 0 ? state.data.feeRate24h : null,
+                  entryEdge: state.data && state.data.edge != null ? Math.round(state.data.edge * 100) / 100 : null,
+                  entrySigma: state.data && state.data.sigma != null ? Math.round(state.data.sigma * 10) / 10 : null,
+                  entrySigmaSource: state.data && state.data.sigmaSource || null });
+                chrome.storage.local.set({ mqlEntryPlan: plans });
+                state.entryPlan = plans[state.pool];
+              });
+            }
             chrome.storage.local.get({ mqlOverrideJournal: [] }, function (st) {
               var j = st.mqlOverrideJournal || [];
               j.push({ ts: Date.now(), pool: state.pool, cls: ov.cls, ignoredGates: ov.ignoredGates, edge: state.data && state.data.edge, sigma: state.data && state.data.sigma, feeRate1h: state.data && state.data.feeRate1h });
@@ -1707,6 +1777,10 @@
     if (newPool === state.pool) return;
     teardownForNavigation();
     state.pool = newPool;
+    state.accumDecayDataTs = 0;
+    state.accumDecayCount = 0;
+    state.accumPositionKey = null;
+    state.accumBaselineTs = 0;
     if (state.pool) {
       mountAll();
       startPolling();

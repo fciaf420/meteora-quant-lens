@@ -15,9 +15,9 @@ prompt.
 LPing a DLMM pool is selling insurance: fees are your premium, impermanent loss
 is the claim you pay when price moves. Meteora's UI shows you the premium and
 hides the risk. Quant Lens measures the risk — real realized volatility from
-price candles — divides the premium by it, and tells you whether you're being
-overpaid or farmed. If you are overpaid, it hands you a specific trade recipe
-with brackets. Once you're in, a separate layer anchored to *your* entry decides
+price candles — and compares the pool-wide fee rate with an IL proxy at the
+recipe's actual width. When the heuristic gates pass, it hands you a specific
+trade recipe with brackets. Once you're in, a separate layer anchored to *your* entry decides
 when the trade is over. Every close is reconciled against on-chain truth so the
 journal can eventually tell you which of its own opinions were right.
 
@@ -35,6 +35,12 @@ journal can eventually tell you which of its own opinions were right.
 After any extension update, open tabs show *"⚡ Lens was updated — refresh this
 page to reconnect"* with a one-click refresh. That's expected: Chrome orphans
 the old script, and only a page reload reconnects it.
+
+Run the strategy and watcher regressions with:
+
+```powershell
+npm test
+```
 
 ## Configure
 
@@ -75,16 +81,18 @@ Three estimators in a quality ladder, chosen automatically:
 edge = fee income ÷ expected IL   (at a given band width)
 ```
 
-`≥1` means fees beat expected impermanent loss with a safety margin. `<1` means
-the pool is farming you. Colored green / yellow / red at 1.0 / 0.5.
+`≥1` means the pool-wide fee rate clears this IL proxy with its safety margin.
+It is a screening heuristic, not a profit estimate: it does not model the bins
+your position will occupy, your active-liquidity share, one-sided inventory path,
+rewards, slippage, priority fees, or rent. Colored green / yellow / red at 1.0 / 0.5.
 
 Two things worth understanding:
 
 - **Edge scales linearly with band width.** A wider band suffers less IL per unit
   of vol, so the same pool quotes differently at ±20% vs ±35%. The headline EDGE
   uses your default W as a common yardstick; when a recipe exists, a second
-  quote appears at the recipe's actual width (`±35%: 2.00`). That second number
-  is the decision-relevant one.
+  quote appears at the recipe's actual width (`±35%: 2.00`). Verdict gates use
+  that recipe-width quote, while the headline remains a common comparison yardstick.
 - **Edge is inversely proportional to σ².** A vol estimate that's 20% too low
   inflates edge by ~56% — which is exactly why the σ ladder above matters.
 
@@ -108,7 +116,7 @@ Two things worth understanding:
 
 ---
 
-## The four setups
+## Trade setups and the BID ASK signal
 
 When the gates for a class all pass, the HUD shows a concrete recipe — shape,
 width, brackets — and a **⚡ Apply** button that fills Meteora's own form.
@@ -135,25 +143,24 @@ Mature (≥72h), calm, organic-buying pool that overpays for its risk. Requires
 edge ≥1.3, 6h OFI <1.0, TVL ≥$100k, mint+freeze burned. Wide ±35% band chosen
 for durability. Hold: days.
 
-### SQUEEZE — long volatility
-σ has compressed to ≤60% of its own trailing median for two consecutive reads
-(data-gated: needs ≥6 readings over ≥45min). Bid-Ask shape with liquidity loaded
-at the band edges, width derived from the *trailing* σ — the vol it coils back
-to, not the compressed reading. **This is the one class with no edge gate**: edge
-measures fee-vs-IL at *current* vol, and low current vol is the entire premise.
-A 24h time-stop closes coils that never spring.
+Volatility compression is still shown as an informational diagnostic. It does
+not issue a SQUEEZE entry: Bid-Ask is passive liquidity with inventory and adverse
+selection risk, rather than a long-vol payoff that wins from either breakout.
 
-### 🪣 ACCUM COMBO — the dip-catcher
+### 🪣 BID ASK — manual accumulation signal
 A deep single-sided SOL band below price (0 → -60..-75%, σ-scaled), built as
 **two layers in one position**: a Bid-Ask base (~70-80%, bottom-weighted so you
 buy more the deeper it dips) plus a Spot layer (uniform, so shallow dips still
-fill and earn). Structurally a ladder of limit-buy orders that pays you to get
-filled.
+fill). It acts like a ladder of limit buys; only active bins that swaps traverse
+can earn fees, while untouched bins earn nothing.
 
-Hard gates: mint+freeze burned, top10 ≤35%, organic buyers present, volume
-persisting, and not a dying knife. **⚡ Apply Combo** runs a guided two-leg flow
+The signal reads `WAIT` or `READY`; an open bound position reads `ACCUMULATING`,
+`WAIT`, or `EXIT`. Hard gates require a supported non-SOL token-X / SOL token-Y
+pool, a fresh and complete snapshot, mint+freeze burned, top10 ≤35%, organic
+buyers present, persistent volume, and no unbought freefall. **Guide Bid-Ask + Spot** runs a manual two-leg flow
 (create → wait for your signature → Add Liquidity panel for the Spot layer), and
-state survives page reloads.
+state survives page reloads. You choose the SOL amount; the extension only fills
+the form and every leg still requires your wallet approval.
 
 Accumulation books get their own rulebook: no scalp TP/SL, and price falling into
 the band is *the design*, not a failure. The only kill-rule is the token dying
@@ -207,8 +214,10 @@ directions), plan-stop broken, fee engine dying, distribution, TIGHTEN (claim
 fees, consider trimming), FREEFALL, accumulation fill milestones (25/50/75%,
 fully filled, popped above band), and position-closed with realized PnL.
 
-**Radar pings** (optional toggle): board-wide scan every ~3 minutes; pings when a
-pool passes every gate of a class. 2h cooldown per pool.
+**Radar pings** (optional toggle): every ~3 minutes, the bounded scanner analyzes
+up to eight high-fee pools selected from the top 100 by 24h volume. It pings for
+full trade setups and fresh `BID ASK READY` signals, with a 2h cooldown per
+pool/signal. This is a candidate screen, not an exhaustive market scan.
 
 **Health alerts:** the extension monitors its own data quality and warns once per
 6h if it's degraded (OHLCV failures, or legacy σ appearing on mature pools).
