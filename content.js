@@ -292,6 +292,113 @@
       && Number(ba.candleAnalysis.latestCompletedTs) === currentCompleted5mTs());
   }
 
+  // Manual BID ASK override deliberately bypasses the candle/base
+  // qualification, but it must still have a real executable plan: supported
+  // X/SOL orientation, finite depth and split, and two practical non-zero
+  // rounded legs. Keep this structural check separate from accumComboCheck so
+  // the normal READY path remains unchanged.
+  function bidAskOverridePlan(d) {
+    var ba = d && d.bidAsk;
+    var reasons = [];
+    if (!d || d.ok !== true) reasons.push("BID ASK plan unavailable — refresh pool data");
+    if (!d || d.supportedSolPair !== true) reasons.push("requires a non-SOL token X and wrapped SOL token Y");
+    var depth = Number(ba && ba.depthPct);
+    if (!isFinite(depth) || depth <= 0 || depth >= 100) reasons.push("valid BID ASK depth is unavailable");
+    var sharePct = Number(ba && ba.allocation && ba.allocation.bidAskPct);
+    var share = sharePct / 100;
+    if (!isFinite(sharePct) || !isFinite(share) || share <= 0 || share >= 1) reasons.push("valid Bid-Ask / Spot split is unavailable");
+    var ignored = [];
+    var gates = ba && Array.isArray(ba.gates) ? ba.gates : [];
+    gates.forEach(function (g) {
+      if (g && g.pass === false) ignored.push(String(g.label || g.key || "base gate"));
+    });
+    var cq = ba && ba.candleQualification;
+    (cq && Array.isArray(cq.reasons) ? cq.reasons : []).forEach(function (key) { ignored.push(String(key)); });
+    if (!cq || cq.ready !== true) ignored.push("candle qualification incomplete");
+    // Some background payloads expose only the combined reasons. Retain them
+    // too, while de-duplicating the display and journal snapshot.
+    (ba && Array.isArray(ba.reasons) ? ba.reasons : []).forEach(function (reason) {
+      if (!/base and candle qualification gates pass/i.test(String(reason))) ignored.push(String(reason));
+    });
+    var uniqueIgnored = [];
+    ignored.forEach(function (reason) {
+      if (uniqueIgnored.indexOf(reason) < 0) uniqueIgnored.push(reason);
+    });
+    return {
+      ok: reasons.length === 0,
+      depth: depth,
+      share: share,
+      sharePct: sharePct,
+      spotPct: 100 - sharePct,
+      reasons: reasons,
+      ignoredGates: uniqueIgnored,
+      signal: ba || null
+    };
+  }
+
+  function validateComboTotal(value, share) {
+    var raw = typeof value === "number" ? value : String(value == null ? "" : value).trim();
+    var total = typeof raw === "number" ? raw : Number(raw);
+    if (!isFinite(total) || total <= 0) return { ok: false, reason: "enter a positive TOTAL SOL amount" };
+    var s = Number(share);
+    if (!isFinite(s) || s <= 0 || s >= 1) return { ok: false, reason: "BID ASK split is unavailable" };
+    var bidAskSol = Math.round(s * total * 1000) / 1000;
+    var spotSol = Math.round((1 - s) * total * 1000) / 1000;
+    if (!isFinite(bidAskSol) || !isFinite(spotSol) || !(bidAskSol > 0) || !(spotSol > 0)) {
+      return { ok: false, reason: "TOTAL SOL is too small for two non-zero 0.001 SOL legs" };
+    }
+    return { ok: true, totalSol: total, bidAskSol: bidAskSol, spotSol: spotSol };
+  }
+
+  function sameOverrideSnapshot(a, b) {
+    return !!(a && b && a.pool === b.pool && a.dataTs === b.dataTs
+      && a.depth === b.depth && a.share === b.share && a.totalSol === b.totalSol);
+  }
+
+  // Small pure seam for the two-click override confirmation. The DOM button
+  // uses this state machine so a pool/plan change between clicks cannot apply
+  // the first click's stale closure.
+  function createAccumOverrideConfirmation(timeoutMs, onExpire) {
+    var armed = null;
+    var timer = null;
+    var ttl = isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0 ? Number(timeoutMs) : 8000;
+    function clear() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      armed = null;
+    }
+    function arm(snapshot) {
+      armed = { snapshot: snapshot, armedAt: Date.now() };
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(function () {
+        timer = null;
+        armed = null;
+        if (typeof onExpire === "function") onExpire();
+      }, ttl);
+    }
+    return {
+      click: function (snapshot) {
+        if (!armed) {
+          arm(snapshot);
+          return { armed: true, snapshot: snapshot };
+        }
+        if (Date.now() - armed.armedAt > ttl) {
+          clear();
+          if (typeof onExpire === "function") onExpire();
+          return { armed: false, expired: true, reason: "confirmation expired — click again to arm" };
+        }
+        if (!sameOverrideSnapshot(armed.snapshot, snapshot)) {
+          clear();
+          return { armed: false, rejected: true, reason: "pool or BID ASK plan changed — confirm again" };
+        }
+        var confirmed = armed.snapshot;
+        clear();
+        return { armed: false, confirmed: true, snapshot: confirmed };
+      },
+      reset: clear,
+      isArmed: function () { return !!armed; }
+    };
+  }
+
   function accumComboCheck(d) {
     if (!d || !d.ok) return null;
     if (d.bidAsk) {
@@ -313,7 +420,13 @@
       if (!reasons.length) reasons.push("BID ASK candle qualification is not complete");
       var state = ba.state || "WAIT";
       if (state === "READY") state = "WATCH";
-      return { show: "wait", state: state, reasons: reasons, signal: ba };
+      var overridePlan = bidAskOverridePlan(d);
+      reasons.forEach(function (reason) {
+        var text = String(reason);
+        if (!/base and candle qualification gates pass/i.test(text)
+            && overridePlan.ignoredGates.indexOf(text) < 0) overridePlan.ignoredGates.push(text);
+      });
+      return { show: "wait", state: state, reasons: reasons, signal: ba, overridePlan: overridePlan };
     }
     // A missing BID ASK payload is unsafe to treat as a legacy-compatible
     // signal. The background worker is the single owner of these gates.
@@ -325,6 +438,9 @@
   // or legacy READY payload cannot enable a manual position flow.
   if (window.__mqlTestExports && typeof window.__mqlTestExports === "object") {
     window.__mqlTestExports.accumComboCheck = accumComboCheck;
+    window.__mqlTestExports.bidAskOverridePlan = bidAskOverridePlan;
+    window.__mqlTestExports.validateComboTotal = validateComboTotal;
+    window.__mqlTestExports.createAccumOverrideConfirmation = createAccumOverrideConfirmation;
   }
 
   function appendCandleEvidence(body, analysis) {
@@ -354,7 +470,51 @@
       "last-hour total pool volume / prior hourly median " + volume +
       " (" + (analysis.volumeBaselineHours || 0) + " baseline hours)"));
     body.appendChild(el("div", "mql-accum-prior",
-      "BID ASK candle checks: 0.5× volume floor · 2 recoveries with 1 within 3h · two non-lower 15m support comparisons · provisional thresholds"));
+      "BID ASK candle checks: 0.5× volume floor · 2 recoveries with 1 within 3h · three wall-clock 15m support lows, each the minimum of 3 completed 5m closes · provisional thresholds"));
+  }
+
+  function appendAccumTotalControls(body, chk, total, actionText, onValid) {
+    var splitLine = el("div", "mql-accum-line");
+    splitLine.id = "mql-accum-split";
+    var setSplitText = function (tot) {
+      var a = Math.round(chk.share * tot * 1000) / 1000;
+      var b = Math.round((1 - chk.share) * tot * 1000) / 1000;
+      splitLine.textContent = "split " + Math.round(chk.share * 100) + "/" + Math.round((1 - chk.share) * 100) +
+        ": " + a + " SOL Bid-Ask + " + b + " SOL Spot (same range)";
+    };
+    setSplitText(total);
+    tipify(splitLine, "accumsplit");
+    body.appendChild(splitLine);
+    var totRow = el("div", "mql-accum-total");
+    totRow.appendChild(el("span", "", "your chosen TOTAL SOL (both legs)"));
+    var totInp = el("input", "");
+    totInp.type = "number"; totInp.step = "0.001"; totInp.min = "0.001"; totInp.value = String(total);
+    totInp.addEventListener("input", safe(function () {
+      var check = validateComboTotal(totInp.value, chk.share);
+      if (check.ok) {
+        comboUI.total = check.totalSol;
+        try { chrome.storage.local.set({ mqlComboTotal: check.totalSol }); } catch (e) {}
+        totInp.classList.remove("mql-input-invalid");
+        setSplitText(check.totalSol);
+      } else {
+        totInp.classList.add("mql-input-invalid");
+      }
+    }));
+    totRow.appendChild(totInp);
+    body.appendChild(totRow);
+    var actionBtn = el("button", "mql-apply", actionText);
+    actionBtn.addEventListener("click", safe(function () {
+      var check = validateComboTotal(totInp.value, chk.share);
+      if (!check.ok) {
+        totInp.classList.add("mql-input-invalid");
+        actionBtn.textContent = "✗ " + check.reason;
+        return;
+      }
+      totInp.classList.remove("mql-input-invalid");
+      onValid(check, actionBtn, totInp);
+    }));
+    body.appendChild(actionBtn);
+    return { input: totInp, button: actionBtn, setSplitText: setSplitText };
   }
 
   var renderAccumBlock = safe(function renderAccumBlock(hud, d) {
@@ -379,49 +539,91 @@
           body.appendChild(el("div", "mql-accum-note", reason));
         });
         appendCandleEvidence(body, d.candleAnalysis || (chk.signal && chk.signal.candleAnalysis), chk.signal && chk.signal.candleQualification);
-        body.appendChild(el("div", "mql-accum-prior", (chk.state || "WAIT") + " — candle-qualified BID ASK is required before the manual guide is enabled"));
+        var ovPlan = chk.overridePlan;
+        if (!ovPlan || !ovPlan.ok) {
+          body.appendChild(el("div", "mql-accum-prior", (chk.state || "WAIT") + " — manual override unavailable: " +
+            ((ovPlan && ovPlan.reasons || ["BID ASK plan unavailable"]).join(" · "))));
+          wrap.appendChild(body); hud.appendChild(wrap); return;
+        }
+        body.appendChild(el("div", "mql-accum-line", "override plan · range 0% → -" + ovPlan.depth + "% · " +
+          Math.round(ovPlan.share * 100) + "/" + Math.round((1 - ovPlan.share) * 100) + " Bid-Ask / Spot"));
+        body.appendChild(el("div", "mql-accum-note", "⚠ Intentional override: standard BID ASK gates are ignored only after two clicks; review every failed gate."));
+        body.appendChild(el("div", "mql-accum-note", "ignored gates: " +
+          (ovPlan.ignoredGates.length ? ovPlan.ignoredGates.join(" · ") : "none reported")));
+        var renderedOverrideIdentity = {
+          pool: state.pool, dataTs: Number(d.ts), depth: ovPlan.depth, share: ovPlan.share
+        };
+        var overrideTotal = isFinite(Number(comboUI.total)) && Number(comboUI.total) > 0 ? Number(comboUI.total) : 1.0;
+        appendAccumTotalControls(body, { share: ovPlan.share }, overrideTotal,
+          "⚠ Override BID ASK anyway (2 clicks)", function (check, button) {
+            var liveGateCheck = accumComboCheck(state.data);
+            var planNow = liveGateCheck && liveGateCheck.overridePlan;
+            if (!planNow) planNow = bidAskOverridePlan(state.data);
+            if (!planNow || !planNow.ok || state.pool !== renderedOverrideIdentity.pool
+                || Number(state.data && state.data.ts) !== renderedOverrideIdentity.dataTs
+                || planNow.depth !== renderedOverrideIdentity.depth
+                || planNow.share !== renderedOverrideIdentity.share) {
+              button.textContent = "✗ pool or BID ASK plan changed — refresh and review";
+              return;
+            }
+            var snapshot = {
+              pool: state.pool, dataTs: Number(state.data && state.data.ts), depth: planNow.depth,
+              share: planNow.share, totalSol: check.totalSol,
+              ignoredGates: planNow.ignoredGates.slice(), plan: planNow
+            };
+            if (!planNow.ok || !isFinite(snapshot.dataTs)) {
+              button.textContent = "✗ BID ASK plan changed — refresh and review";
+              return;
+            }
+            var confirmation = button.__mqlOverrideConfirmation;
+            if (!confirmation) {
+              confirmation = createAccumOverrideConfirmation(8000, function () {
+                button.textContent = "⚠ Override BID ASK anyway (2 clicks)";
+              });
+              button.__mqlOverrideConfirmation = confirmation;
+            }
+            var result = confirmation.click(snapshot);
+            if (result.confirmed) {
+              var finalGateCheck = accumComboCheck(state.data);
+              var currentPlan = finalGateCheck && finalGateCheck.overridePlan;
+              if (!currentPlan) currentPlan = bidAskOverridePlan(state.data);
+              var amountCheck = validateComboTotal(snapshot.totalSol, currentPlan.share);
+              var currentSnapshot = {
+                pool: state.pool, dataTs: Number(state.data && state.data.ts), depth: currentPlan.depth,
+                share: currentPlan.share, totalSol: snapshot.totalSol
+              };
+              if (!currentPlan.ok || !amountCheck.ok || !sameOverrideSnapshot(snapshot, currentSnapshot)) {
+                button.textContent = "✗ pool or BID ASK plan changed — confirm again";
+                return;
+              }
+              startCombo(currentPlan.depth, currentPlan.share, amountCheck.totalSol, {
+                override: true, pool: snapshot.pool, dataTs: snapshot.dataTs,
+                ignoredGates: snapshot.ignoredGates, plan: currentPlan
+              });
+              button.textContent = "⚠ Override started — review the two-leg banner";
+            } else if (result.expired) {
+              button.textContent = "⚠ Override BID ASK anyway (2 clicks)";
+            } else if (result.rejected) {
+              button.textContent = "✗ " + result.reason;
+            } else {
+              button.textContent = "⚠ Ignoring: " + (snapshot.ignoredGates.join(" · ") || "failed BID ASK gates") + " — click again within 8s";
+            }
+          });
         wrap.appendChild(body); hud.appendChild(wrap); return;
       }
       var rangeLine = el("div", "mql-accum-line", "range 0% → -" + chk.depth + "% (σ-scaled depth)");
       tipify(rangeLine, "accumdepth");
       body.appendChild(rangeLine);
-      var total = comboUI.total || 1.0;
-      var splitLine = el("div", "mql-accum-line");
-      splitLine.id = "mql-accum-split";
-      var setSplitText = function (tot) {
-        var a = Math.round(chk.share * tot * 1000) / 1000;
-        var b = Math.round((1 - chk.share) * tot * 1000) / 1000;
-        splitLine.textContent = "split " + Math.round(chk.share * 100) + "/" + Math.round((1 - chk.share) * 100) +
-          ": " + a + " SOL Bid-Ask + " + b + " SOL Spot (same range)";
-      };
-      setSplitText(total);
-      tipify(splitLine, "accumsplit");
-      body.appendChild(splitLine);
-      var totRow = el("div", "mql-accum-total");
-      totRow.appendChild(el("span", "", "your chosen SOL amount"));
-      var totInp = el("input", "");
-      totInp.type = "number"; totInp.step = "0.1"; totInp.min = "0.01"; totInp.value = String(total);
-      totInp.addEventListener("input", safe(function () {
-        var v = parseFloat(totInp.value);
-        if (isFinite(v) && v > 0) {
-          comboUI.total = v;
-          try { chrome.storage.local.set({ mqlComboTotal: v }); } catch (e) {}
-          setSplitText(v);
-        }
-      }));
-      totRow.appendChild(totInp);
-      body.appendChild(totRow);
+      var total = isFinite(Number(comboUI.total)) && Number(comboUI.total) > 0 ? Number(comboUI.total) : 1.0;
       body.appendChild(el("div", "mql-accum-line mql-muted",
         "σ " + fmtNum(d.sigma, 0) + "%/d → depth " + chk.depth + "% · fees 1h " + fmtNum(d.feeRate1h, 1) +
         " vs 24h " + fmtNum(d.feeRate24h, 1) + "%/d (persisting) · OFI " + fmtNum(d.ofi1h, 2)));
       appendCandleEvidence(body, d.candleAnalysis || (chk.signal && chk.signal.candleAnalysis), chk.signal && chk.signal.candleQualification);
       body.appendChild(el("div", "mql-rec-warn", "⚠ directional bag risk: if the token dies you own it the whole way down — size for total loss"));
       body.appendChild(el("div", "mql-accum-prior", "uncalibrated heuristic · pool-wide fees and position costs are not modeled"));
-      var applyBtn = el("button", "mql-apply", "⚡ Guide Bid-Ask + Spot (2 legs)");
-      applyBtn.addEventListener("click", safe(function () {
-        startCombo(chk.depth, chk.share, comboUI.total || 1.0);
-      }));
-      body.appendChild(applyBtn);
+      appendAccumTotalControls(body, chk, total, "⚡ Guide Bid-Ask + Spot (2 legs)", function (check) {
+        startCombo(chk.depth, chk.share, check.totalSol);
+      });
       wrap.appendChild(body);
     }
     hud.appendChild(wrap);
@@ -549,10 +751,14 @@
     if (!b) { b = el("div", ""); b.id = "mql-combo-banner"; document.body.appendChild(b); }
     b.innerHTML = "";
     var amt = comboLegAmt(st);
+    var overridePrefix = st.override ? "⚠ OVERRIDE · " : "";
     var stepTxt = st.leg === 1
-      ? "LEG 1/2 — BID-ASK " + amt + " SOL · range 0 → -" + st.depth + "% (creates the position)"
-      : "LEG 2/2 — ADD " + amt + " SOL as SPOT into the SAME position (range locked to leg 1)";
+      ? overridePrefix + "LEG 1/2 — BID-ASK " + amt + " SOL · range 0 → -" + st.depth + "% (creates the position)"
+      : overridePrefix + "LEG 2/2 — ADD " + amt + " SOL as SPOT into the SAME position (range locked to leg 1)";
     b.appendChild(el("div", "mql-combo-step", stepTxt));
+    if (st.override && st.ignoredGates && st.ignoredGates.length) {
+      b.appendChild(el("div", "mql-combo-sub", "ignored gates: " + st.ignoredGates.join(" · ")));
+    }
     var subTxt = note || (st.amtFilled
       ? "form filled — review & sign in wallet (keep Auto-Fill OFF, SOL side only)"
       : "strategy + range filled — ENTER " + amt + " SOL yourself, then sign (keep Auto-Fill OFF)");
@@ -583,14 +789,19 @@
           var logArr = jr.mqlTradeLog || [];
           logArr.push({ type: "BID_ASK_OPEN", profile: "ACCUM", strategy: "Bid-Ask + Spot", pool: st.poolAddr, depth: st.depth, share: st.share,
             totalSol: st.totalSol, startedAt: st.startedAt, leg1At: st.leg1At || null,
-            finishedAt: Date.now(), detectedBy: how });
+            finishedAt: Date.now(), detectedBy: how, override: st.override === true,
+            ignoredGates: st.ignoredGates || [], entryPlanTs: st.entryPlanTs || null });
           chrome.storage.local.set({ mqlTradeLog: logArr.slice(-200) });
         });
       } catch (e) {}
       var b = document.getElementById("mql-combo-banner");
       if (b) {
         b.innerHTML = "";
-        b.appendChild(el("div", "mql-combo-step mql-good", "✅ BID ASK DEPLOYED — one position: Bid-Ask base + Spot layer. Position Watch is tracking fill %."));
+        b.appendChild(el("div", "mql-combo-step mql-good", (st.override ? "⚠ OVERRIDE · " : "") +
+          "✅ BID ASK DEPLOYED — one position: Bid-Ask base + Spot layer. Position Watch is tracking fill %."));
+        if (st.override && st.ignoredGates && st.ignoredGates.length) {
+          b.appendChild(el("div", "mql-combo-sub", "override recorded; ignored gates: " + st.ignoredGates.join(" · ")));
+        }
         setTimeout(safe(function () { var n = document.getElementById("mql-combo-banner"); if (n) n.remove(); }), 9000);
       }
       comboFlow.st = null;
@@ -640,40 +851,98 @@
     }), 15000);
   }
 
-  var startCombo = safe(function startCombo(depth, share, totalSol) {
-    var ba = state.data && state.data.bidAsk;
+  var startCombo = safe(function startCombo(depth, share, totalSol, overrideMeta) {
+    var startPool = state.pool;
+    var startData = state.data;
+    var ba = startData && startData.bidAsk;
     var comboNow = Date.now();
-    var comboTs = Number(state.data && state.data.ts);
-    if (!ba || !ba.ready || ba.state !== 'READY' || state.data.supportedSolPair !== true
-        || !isFinite(comboTs) || comboNow < comboTs || comboNow - comboTs > 120000
-        || !bidAskCandleFresh(ba)) return;
+    var comboTs = Number(startData && startData.ts);
+    var isOverride = !!(overrideMeta && overrideMeta.override === true);
+    var structural = bidAskOverridePlan(startData);
+    var amount = validateComboTotal(totalSol, share);
+    if (!startPool || !ba || !structural.ok || !amount.ok
+        || !isFinite(Number(depth)) || Number(depth) <= 0 || Number(depth) >= 100
+        || Number(depth) !== structural.depth || Number(share) !== structural.share
+        || !isFinite(comboTs)) return;
+    if (isOverride) {
+      // The second click captured this pool/data/plan identity. Manual override
+      // skips candle/base qualification only; a changed plan must be confirmed
+      // again rather than applying a stale closure to a new pool.
+      if (!overrideMeta.pool || overrideMeta.pool !== startPool
+          || Number(overrideMeta.dataTs) !== comboTs) return;
+    } else if (!ba.ready || ba.state !== 'READY' || startData.supportedSolPair !== true
+        || comboNow < comboTs || comboNow - comboTs > 120000 || !bidAskCandleFresh(ba)) {
+      return;
+    }
+    var entryTs = isOverride && isFinite(Number(overrideMeta.entryTs)) ? Number(overrideMeta.entryTs) : comboNow;
+    var ignoredGates = isOverride && Array.isArray(overrideMeta.ignoredGates)
+      ? overrideMeta.ignoredGates.slice() : [];
+    var entryContext = {
+      feeRate1h: startData.feeRate1h,
+      feeRate24h: startData.feeRate24h,
+      edge: startData.edge,
+      sigma: startData.sigma,
+      sigmaSource: startData.sigmaSource
+    };
+    var entryPlan = { cls: 'BID_ASK', profile: 'ACCUM', strategy: 'Bid-Ask + Spot', pool: startPool, ts: entryTs,
+      widthPct: Math.round(Number(depth) / (2 - Number(depth) / 100)), minPct: -Number(depth), maxPct: 0, mode: 'single',
+      depthPct: Number(depth), bidAskPct: Math.round(Number(share) * 100), spotPct: Math.round((1 - Number(share)) * 100), accum: true,
+      totalSol: amount.totalSol,
+      entryFeeRate: (entryContext.feeRate1h > 0) ? entryContext.feeRate1h : null,
+      entryFeeRate24h: (entryContext.feeRate24h > 0) ? entryContext.feeRate24h : null,
+      entryEdge: (entryContext.edge != null) ? Math.round(entryContext.edge * 100) / 100 : null,
+      entrySigma: (entryContext.sigma != null) ? Math.round(entryContext.sigma * 10) / 10 : null,
+      entrySigmaSource: entryContext.sigmaSource || null };
+    if (isOverride) {
+      entryPlan.override = true;
+      entryPlan.ignoredGates = ignoredGates.slice();
+      entryPlan.overrideDataTs = comboTs;
+    }
     var startCount = (state.apiPos && state.apiPos.count) || 0;
-    // journal the combo's OWN entry plan: correct class label, correct fee baseline
-    // (previously the combo wrote no plan, so a stale Apply-click plan could bind)
+    comboFlow.st = { poolAddr: startPool, depth: Number(depth), share: Number(share), totalSol: amount.totalSol,
+      leg: 1, startedAt: entryTs, entryPlanTs: entryTs, dataTs: comboTs,
+      startCount: startCount, lastCount: startCount,
+      startDeposits: (state.apiPos && state.apiPos.depositsSol != null ? Number(state.apiPos.depositsSol) : 0),
+      leg1Deposits: null, amtFilled: false, warned: false,
+      override: isOverride, ignoredGates: ignoredGates };
+    // Journal the combo's OWN entry plan. For overrides, the plan and override
+    // journal share the exact same timestamp so background entry-origin joining
+    // cannot lose the intent across the asynchronous storage callbacks.
     try {
-      chrome.storage.local.get({ mqlEntryPlan: {} }, safe(function (jr9) {
+      chrome.storage.local.get({ mqlEntryPlan: {}, mqlOverrideJournal: [] }, safe(function (jr9) {
         var plans9 = jr9.mqlEntryPlan || {};
-        plans9[state.pool] = { cls: 'BID_ASK', profile: 'ACCUM', strategy: 'Bid-Ask + Spot', pool: state.pool, ts: Date.now(),
-          widthPct: Math.round(depth / (2 - depth / 100)), minPct: -depth, maxPct: 0, mode: 'single',
-          depthPct: depth, bidAskPct: Math.round(share * 100), spotPct: Math.round((1 - share) * 100), accum: true,
-          entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null,
-          entryFeeRate24h: (state.data && state.data.feeRate24h > 0) ? state.data.feeRate24h : null,
-          entryEdge: (state.data && state.data.edge != null) ? Math.round(state.data.edge * 100) / 100 : null,
-          entrySigma: (state.data && state.data.sigma != null) ? Math.round(state.data.sigma * 10) / 10 : null,
-          entrySigmaSource: (state.data && state.data.sigmaSource) || null };
-        chrome.storage.local.set({ mqlEntryPlan: plans9 });
-        state.entryPlan = plans9[state.pool];
+        plans9[startPool] = entryPlan;
+        var payload = { mqlEntryPlan: plans9 };
+        if (isOverride) {
+          var overrides = jr9.mqlOverrideJournal || [];
+          overrides.push({ ts: entryTs, pool: startPool, cls: 'BID_ASK', override: true,
+            ignoredGates: ignoredGates.slice(), depth: Number(depth), share: Number(share),
+            totalSol: amount.totalSol, dataTs: comboTs, edge: entryContext.edge,
+            sigma: entryContext.sigma, feeRate1h: entryContext.feeRate1h });
+          payload.mqlOverrideJournal = overrides.slice(-100);
+        }
+        chrome.storage.local.set(payload, safe(function () {
+          if (state.pool === startPool) state.entryPlan = entryPlan;
+        }));
       }));
     } catch (e) {}
-    comboFlow.st = { poolAddr: state.pool, depth: depth, share: share, totalSol: totalSol,
-      leg: 1, startedAt: Date.now(), startCount: startCount, lastCount: startCount,
-      startDeposits: (state.apiPos && state.apiPos.depositsSol != null ? Number(state.apiPos.depositsSol) : 0),
-      leg1Deposits: null, amtFilled: false, warned: false };
     comboSave();
     renderComboBanner();
     comboApplyLeg();
     comboPollStart();
   });
+
+  // Additional VM seams cover the DOM click path without exposing production
+  // controls. They are populated only by the existing test harness object.
+  if (window.__mqlTestExports && typeof window.__mqlTestExports === "object") {
+    window.__mqlTestExports.renderAccumBlock = renderAccumBlock;
+    window.__mqlTestExports.startCombo = startCombo;
+    window.__mqlTestExports.setState = function (patch) {
+      if (patch && typeof patch === "object") Object.assign(state, patch);
+    };
+    window.__mqlTestExports.setComboOpen = function (open) { comboUI.open = !!open; };
+    window.__mqlTestExports.getComboState = function () { return comboFlow.st; };
+  }
 
   function loadEntryPlan() {
     try {

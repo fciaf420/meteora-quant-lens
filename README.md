@@ -154,7 +154,7 @@ buy more the deeper it dips) plus a Spot layer (uniform, so shallow dips still
 fill). It acts like a ladder of limit buys; only active bins that swaps traverse
 can earn fees, while untouched bins earn nothing.
 
-The signal reads `WAIT` or `READY`; an open bound position reads `ACCUMULATING`,
+The signal reads `WAIT`, `WATCH`, or `READY`; an open bound position reads `ACCUMULATING`,
 `WAIT`, or `EXIT`. Hard gates require a supported non-SOL token-X / SOL token-Y
 pool, a fresh and complete snapshot, mint+freeze burned, top10 ≤35%, organic
 buyers present, persistent volume, and no unbought freefall. **Guide Bid-Ask + Spot** runs a manual two-leg flow
@@ -175,7 +175,13 @@ The BID ASK card and Radar first apply the existing pool, orientation, safety,
 organic-flow, fee-persistence, and freefall checks. A base candidate that passes
 those checks remains `WATCH` until current completed public Meteora 5-minute
 candles also qualify it. `READY` means the manual Bid-Ask + Spot guide is
-enabled; it is still a user-approved entry, not an automated wallet action.
+enabled; it is still a user-approved entry, not an automated wallet action. A
+`WATCH`/`WAIT` card can also expose an intentional **Override BID ASK anyway**
+flow when its supported-pair, depth, and split plan are structurally valid. The
+override requires two clicks within eight seconds, shows the ignored gates,
+records the same override timestamp in the entry plan and override journal, and
+still guides the same two wallet-approved legs. It does not silently reuse an
+invalid amount or a plan from another pool.
 
 The candle qualification requires a current completed 5-minute bucket, at least
 half the prior complete hourly median of **total pool volume** (with at least one
