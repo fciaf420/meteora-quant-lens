@@ -652,7 +652,33 @@
   // Fill the SOL amount input. DOM assumption (flagged for live review): each
   // AmountInput wrap shows its token symbol as text; we fill the unique wrap
   // mentioning SOL, else fall back to the 2nd of exactly two inputs (quote side).
-  function fillSolAmount(amt) {
+  // Which deposit panel owns a node? Walk a BOUNDED set of ancestors and read the
+  // panel's own submit button label. Meteora keeps the Create Position form mounted
+  // next to a position's Add Liquidity panel, so anything document-wide is ambiguous.
+  function panelKind(node) {
+    var n = node, hops = 0;
+    while (n && n !== document.body && hops < 10) {
+      var btns = n.querySelectorAll("button");
+      for (var i = 0; i < btns.length; i++) {
+        var t = (btns[i].textContent || "").replace(/\s+/g, " ").trim();
+        if (/^add liquidity$/i.test(t)) return { kind: "ADD", root: n };
+        if (/^create position$/i.test(t)) return { kind: "CREATE", root: n };
+      }
+      n = n.parentElement; hops++;
+    }
+    return { kind: null, root: null };
+  }
+
+  function findPanelRoot(kind) {
+    var wraps = document.querySelectorAll('[data-sentry-component="AmountInput"]');
+    for (var i = 0; i < wraps.length; i++) {
+      var pk = panelKind(wraps[i]);
+      if (pk.kind === kind) return pk.root;
+    }
+    return null;
+  }
+
+  function fillSolAmount(amt, scopeEl) {
     try {
       if (!state.data || state.data.supportedSolPair !== true) return false;
       // NESTED-WRAP TRAP (caught live on the Add Liquidity panel): AmountInput wraps
@@ -660,7 +686,11 @@
       // textContent matches /SOL/ and querySelector('input') returns the FIRST input
       // = the TOKEN box. Judge each input by its own LEAF section text instead:
       // climb ancestors while the container still holds only that one input.
-      var wraps = document.querySelectorAll('[data-sentry-component="AmountInput"]');
+      // TWO-PANEL TRAP (caught live on leg 2): with the Add Liquidity panel open the
+      // page holds TWO enabled SOL inputs, so the "exactly one" rule below bailed and
+      // the amount silently went unfilled. Callers pass the owning panel as scope.
+      var root = scopeEl || document;
+      var wraps = root.querySelectorAll('[data-sentry-component="AmountInput"]');
       var seen = [], inputs = [];
       for (var i = 0; i < wraps.length; i++) {
         var ins = wraps[i].querySelectorAll("input");
@@ -677,7 +707,11 @@
       var solInputs = [];
       for (var k = 0; k < inputs.length; k++) {
         var lt = localText(inputs[k]);
-        if (/\bSOL\b/.test(lt) && !/USDC|USDT/.test(lt)) solInputs.push(inputs[k]);
+        // WORD-BOUNDARY TRAP (caught live): the SOL section's leaf text concatenates
+        // the symbol straight onto the wallet balance ("SOL48.50323..."), so /\bSOL\b/
+        // never matched and the amount silently went unfilled. Use a LETTER boundary
+        // instead: digits/symbols may touch "SOL", letters may not (keeps SOLCAT out).
+        if (/(^|[^A-Za-z])SOL([^A-Za-z]|$)/.test(lt) && !/USDC|USDT/.test(lt)) solInputs.push(inputs[k]);
       }
       var enabledSol = solInputs.filter(function (x) { return !x.disabled; });
       var pick = enabledSol.length === 1 ? enabledSol[0] : null;
@@ -689,23 +723,31 @@
   // Leg 2 = ADD LIQUIDITY into the leg-1 position (user-confirmed: ONE position,
   // bid-ask base + spot layered on top). Range is locked to the position's bins,
   // so we only drive: Add Liquidity button -> Spot strategy -> SOL amount.
-  function findAddLiquidityBtn() {
+  // OPENER only. Never returns the Add panel's own SUBMIT button: clicking that
+  // would try to send the deposit instead of opening the form.
+  function findAddLiquidityBtn(addRoot) {
     var btns = document.querySelectorAll("button");
     for (var i = 0; i < btns.length; i++) {
       var t = (btns[i].textContent || "").replace(/\s+/g, " ").trim();
-      if (/^add liquidity$/i.test(t)) return btns[i];
+      if (!/^add liquidity$/i.test(t)) continue;
+      if (addRoot && addRoot.contains(btns[i])) continue;
+      return btns[i];
     }
     return null;
   }
 
   var comboAddSpotLayer = safe(function comboAddSpotLayer() {
     var st = comboFlow.st; if (!st) return;
-    var addBtn = findAddLiquidityBtn();
+    var addRoot = findPanelRoot("ADD");
+    var addBtn = addRoot ? null : findAddLiquidityBtn(null);
     if (addBtn) { try { addBtn.click(); } catch (e) {} }
     setTimeout(safe(function () {
       var st2 = comboFlow.st; if (!st2) return;
-      // strategy: Spot (same proven selector as applySetup)
-      var stratWrap = document.querySelector('[data-sentry-component="StrategySelection"]');
+      // Re-resolve after the click: leg 2 must drive the position's Add panel, not
+      // the Create Position form that stays mounted right next to it.
+      var root = findPanelRoot("ADD");
+      // strategy: Spot (same proven selector as applySetup, scoped to that panel)
+      var stratWrap = (root || document).querySelector('[data-sentry-component="StrategySelection"]');
       if (stratWrap) {
         var btns = stratWrap.querySelectorAll("button");
         for (var i = 0; i < btns.length; i++) {
@@ -714,9 +756,10 @@
       }
       setTimeout(safe(function () {
         var st3 = comboFlow.st; if (!st3) return;
-        st3.amtFilled = fillSolAmount(comboLegAmt(st3));
+        var root2 = findPanelRoot("ADD") || root;
+        st3.amtFilled = fillSolAmount(comboLegAmt(st3), root2);
         comboSave();
-        renderComboBanner((addBtn || stratWrap)
+        renderComboBanner(root2
           ? null
           : "couldn't find your position's Add Liquidity panel — open the position card, click Add Liquidity, pick Spot, enter " + comboLegAmt(st3) + " SOL, then sign");
       }), 700);
@@ -731,7 +774,7 @@
       var st2 = comboFlow.st; if (!st2) return;
       var r = readRange();
       if (!r) { renderComboBanner("open the deposit / Add Position panel first, then hit ↻ re-apply"); return; }
-      st2.amtFilled = fillSolAmount(comboLegAmt(st2));
+      st2.amtFilled = fillSolAmount(comboLegAmt(st2), findPanelRoot("CREATE"));
       comboSave(); renderComboBanner();
       // re-verify the range stuck (Auto-Fill likes to reset it)
       setTimeout(safe(function () {
