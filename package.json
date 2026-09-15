@@ -1,6 +1,6 @@
 {
   "private": true,
   "scripts": {
-    "test": "node --test tests/background-strategy.test.cjs"
+    "test": "node --test tests/background-strategy.test.cjs tests/candle-analysis.test.cjs tests/content-strategy.test.cjs"
   }
 }

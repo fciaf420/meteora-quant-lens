@@ -6,6 +6,8 @@
 
 'use strict';
 
+importScripts('candle-analysis.js');
+
 // ---------------------------------------------------------------------------
 // Small utils
 // ---------------------------------------------------------------------------
@@ -122,6 +124,56 @@ function usablePoolSeed(address, p) {
     && pick(p, 'dynamic_fee_pct', 'dynamic_fee_percentage', 'dynamicFeePct') !== undefined
     && (pick(p.pool_config || {}, 'base_fee_pct', 'baseFeePct') !== undefined
       || pick(p, 'base_fee_pct', 'base_fee_percentage', 'baseFeePct') !== undefined);
+}
+
+const candleHistoryLoader = globalThis.MQLCandleAnalysis.createCandleHistoryLoader({
+  fetchJson: async (url) => {
+    const response = await fetchJson(url);
+    if (!response || !response.ok) throw new Error((response && response.error) || 'candle fetch failed');
+    return response.json;
+  },
+  maxPools: 12
+});
+const candleHistoryPrimed = new Set();
+let candleHistoryPersistChain = Promise.resolve();
+
+async function persistCandleHistory(address, candles, poolCreatedAt) {
+  const key = 'mqlc:candles:' + address;
+  candleHistoryPersistChain = candleHistoryPersistChain.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.session.get({ mqlCandleCacheIndex: [] });
+    const prior = (stored.mqlCandleCacheIndex || []).filter((row) => row && row.address !== address);
+    const next = prior.concat([{ address, ts: Date.now() }]).slice(-12);
+    const keep = new Set(next.map((row) => row.address));
+    const evicted = prior.filter((row) => !keep.has(row.address)).map((row) => 'mqlc:candles:' + row.address);
+    if (evicted.length) await chrome.storage.session.remove(evicted);
+    await chrome.storage.session.set({
+      mqlCandleCacheIndex: next,
+      [key]: { ts: Date.now(), data: { candles, poolCreatedAt } }
+    });
+  });
+  try { await candleHistoryPersistChain; } catch (e) {}
+}
+
+async function loadCandleEvidence(address, poolCreatedAt, recentCandles) {
+  const key = 'mqlc:candles:' + address;
+  if (!candleHistoryPrimed.has(address)) {
+    candleHistoryPrimed.add(address);
+    const stored = await sessionCacheGet(key, 26 * 3600e3);
+    if (stored && stored.data && Array.isArray(stored.data.candles)) {
+      candleHistoryLoader.seed(address, stored.data.candles,
+        { poolCreatedAt: poolCreatedAt == null ? stored.data.poolCreatedAt : poolCreatedAt });
+    } else if (Array.isArray(recentCandles) && recentCandles.length) {
+      candleHistoryLoader.seed(address, recentCandles, { poolCreatedAt });
+    }
+  }
+  const result = await candleHistoryLoader.load(address, { poolCreatedAt });
+  // Never persist normalized remnants from an invalid/conflicting response. A
+  // worker restart must refetch that history instead of treating sanitized rows
+  // as proof that the original response was complete and internally consistent.
+  if (result.analysis.state === 'READY' || result.analysis.state === 'LIMITED') {
+    await persistCandleHistory(address, result.candles, poolCreatedAt);
+  }
+  return result.analysis;
 }
 
 async function fetchPoolRaw(address, seed) {
@@ -329,7 +381,11 @@ function computeBidAskSignal(d, now) {
     gate('fee persistence', finite(d.feeRate1h) && finite(d.feeRate24h) && d.feeRate24h >= 8 && d.feeRate1h >= 0.5 * d.feeRate24h),
     gate('no unbought freefall', typeof d.path === 'string' && finite(d.ofi1h) && !(d.path === 'FREEFALL' && d.ofi1h >= 1.43))
   ];
-  const ready = gates.every((g) => g.pass);
+  const baseReady = gates.every((g) => g.pass);
+  const candleQualification = globalThis.MQLCandleAnalysis.qualifyBidAskCandle(
+    d.candleAnalysis, { nowMs: now });
+  const ready = baseReady && candleQualification.ready;
+  const state = ready ? 'READY' : (baseReady ? 'WATCH' : 'WAIT');
   const missing = [];
   if (d.ok !== true) missing.push('pool data');
   if (!finite(d.ts)) missing.push('snapshot time');
@@ -350,21 +406,42 @@ function computeBidAskSignal(d, now) {
     share = Math.min(0.80, Math.max(0.60, share));
     bidAskPct = Math.round((Math.round(share * 20) / 20) * 100);
   }
+  let reasons;
+  if (ready) {
+    reasons = ['base and candle qualification gates pass; manual wallet approval required'];
+  } else if (!baseReady) {
+    reasons = !pairOK
+      ? ['Unsupported orientation: BID ASK requires a non-SOL token X and wrapped SOL token Y.']
+      : (missing.length
+        ? ['Waiting for current ' + missing.join(', ') + ' data.']
+        : gates.filter((g) => !g.pass).map((g) => '\u2717 ' + g.label));
+  } else {
+    const candleReasonText = {
+      fresh: 'Waiting for the latest completed 5m candle.',
+      history: 'Waiting for contiguous candle history.',
+      volume: 'Last completed hour is below half the prior hourly median, or its baseline is incomplete.',
+      repeatedRecoveries: 'Fewer than two distinct completed pullback recoveries are available.',
+      recentRecovery: 'No completed recovery within the last three hours.',
+      support: 'Three completed 15m blocks have not formed two non-lower close supports.',
+      cycle: 'The active pullback timed out or has not risen from its running trough.'
+    };
+    reasons = candleQualification.reasons.map((key) => candleReasonText[key] || ('Candle gate: ' + key));
+  }
   return {
     name: 'BID ASK',
     profile: 'ACCUM',
-    state: ready ? 'READY' : 'WAIT',
+    state,
     ready,
+    baseReady,
     manual: true,
     heuristic: true,
     strategy: 'Bid-Ask + Spot',
     depthPct,
     allocation: bidAskPct == null ? null : { bidAskPct, spotPct: 100 - bidAskPct },
     gates: gates.map((g, i) => ({ key: ['fresh','data','pair','auth','top10','flow','fees','path'][i], label: g.label, pass: g.pass })),
-    reasons: ready ? ['all accumulation gates pass; manual wallet approval required']
-      : (!pairOK ? ['Unsupported orientation: BID ASK requires a non-SOL token X and wrapped SOL token Y.']
-        : (missing.length ? ['Waiting for current ' + missing.join(', ') + ' data.']
-          : gates.filter((g) => !g.pass).map((g) => '\u2717 ' + g.label)))
+    candleQualification,
+    candleAnalysis: d.candleAnalysis || null,
+    reasons
   };
 }
 
@@ -586,9 +663,10 @@ function computeVerdict(m) {
 // Assemble full pool payload
 // ---------------------------------------------------------------------------
 
-async function buildPoolData(address, settings, poolSeed) {
+async function buildPoolData(address, settings, poolSeed, options = {}) {
   const W = num(settings.mqlWidthPct, 20) || 20;
   const hasKey = !!settings.jupApiKey;
+  const deferCandle = options.deferCandle === true;
 
   // --- Meteora datapi (required) ---
   const poolResp = await fetchPoolRaw(address, poolSeed);
@@ -596,6 +674,7 @@ async function buildPoolData(address, settings, poolSeed) {
     return { ok: false, error: 'datapi pool fetch failed: ' + (poolResp.error || poolResp.status) };
   }
   const p = poolResp.json || {};
+  const sourceTs = num(p._mqlBoardTs, Date.now());
   const pair = getPoolPairMeta(p);
 
   // pool descriptors (defensive field names)
@@ -604,7 +683,9 @@ async function buildPoolData(address, settings, poolSeed) {
   const binStep = num(pick(p.pool_config || {}, 'bin_step', 'binStep'), 0) || num(pick(p, 'bin_step', 'binStep'), 0);
   const baseFeePct = num(pick(p, 'pool_config.base_fee_pct', 'base_fee_pct', 'base_fee_percentage', 'baseFeePct'), 0);
   const currentPrice = num(pick(p, 'current_price', 'currentPrice', 'price'), 0);
+  const poolCreatedAt = pick(p, 'created_at', 'createdAt');
   const poolMeta = { name, address, tvl, binStep, baseFeePct, currentPrice,
+    createdAt: poolCreatedAt,
     tokenX: pair.tokenX, tokenY: pair.tokenY, supportedSolPair: pair.supportedSolPair };
 
   const ftr = pick(p, 'fee_tvl_ratio', 'feeTvlRatio') || {};
@@ -629,6 +710,7 @@ async function buildPoolData(address, settings, poolSeed) {
   // --- OHLCV (best effort) ---
   let ddHigh = null, rangePos = null, dayLow = null, low6h = null;
   let candleClose = null;
+  let rvCandles = [];
   let rvSigma = null;
   let trailOut = null;   // recent sigma/fee trail (exported for the HUD sparkline)
   try {
@@ -643,6 +725,7 @@ async function buildPoolData(address, settings, poolSeed) {
         return [];
       };
       const rvC = arrOf(ohResp.rv), dayC = arrOf(ohResp.day);
+      rvCandles = rvC;
       // rolling-24h structure from the 1h candles
       let hi = -Infinity, lo = Infinity;
       for (const c of dayC) {
@@ -696,7 +779,7 @@ async function buildPoolData(address, settings, poolSeed) {
     return finalize({
       ok: true, pool: poolMeta, supportedSolPair: false,
       feeRate1h, feeRate24h, trend, surge, accel,
-      ddHigh, rangePos, dayLow, ts: Date.now()
+      ddHigh, rangePos, dayLow, ts: sourceTs
     }, unsupported);
   }
 
@@ -706,7 +789,7 @@ async function buildPoolData(address, settings, poolSeed) {
       pool: poolMeta, supportedSolPair: true,
       feeRate1h, feeRate24h, trend, surge, accel,
       ddHigh, rangePos, dayLow,
-      ts: Date.now()
+      ts: sourceTs
     }, jupNullPayload);
   }
 
@@ -719,7 +802,7 @@ async function buildPoolData(address, settings, poolSeed) {
       pool: poolMeta, supportedSolPair: true,
       feeRate1h, feeRate24h, trend, surge, accel,
       ddHigh, rangePos, dayLow,
-      ts: Date.now()
+      ts: sourceTs
     }, degraded);
   }
 
@@ -865,12 +948,31 @@ async function buildPoolData(address, settings, poolSeed) {
     sigmaTrail, sigmaRatio, squeezeDiagnostic,
     verdict,
     recommendation,
-    ts: Date.now()
+    ts: sourceTs
   };
+  // Keep the already-fetched six-hour window available to the Radar selector
+  // without putting it in the public payload or session cache. The selected
+  // sibling can seed the shared loader before it backfills older windows.
+  try {
+    Object.defineProperty(data, '_recentCandles', { value: rvCandles, enumerable: false, configurable: true });
+  } catch (e) {}
   // stash sigma+W for breakeven reuse (not part of contract but harmless)
   data._sigma = sigma;
   data._W = W;
+  data.candleAnalysis = {
+    state: 'NOT_COLLECTED', reason: deferCandle ? 'deferred-for-radar-selection' : 'BID ASK base gates not ready',
+    note: 'provisional candle qualification; required for BID ASK READY'
+  };
   data.bidAsk = computeBidAskSignal(data);
+  if (data.bidAsk && data.bidAsk.baseReady && !deferCandle) {
+    try {
+      data.candleAnalysis = await loadCandleEvidence(address, poolCreatedAt, rvCandles);
+    } catch (e) {
+      data.candleAnalysis = { state: 'WAIT', reason: 'fetch-failed',
+        note: 'candle qualification required for BID ASK READY', events: null };
+    }
+    data.bidAsk = computeBidAskSignal(data);
+  }
   return data;
 }
 
@@ -886,18 +988,66 @@ function finalize(base, jupPayload) {
 // Cache-aware getters
 // ---------------------------------------------------------------------------
 
-async function getPoolData(address, poolSeed) {
+function freshBidAskSnapshot(data, now) {
+  now = isFinite(now) ? now : Date.now();
+  const ts = num(data && data.ts, NaN);
+  return isFinite(ts) && now >= ts && now - ts <= BID_ASK_FRESH_MS;
+}
+
+function freshCandleAnalysis(analysis, now) {
+  now = isFinite(now) ? now : Date.now();
+  return !!analysis && Number(analysis.latestCompletedTs) === currentCompleted5m(now);
+}
+
+async function refreshBidAskEvidence(address, data, now) {
+  if (!data || !data.ok) return data;
+  data.bidAsk = computeBidAskSignal(data, now);
+  if (!data.bidAsk || !data.bidAsk.baseReady) return data;
+  if (!freshCandleAnalysis(data.candleAnalysis, now)) {
+    try {
+      data.candleAnalysis = await loadCandleEvidence(
+        address,
+        data.pool && data.pool.createdAt,
+        data._recentCandles
+      );
+    } catch (e) {
+      data.candleAnalysis = {
+        state: 'WAIT', reason: 'fetch-failed', events: null,
+        note: 'candle qualification required for BID ASK READY'
+      };
+    }
+  }
+  data.bidAsk = computeBidAskSignal(data, Date.now());
+  return data;
+}
+
+async function getPoolData(address, poolSeed, options = {}) {
+  const deferCandle = options.deferCandle === true;
+  const now = Date.now();
   const cached = poolCache.get(address);
-  if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
+  if (cached && (now - cached.ts) < CACHE_TTL_MS && freshBidAskSnapshot(cached.data, now)) {
+    if (deferCandle) {
+      cached.data.bidAsk = computeBidAskSignal(cached.data, now);
+      return cached.data;
+    }
+    await refreshBidAskEvidence(address, cached.data, now);
+    sessionCacheSet('mqlc:pool:' + address, cached.data);
     return cached.data;
   }
   const sc = await sessionCacheGet('mqlc:pool:' + address, CACHE_TTL_MS);
-  if (sc) {
+  if (sc && freshBidAskSnapshot(sc.data, now)) {
+    if (deferCandle) {
+      sc.data.bidAsk = computeBidAskSignal(sc.data, now);
+      poolCache.set(address, { ts: sc.ts, data: sc.data });
+      return sc.data;
+    }
+    await refreshBidAskEvidence(address, sc.data, now);
     poolCache.set(address, { ts: sc.ts, data: sc.data });
+    sessionCacheSet('mqlc:pool:' + address, sc.data);
     return sc.data;
   }
   const settings = await getSettings();
-  const data = await buildPoolData(address, settings, poolSeed);
+  const data = await buildPoolData(address, settings, poolSeed, options);
   if (data && data.ok) {
     poolCache.set(address, { ts: Date.now(), data });
     sessionCacheSet('mqlc:pool:' + address, data);
@@ -942,43 +1092,104 @@ async function getBreakeven(address, widthPct) {
 
 // ---- RADAR: board-wide scan for actionable pools ----
 let radarCache = { ts: 0, data: null };
+function currentCompleted5m(now) {
+  now = isFinite(now) ? now : Date.now();
+  return Math.floor(now / 1000 / 300) * 300 - 300;
+}
+function radarBidAskFresh(it, now) {
+  now = isFinite(now) ? now : Date.now();
+  if (!it || (it.kind !== 'BID_ASK' && it.kind !== 'BID_WATCH')) return true;
+  if (now < num(it.dataTs, 0) || now - num(it.dataTs, 0) > BID_ASK_FRESH_MS) return false;
+  if (!it.bidAsk || it.bidAsk.baseReady !== true) return false;
+  if (it.kind === 'BID_ASK') {
+    // A cached legacy payload can say READY without carrying the new shared
+    // qualifier. Recompute on the next pool read; never expose it as an entry.
+    return !!(it.bidAsk.ready && it.bidAsk.candleQualification
+      && it.bidAsk.candleQualification.ready === true && it.candleAnalysis
+      && it.candleAnalysis.latestCompletedTs === currentCompleted5m(now));
+  }
+  // A fresh base with unavailable/failed history remains a useful WATCH row;
+  // it is explicitly non-actionable and carries its reason in the UI. If
+  // evidence exists, it must still be for the current completed bucket.
+  if (!it.candleAnalysis || it.candleAnalysis.state === 'NOT_COLLECTED') return true;
+  if (it.candleAnalysis.state === 'WAIT' && it.candleAnalysis.latestCompletedTs == null) return true;
+  return it.candleAnalysis.latestCompletedTs === currentCompleted5m(now);
+}
+function radarSnapshotUsable(r, now) {
+  now = isFinite(now) ? now : Date.now();
+  return !!r && Array.isArray(r.items) && isFinite(r.ts)
+    && now >= r.ts && now - r.ts < 180e3
+    && r.items.every((it) => radarBidAskFresh(it, now));
+}
 function freshRadarSnapshot(r) {
   if (!r || !Array.isArray(r.items)) return r;
-  const fresh = (arr) => (arr || []).filter((it) => it.kind !== 'BID_ASK' || Date.now() - num(it.dataTs, 0) <= BID_ASK_FRESH_MS);
+  const now = Date.now();
+  const fresh = (arr) => (arr || []).filter((it) => radarBidAskFresh(it, now));
   return Object.assign({}, r, { items: fresh(r.items), alertItems: fresh(r.alertItems || r.items).filter((it) => it.kind === 'FULL' || it.kind === 'BID_ASK') });
 }
 function selectRadarPayload(items, now) {
   now = isFinite(now) ? now : Date.now();
-  const actionable = items.filter((it) => (it.kind === 'FULL' || it.kind === 'BID_ASK')
-    && (it.kind !== 'BID_ASK' || now - num(it.dataTs, 0) <= BID_ASK_FRESH_MS));
-  const visible = items.slice(0, 6);
-  const firstBidAsk = actionable.find((it) => it.kind === 'BID_ASK');
-  if (firstBidAsk && !visible.some((it) => it.kind === 'BID_ASK')) {
+  const freshItems = items.filter((it) => radarBidAskFresh(it, now));
+  const actionable = freshItems.filter((it) => (it.kind === 'FULL' || it.kind === 'BID_ASK')
+    && radarBidAskFresh(it, now));
+  const visible = freshItems.slice(0, 6);
+  const firstBidAsk = actionable.find((it) => it.kind === 'BID_ASK')
+    || freshItems.find((it) => it.kind === 'BID_WATCH');
+  if (firstBidAsk && !visible.some((it) => it.kind === 'BID_ASK' || it.kind === 'BID_WATCH')) {
     if (visible.length >= 6) visible[visible.length - 1] = firstBidAsk;
     else visible.push(firstBidAsk);
   }
   return { items: visible, alertItems: actionable };
 }
+function radarBidCandidateScore(candidate, now) {
+  const d = candidate && candidate.bidAsk;
+  const currentlyQualified = !!(d && d.ready && d.candleQualification
+    && d.candleQualification.ready === true && freshCandleAnalysis(candidate.candleAnalysis, now));
+  return (currentlyQualified ? 1e12 : 0) + num(candidate && candidate.feeRate1h, 0);
+}
+function chooseRadarBidCandidates(candidates, now) {
+  const byMint = new Map();
+  for (const candidate of candidates || []) {
+    if (!candidate || !candidate.bidAsk || candidate.bidAsk.baseReady !== true) continue;
+    const key = candidate.mint || candidate.address;
+    const prior = byMint.get(key);
+    if (!prior || radarBidCandidateScore(candidate, now) > radarBidCandidateScore(prior, now)) {
+      byMint.set(key, candidate);
+    }
+  }
+  return [...byMint.values()];
+}
 async function getRadar() {
-  if (radarCache.data && Date.now() - radarCache.ts < 180e3) return freshRadarSnapshot(radarCache.data);
+  const now = Date.now();
+  if (radarCache.data && now - radarCache.ts < 180e3 && radarSnapshotUsable(radarCache.data, now)) {
+    return freshRadarSnapshot(radarCache.data);
+  }
   const scr = await sessionCacheGet('mqlc:radar', 180e3);
-  if (scr) { radarCache = { ts: scr.ts, data: scr.data }; return freshRadarSnapshot(scr.data); }
+  if (scr && radarSnapshotUsable(scr.data, now)) {
+    radarCache = { ts: scr.ts, data: scr.data };
+    return freshRadarSnapshot(scr.data);
+  }
   const boardResp = await fetchJson(DATAPI + '/pools?sort_by=volume_24h:desc&page_size=100');
   if (!boardResp.ok) return { ok: false, error: 'board fetch failed' };
+  const boardTs = Date.now();
   const arr = (boardResp.json.data || boardResp.json.pools || boardResp.json || []).filter(
     (p) => (p.tvl || 0) >= 60000 && ((p.volume && p.volume['24h']) || 0) >= 150000
+      && getPoolPairMeta(p).supportedSolPair
   );
+  arr.forEach((p) => { p._mqlBoardTs = boardTs; });
   arr.forEach((p) => { p._fr = ((p.fee_tvl_ratio && p.fee_tvl_ratio['1h']) || 0) * 24; });
   arr.sort((a, b) => b._fr - a._fr);
   const items = [];
-  // parallel but chunked to 4: 8 concurrent analyses x ~4 fetches each brushed
-  // the datapi's 30 RPS limit in one burst
+  // First fetch only the normal pool/Jupiter metrics. Candle history is loaded
+  // after this pass so sibling pools for the same token cannot consume several
+  // history slots before Radar deduplicates them.
   const top8 = arr.slice(0, 8);
   const results = [];
   for (let ci = 0; ci < top8.length; ci += 4) {
-    const chunk = await Promise.all(top8.slice(ci, ci + 4).map((p) => getPoolData(p.address, p).then((d) => ({ p, d })).catch(() => null)));
+    const chunk = await Promise.all(top8.slice(ci, ci + 4).map((p) => getPoolData(p.address, p, { deferCandle: true }).then((d) => ({ p, d })).catch(() => null)));
     results.push(...chunk);
   }
+  const bidCandidatesRaw = [];
   for (const rp of results) {
     try {
       if (!rp) continue;
@@ -987,9 +1198,14 @@ async function getRadar() {
       if (d.verdict && d.verdict.class !== 'NONE') {
         items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: d.verdict.class, edge: d.edge, feeRate1h: d.feeRate1h, kind: 'FULL', rec: d.recommendation, dataTs: d.ts });
       }
-      if (d.bidAsk && d.bidAsk.ready && Date.now() - d.ts <= BID_ASK_FRESH_MS) {
-        items.push({ address: p.address, name: d.pool.name, binStep: d.pool.binStep, cls: 'BID ASK', feeRate1h: d.feeRate1h, kind: 'BID_ASK', bidAsk: d.bidAsk, dataTs: d.ts });
-      } else if ((!d.verdict || d.verdict.class === 'NONE') && d.path !== 'FREEFALL') {
+      if (d.bidAsk && d.bidAsk.baseReady) {
+        const mint = d.pool && d.pool.tokenX && d.pool.tokenX.address;
+        const candidate = { address: p.address, mint, name: d.pool.name, binStep: d.pool.binStep,
+          cls: 'BID ASK', feeRate1h: d.feeRate1h, kind: 'BID_WATCH', bidAsk: d.bidAsk,
+          candleAnalysis: d.candleAnalysis, dataTs: d.ts };
+        bidCandidatesRaw.push(candidate);
+      }
+      if ((!d.verdict || d.verdict.class === 'NONE') && d.path !== 'FREEFALL' && !(d.bidAsk && d.bidAsk.baseReady)) {
         const fails = [];
         if (d.edge < 1.0) fails.push('edge ' + (Math.round(d.edge * 100) / 100));
         if (d.surge < 1.25) fails.push('surge ' + (Math.round(d.surge * 100) / 100));
@@ -1000,7 +1216,38 @@ async function getRadar() {
       }
     } catch (e) {}
   }
-  const rank = { FULL: 0, BID_ASK: 1, NEAR: 2 };
+  const bidCandidates = chooseRadarBidCandidates(bidCandidatesRaw, now);
+  // Only the selected sibling per token gets a candle request for this Radar
+  // build. Keep this bounded like the board fetches; direct pool HUD requests
+  // still fetch their own history through getPoolData().
+  for (let ci = 0; ci < bidCandidates.length; ci += 4) {
+    const chunk = await Promise.all(bidCandidates.slice(ci, ci + 4).map(async (candidate) => {
+      const rp = results.find((row) => row && row.p && row.p.address === candidate.address);
+      const d = rp && rp.d;
+      if (!d) return candidate;
+      if (!freshCandleAnalysis(d.candleAnalysis, now)) {
+        try {
+          d.candleAnalysis = await loadCandleEvidence(
+            candidate.address,
+            d.pool && d.pool.createdAt,
+            d._recentCandles
+          );
+        } catch (e) {
+          d.candleAnalysis = {
+            state: 'WAIT', reason: 'fetch-failed', events: null,
+            note: 'candle qualification required for BID ASK READY'
+          };
+        }
+      }
+      d.bidAsk = computeBidAskSignal(d, Date.now());
+      candidate.bidAsk = d.bidAsk;
+      candidate.candleAnalysis = d.candleAnalysis;
+      candidate.kind = d.bidAsk.ready ? 'BID_ASK' : 'BID_WATCH';
+      return candidate;
+    }));
+    items.push(...chunk);
+  }
+  const rank = { FULL: 0, BID_ASK: 1, BID_WATCH: 2, NEAR: 3 };
   items.sort((a, b) => (a.kind === b.kind ? (b.edge || b.feeRate1h || 0) - (a.edge || a.feeRate1h || 0) : rank[a.kind] - rank[b.kind]));
   // SHADOW LOG (mirror of dlmm-quant): persist every fresh radar evaluation for
   // counterfactual replay. Chrome is open far more than the daemon runs, so this
@@ -1019,7 +1266,19 @@ async function getRadar() {
         ageH: d.tokenAgeHours != null ? +d.tokenAgeHours.toFixed(1) : null,
         dd: d.ddHigh != null ? Math.round(d.ddHigh) : null,
         sig: (d.verdict && d.verdict.class !== 'NONE') ? d.verdict.class : (d.bidAsk && d.bidAsk.ready ? 'BID_ASK' : null),
-        w: (d.recommendation && d.recommendation.plan && d.recommendation.plan.widthPct) || null });
+        w: (d.recommendation && d.recommendation.plan && d.recommendation.plan.widthPct) || null,
+        candle: d.candleAnalysis && (d.candleAnalysis.state === 'READY' || d.candleAnalysis.state === 'LIMITED') ? {
+          state: d.candleAnalysis.state, hours: d.candleAnalysis.historyHours,
+          total: d.candleAnalysis.events && d.candleAnalysis.events.total,
+          matured: d.candleAnalysis.events && d.candleAnalysis.events.matured,
+          recovered: d.candleAnalysis.events && d.candleAnalysis.events.recovered,
+          timedOut: d.candleAnalysis.events && d.candleAnalysis.events.timedOut,
+          pending: d.candleAnalysis.events && d.candleAnalysis.events.pending,
+          medianDepthPct: d.candleAnalysis.medianDepthPct,
+          medianRecoveryMinutes: d.candleAnalysis.medianRecoveryMinutes,
+          currentDrawdownPct: d.candleAnalysis.currentDrawdownPct,
+          recentVolumeRatio: d.candleAnalysis.recentVolumeRatio
+        } : { state: d.candleAnalysis && d.candleAnalysis.state, reason: d.candleAnalysis && d.candleAnalysis.reason } });
     }
     if (shRows.length) {
       const shSt = await chrome.storage.local.get({ mqlShadow: [] });
@@ -1540,15 +1799,24 @@ async function radarAlertScan() {
   const now = Date.now();
   for (const it of (r.alertItems || r.items)) {
     if (it.kind !== 'FULL' && it.kind !== 'BID_ASK') continue;
-    const alertKey = it.address + ':' + it.kind;
+    const alertKey = it.kind === 'BID_ASK'
+      ? 'BID_ASK:' + (it.mint || it.address)
+      : it.address + ':' + it.kind;
     if (alerted[alertKey] && now - alerted[alertKey] < 2 * 3600e3) continue; // 2h cooldown per pool/signal
     if (it.kind === 'BID_ASK') {
       const ba = it.bidAsk || {};
-      if (!ba.ready || now - num(it.dataTs, 0) > BID_ASK_FRESH_MS || !ba.allocation || !ba.depthPct) continue;
+      if (!radarBidAskFresh(it, Date.now()) || !ba.ready || !ba.candleQualification
+          || ba.candleQualification.ready !== true || !ba.allocation || !ba.depthPct) continue;
       const msgBA = '🪣 **Meteora Lens — BID ASK READY** · ' + it.name + '\nManual Bid-Ask + Spot accumulation · range 0% to -' + ba.depthPct + '% · allocation ' + ba.allocation.bidAskPct + '/' + ba.allocation.spotPct + '%. Choose your own SOL amount and approve both legs in your wallet. Heuristic priors; position costs are not modeled.\nhttps://www.meteora.ag/dlmm/' + it.address;
+      // The Discord request is awaited. Recheck immediately before and after
+      // it so a boundary crossing cannot create a fresh-looking UI alert.
+      if (!radarBidAskFresh(it, Date.now())) continue;
       await postDiscord(cfg.webhookUrl, msgBA);
-      try { chrome.notifications.create('mqlba-' + now + '-' + it.address.slice(0,4), { type: 'basic', iconUrl: 'icon128.png', title: 'BID ASK READY', message: it.name + ' · manual Bid-Ask + Spot · 0% to -' + ba.depthPct + '%', priority: 2 }); } catch (e) {}
-      alerted[alertKey] = now;
+      const sentAt = Date.now();
+      if (radarBidAskFresh(it, sentAt)) {
+        try { chrome.notifications.create('mqlba-' + sentAt + '-' + it.address.slice(0,4), { type: 'basic', iconUrl: 'icon128.png', title: 'BID ASK READY', message: it.name + ' · manual Bid-Ask + Spot · 0% to -' + ba.depthPct + '%', priority: 2 }); } catch (e) {}
+      }
+      alerted[alertKey] = sentAt;
       continue;
     }
     const rec = it.rec || {};

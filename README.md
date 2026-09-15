@@ -169,6 +169,39 @@ while you accumulate — fee-decay **and** flow-flip together.
 **Take the warning seriously: if the token dies you own it the whole way down.
 Size for total loss.**
 
+#### Candle evidence for pullbacks
+
+The BID ASK card and Radar first apply the existing pool, orientation, safety,
+organic-flow, fee-persistence, and freefall checks. A base candidate that passes
+those checks remains `WATCH` until current completed public Meteora 5-minute
+candles also qualify it. `READY` means the manual Bid-Ask + Spot guide is
+enabled; it is still a user-approved entry, not an automated wallet action.
+
+The candle qualification requires a current completed 5-minute bucket, at least
+half the prior complete hourly median of **total pool volume** (with at least one
+baseline hour), at least two completed 5% close-dip recoveries where price
+recovers at least 80% of each peak-to-trough move within six hours, with one
+recovery within three hours, and two successive non-lower support lows across
+closed wall-clock 15-minute blocks. Each support low is the minimum of the three
+completed 5-minute **closes** in that block. An active dip may qualify only while
+its latest close is above its running trough; an active dip that times out blocks
+`READY`. A completed recent recovery can qualify while the setup waits for the
+next dip. Total pool volume is separate from Jupiter's organic buy/sell flow.
+
+Full 24-hour history is preferred. A known young pool uses only complete candles
+since its first full 5-minute bucket and is labeled `LIMITED HISTORY`; missing
+candles after creation produce `WAIT`. Pool creation age and Jupiter's token age
+are separate facts. A young pool can qualify from the evidence it has, but it
+does not receive an age bonus and insufficient evidence remains `WATCH`. Read
+the counts before the percentage: these are provisional heuristics, not a
+win probability, fee model, or PnL model. The companion bot includes a public,
+wallet-free CLI:
+
+```powershell
+node candle-analysis.cjs <POOL_ADDRESS>
+node candle-analysis.cjs <POOL_ADDRESS> --json
+```
+
 ### Cap-aware take-profits
 
 A two-sided band's maximum price-driven gain is exactly **W/4** — above the band

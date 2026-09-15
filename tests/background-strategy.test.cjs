@@ -36,10 +36,10 @@ function storageArea(initial = {}) {
   };
 }
 
-function loadBackground({ sync = {}, local = {}, fetch } = {}) {
+function loadBackground({ sync = {}, local = {}, session = {}, fetch } = {}) {
   const syncArea = storageArea(sync);
   const localArea = storageArea(local);
-  const sessionArea = storageArea();
+  const sessionArea = storageArea(session);
   const noopEvent = { addListener() {} };
   const context = {
     console,
@@ -56,6 +56,9 @@ function loadBackground({ sync = {}, local = {}, fetch } = {}) {
     }
   };
   vm.createContext(context);
+  context.importScripts = (...names) => names.forEach((name) => {
+    vm.runInContext(fs.readFileSync(path.join(ROOT, name), 'utf8'), context, { filename: name });
+  });
   const source = fs.readFileSync(path.join(ROOT, 'background.js'), 'utf8');
   const exports = `\n;globalThis.__mql = {
     computeEdge,
@@ -70,9 +73,12 @@ function loadBackground({ sync = {}, local = {}, fetch } = {}) {
     resolvePositionProfile: typeof resolvePositionProfile === 'function' ? resolvePositionProfile : null,
     evaluateAccumLifecycle: typeof evaluateAccumLifecycle === 'function' ? evaluateAccumLifecycle : null
     ,selectRadarPayload: typeof selectRadarPayload === 'function' ? selectRadarPayload : null
+    ,chooseRadarBidCandidates: typeof chooseRadarBidCandidates === 'function' ? chooseRadarBidCandidates : null
+    ,radarBidAskFresh: typeof radarBidAskFresh === 'function' ? radarBidAskFresh : null
+    ,loadCandleEvidence: typeof loadCandleEvidence === 'function' ? loadCandleEvidence : null
   };`;
   vm.runInContext(source + exports, context, { filename: 'background.js' });
-  return { api: context.__mql, sync: syncArea.data, local: localArea.data };
+  return { api: context.__mql, sync: syncArea.data, local: localArea.data, session: sessionArea.data };
 }
 
 test('verdict gates IGNITION on the recommended 12% band, not the 35% settings band', () => {
@@ -109,7 +115,12 @@ test('BID ASK is READY only for fresh, complete inputs and returns a hand-checka
     ok: true, ts: now - 30_000, supportedSolPair: true,
     mintAuthorityDisabled: true, freezeAuthorityDisabled: true,
     topHoldersPct: 20, orgBuy1h: 100, feeRate1h: 10, feeRate24h: 12,
-    path: 'CHOP', ofi1h: 1.2, sigma: 100, ddHigh: 30
+    path: 'CHOP', ofi1h: 1.2, sigma: 100, ddHigh: 30,
+    candleAnalysis: {
+      state: 'READY', latestCompletedTs: 1500, recentVolumeRatio: 0.5,
+      volumeBaselineHours: 1, events: { recovered: 2 }, lastRecoveryMinutes: 180,
+      support15m: { ready: true }, activeEvent: null,
+    }
   };
   const signal = api.computeBidAskSignal(base, now);
   assert.deepEqual(
@@ -120,6 +131,28 @@ test('BID ASK is READY only for fresh, complete inputs and returns a hand-checka
   assert.equal(api.computeBidAskSignal({ ...base, ofi1h: null }, now).state, 'WAIT');
   assert.equal(api.computeBidAskSignal({ ...base, sigma: 0 }, now).state, 'WAIT');
   assert.equal(api.computeBidAskSignal({ ...base, supportedSolPair: false }, now).state, 'WAIT');
+  const watch = api.computeBidAskSignal({ ...base, candleAnalysis: null }, now);
+  assert.equal(watch.baseReady, true);
+  assert.equal(watch.state, 'WATCH');
+  assert.equal(watch.ready, false);
+});
+
+test('BID ASK remains WATCH while only support or current-cycle recovery remains', () => {
+  const { api } = loadBackground();
+  const now = 2_000_000;
+  const candleAnalysis = {
+    state: 'READY', latestCompletedTs: 1500, recentVolumeRatio: 1,
+    volumeBaselineHours: 8, events: { recovered: 3 }, lastRecoveryMinutes: 30,
+    support15m: { ready: false }, activeEvent: null,
+  };
+  const signal = api.computeBidAskSignal({
+    ok: true, ts: now, supportedSolPair: true,
+    mintAuthorityDisabled: true, freezeAuthorityDisabled: true,
+    topHoldersPct: 20, orgBuy1h: 100, feeRate1h: 10, feeRate24h: 12,
+    path: 'CHOP', ofi1h: 1, sigma: 100, candleAnalysis,
+  }, now);
+  assert.equal(signal.state, 'WATCH');
+  assert.deepEqual(Array.from(signal.candleQualification.reasons), ['support']);
 });
 
 test('explicit profiles outrank deposit-composition inference', () => {
@@ -197,16 +230,16 @@ test('watcher confirms BID ASK fee decay on two distinct pool snapshots', async 
     fetch: fakeFetch
   });
   const data = (ts) => ({ ok: true, pool: { name: 'TOK-SOL' }, feeRate1h: 4, feeRate24h: 8, ofi1h: 1, pc1h: 1, surge: 1, path: 'CHOP', sigma: 100, ts });
-  api.poolCache.set(pool, { ts: Date.now(), data: data(now) });
+  api.poolCache.set(pool, { ts: Date.now(), data: data(Date.now() - 30_000) });
   await api.watchPositions();
   await api.watchPositions();
   assert.equal(local.mqlLastPos[`${pool}:${position}`].belowCount, 1);
   assert.equal(webhookBodies.some((body) => body.content.includes('BID ASK WAIT')), false);
-  api.poolCache.set(pool, { ts: Date.now(), data: data(now + 60_000) });
+  api.poolCache.set(pool, { ts: Date.now(), data: data(Date.now() - 30_000) });
   await api.watchPositions();
   assert.equal(local.mqlLastPos[`${pool}:${position}`].belowCount, 2);
   assert.equal(webhookBodies.some((body) => body.content.includes('BID ASK WAIT')), true);
-  api.poolCache.set(pool, { ts: Date.now(), data: { ...data(now + 120_000), ofi1h: null } });
+  api.poolCache.set(pool, { ts: Date.now(), data: { ...data(Date.now() - 30_000), ofi1h: null } });
   await api.watchPositions();
   assert.equal(local.mqlLastPos[`${pool}:${position}`].belowCount, 2);
   assert.equal(webhookBodies.some((body) => body.content.includes('current fee/organic-flow data is unavailable')), true);
@@ -215,12 +248,65 @@ test('watcher confirms BID ASK fee decay on two distinct pool snapshots', async 
 test('radar keeps BID ASK visible and preserves every actionable item for alerts', () => {
   const { api } = loadBackground();
   assert.equal(typeof api.selectRadarPayload, 'function');
-  const full = Array.from({ length: 6 }, (_, i) => ({ kind: 'FULL', address: `F${i}`, dataTs: 1_000 }));
-  const bidAsk = { kind: 'BID_ASK', address: 'BA', dataTs: 1_000 };
-  const selected = api.selectRadarPayload(full.concat([bidAsk]), 1_000);
+  const now = Date.now();
+  const latest = Math.floor(now / 1000 / 300) * 300 - 300;
+  const full = Array.from({ length: 6 }, (_, i) => ({ kind: 'FULL', address: `F${i}`, dataTs: now }));
+  const bidAsk = { kind: 'BID_ASK', address: 'BA', dataTs: now,
+    bidAsk: { baseReady: true, ready: true, candleQualification: { ready: true } },
+    candleAnalysis: { latestCompletedTs: latest } };
+  const selected = api.selectRadarPayload(full.concat([bidAsk]), now);
   assert.equal(selected.items.length, 6);
   assert.equal(selected.items.some((item) => item.kind === 'BID_ASK'), true);
   assert.equal(selected.alertItems.length, 7);
+});
+
+test('radar removes a BID ASK row when its current 5m candle or base snapshot expires', () => {
+  const { api } = loadBackground();
+  const now = Date.now();
+  const latest = Math.floor(now / 1000 / 300) * 300 - 300;
+  const common = {
+    kind: 'BID_ASK', address: 'BA', dataTs: now - 30_000,
+    bidAsk: { baseReady: true, ready: true, candleQualification: { ready: true } }
+  };
+  const staleCandle = { ...common, candleAnalysis: { latestCompletedTs: latest - 300 } };
+  assert.equal(api.radarBidAskFresh(staleCandle, now), false);
+  const staleBase = { ...common, dataTs: now - 120_001, candleAnalysis: { latestCompletedTs: latest } };
+  assert.equal(api.radarBidAskFresh(staleBase, now), false);
+  const visible = api.selectRadarPayload([staleCandle, staleBase], now);
+  assert.equal(visible.items.length, 0);
+  assert.equal(visible.alertItems.length, 0);
+});
+
+test('radar keeps fresh base WATCH rows visible without making them alerts', () => {
+  const { api } = loadBackground();
+  const now = Date.now();
+  const watch = {
+    kind: 'BID_WATCH', address: 'WATCH', mint: 'MINT', dataTs: now,
+    bidAsk: { baseReady: true, ready: false, candleQualification: { ready: false } },
+    candleAnalysis: { state: 'WAIT', reason: 'fetch-failed', latestCompletedTs: null }
+  };
+  assert.equal(api.radarBidAskFresh(watch, now), true);
+  const selected = api.selectRadarPayload([watch], now);
+  assert.equal(selected.items.length, 1);
+  assert.equal(selected.items[0].kind, 'BID_WATCH');
+  assert.equal(selected.alertItems.length, 0);
+});
+
+test('radar deduplicates BID ASK siblings by exact token mint and prefers a qualified one', () => {
+  const { api } = loadBackground();
+  const now = Date.now();
+  const latest = Math.floor(now / 1000 / 300) * 300 - 300;
+  const make = (address, feeRate1h, ready) => ({
+    address, mint: 'TOKEN-MINT', feeRate1h,
+    bidAsk: { baseReady: true, ready, candleQualification: { ready } },
+    candleAnalysis: { state: 'READY', latestCompletedTs: latest }
+  });
+  const selected = api.chooseRadarBidCandidates([
+    make('HIGH-FEE-WATCH', 40, false),
+    make('LOW-FEE-READY', 8, true),
+    { ...make('OTHER-TOKEN', 12, false), mint: 'OTHER-MINT' }
+  ], now);
+  assert.deepEqual(Array.from(selected.map((item) => item.address)), ['LOW-FEE-READY', 'OTHER-TOKEN']);
 });
 
 test('request coalescing reuses one Jupiter lookup and complete fresh board metadata', async () => {
@@ -239,4 +325,83 @@ test('request coalescing reuses one Jupiter lookup and complete fresh board meta
   const seeded = await api.fetchPoolRaw('POOL', completeSeed);
   assert.equal(seeded.json, completeSeed);
   assert.equal(requests, 1);
+});
+
+test('candle evidence persists completed history across service-worker restarts', async () => {
+  const createdAt = Date.now() - 48 * 3600e3;
+  let requests = 0;
+  const fakeFetch = async (url) => {
+    requests++;
+    const u = new URL(url);
+    const start = Number(u.searchParams.get('start_time'));
+    const end = Number(u.searchParams.get('end_time'));
+    const data = [];
+    for (let ts = start; ts <= end; ts += 300) data.push({
+      timestamp: ts, open: 1, high: 1, low: 1, close: 1, volume: 1
+    });
+    return { ok: true, json: async () => ({ data }) };
+  };
+  const firstWorker = loadBackground({ fetch: fakeFetch });
+  const first = await firstWorker.api.loadCandleEvidence('POOL', createdAt);
+  assert.equal(first.state, 'READY');
+  assert.equal(requests, 4);
+  assert.ok(firstWorker.session['mqlc:candles:POOL']);
+
+  requests = 0;
+  const secondWorker = loadBackground({ fetch: fakeFetch, session: firstWorker.session });
+  const restored = await secondWorker.api.loadCandleEvidence('POOL', createdAt);
+  assert.equal(restored.state, 'READY');
+  assert.equal(requests, 0);
+});
+
+test('a current six-hour seed for a mature pool backfills the missing 18 hours', async () => {
+  const nowSec = Math.floor(Date.now() / 300000) * 300;
+  const recent = [];
+  for (let ts = nowSec - 6 * 3600; ts < nowSec; ts += 300) {
+    recent.push({ timestamp: ts, open: 1, high: 1, low: 1, close: 1, volume: 1 });
+  }
+  let requests = 0;
+  const worker = loadBackground({ fetch: async (url) => {
+    requests++;
+    const u = new URL(url);
+    const start = Number(u.searchParams.get('start_time'));
+    const end = Number(u.searchParams.get('end_time'));
+    const data = [];
+    for (let ts = start; ts <= end; ts += 300) {
+      data.push({ timestamp: ts, open: 1, high: 1, low: 1, close: 1, volume: 1 });
+    }
+    return { ok: true, json: async () => ({ data }) };
+  } });
+  const analysis = await worker.api.loadCandleEvidence(
+    'MATURE', Date.now() - 48 * 3600e3, recent);
+  assert.equal(analysis.state, 'READY');
+  assert.equal(requests, 3);
+});
+
+test('invalid candle history is not sanitized into a trusted restart cache', async () => {
+  let requests = 0;
+  const conflictingFetch = async (url) => {
+    requests++;
+    const u = new URL(url);
+    const start = Number(u.searchParams.get('start_time'));
+    const end = Number(u.searchParams.get('end_time'));
+    const data = [];
+    for (let ts = start; ts <= end; ts += 300) {
+      data.push({ timestamp: ts, open: 1, high: 1, low: 1, close: 1, volume: 1 });
+    }
+    if (requests === 1 && data.length) {
+      data.push({ timestamp: data[0].timestamp, open: 2, high: 2, low: 2, close: 2, volume: 1 });
+    }
+    return { ok: true, json: async () => ({ data }) };
+  };
+  const firstWorker = loadBackground({ fetch: conflictingFetch });
+  const first = await firstWorker.api.loadCandleEvidence('BAD', Date.now() - 48 * 3600e3);
+  assert.equal(first.state, 'WAIT');
+  assert.equal(first.reason, 'invalid-candles');
+  assert.equal(firstWorker.session['mqlc:candles:BAD'], undefined);
+
+  requests = 0;
+  const secondWorker = loadBackground({ fetch: conflictingFetch, session: firstWorker.session });
+  await secondWorker.api.loadCandleEvidence('BAD', Date.now() - 48 * 3600e3);
+  assert.ok(requests > 0);
 });

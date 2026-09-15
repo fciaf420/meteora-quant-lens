@@ -282,53 +282,79 @@
   // ========================================================================
   var comboUI = { open: false, total: 1.0 };
 
+  function currentCompleted5mTs() {
+    return Math.floor(Date.now() / 300000) * 300 - 300;
+  }
+
+  function bidAskCandleFresh(ba) {
+    return !!(ba && ba.candleAnalysis
+      && ba.candleQualification && ba.candleQualification.ready === true
+      && Number(ba.candleAnalysis.latestCompletedTs) === currentCompleted5mTs());
+  }
+
   function accumComboCheck(d) {
     if (!d || !d.ok) return null;
     if (d.bidAsk) {
       var ba = d.bidAsk;
-      var stale = !d.ts || Date.now() - d.ts > 120000;
-      if (ba.ready && ba.state === "READY" && !stale && d.supportedSolPair === true
+      var now = Date.now();
+      var snapshotTs = Number(d.ts);
+      var stale = !isFinite(snapshotTs) || now < snapshotTs || now - snapshotTs > 120000;
+      var candleCurrent = !!(ba.candleAnalysis
+        && Number(ba.candleAnalysis.latestCompletedTs) === currentCompleted5mTs());
+      var candleStale = !bidAskCandleFresh(ba);
+      if (ba.ready && ba.state === "READY" && !stale && !candleStale && d.supportedSolPair === true
           && ba.depthPct > 0 && ba.allocation && ba.allocation.bidAskPct > 0) {
         return { show: "full", state: "READY", depth: ba.depthPct,
           share: ba.allocation.bidAskPct / 100, reasons: ba.reasons || [], signal: ba };
       }
       var reasons = (ba.reasons || []).slice();
       if (stale) reasons.unshift("✗ data stale — wait for a fresh snapshot");
-      return { show: "wait", state: "WAIT", reasons: reasons, signal: ba };
+      if (!candleCurrent) reasons.unshift("✗ candle data stale — wait for the latest completed 5m candle");
+      if (!reasons.length) reasons.push("BID ASK candle qualification is not complete");
+      var state = ba.state || "WAIT";
+      if (state === "READY") state = "WATCH";
+      return { show: "wait", state: state, reasons: reasons, signal: ba };
     }
-    // hard gates — directional bag risk: safety outranks the edge math
-    var gates = {
-      auth: !!(d.mintAuthorityDisabled && d.freezeAuthorityDisabled),            // non-negotiable
-      top10: d.topHoldersPct != null && d.topHoldersPct <= 35,
-      flow: d.orgBuy1h != null && d.orgBuy1h > 0,                               // organic buyers exist
-      vol: d.feeRate1h >= 0.5 * d.feeRate24h && d.feeRate24h >= 8,              // volume persistence
-      // dying-knife block. NOTE: OFI here = organic sells/buys (Jupiter), so a
-      // freefall NOBODY is buying = OFI high. (Spec said "OFI<0.7" assuming
-      // buy/sell; implemented as sells/buys >= 1.43 — same intent.)
-      path: !(d.path === "FREEFALL" && d.ofi1h != null && d.ofi1h >= 1.43)
-    };
-    var fails = Object.keys(gates).filter(function (k) { return !gates[k]; });
-    if (fails.length === 1 && fails[0] === "vol") {
-      // say WHICH sub-condition failed — decay vs thin-floor are different stories
-      var decaying = d.feeRate1h < 0.5 * d.feeRate24h;
-      return { show: "volnote", volMsg: decaying
-        ? "ACCUM: volume decaying (1h " + fmtNum(d.feeRate1h, 1) + " vs 24h " + fmtNum(d.feeRate24h, 1) + "%/d) — wait for the fee trend to stabilize"
-        : "ACCUM: fees too thin — 24h " + fmtNum(d.feeRate24h, 1) + "%/d under the 8%/d floor" + (d.feeRate1h >= 8 ? " (1h " + fmtNum(d.feeRate1h, 1) + " is heating — close; re-check soon)" : "") };
+    // A missing BID ASK payload is unsafe to treat as a legacy-compatible
+    // signal. The background worker is the single owner of these gates.
+    return { show: "wait", state: "WAIT", reasons: ["BID ASK signal unavailable — reload the extension"], signal: null };
+  }
+
+  // Test-only seam: the production page never sets this object. Keeping the
+  // pure display/guide gate observable lets the VM suite verify that a stale
+  // or legacy READY payload cannot enable a manual position flow.
+  if (window.__mqlTestExports && typeof window.__mqlTestExports === "object") {
+    window.__mqlTestExports.accumComboCheck = accumComboCheck;
+  }
+
+  function appendCandleEvidence(body, analysis) {
+    if (!analysis || analysis.state === "NOT_COLLECTED") return;
+    var stateLabel = analysis.state === "LIMITED" ? "LIMITED HISTORY" : analysis.state;
+    if (analysis.state === "WAIT" || !analysis.events) {
+      var why = String(analysis.reason || "history unavailable").replace(/-/g, " ");
+      body.appendChild(el("div", "mql-accum-line mql-muted", "CANDLE EVIDENCE · WAIT — " + why));
+      body.appendChild(el("div", "mql-accum-prior", "event statistics withheld until completed candle history is current and contiguous"));
+      return;
     }
-    if (fails.length) return null;
-    var sig = d.sigma == null ? 100 : d.sigma;
-    // depth: σ-scaled — the band must survive a normal bad day for this token
-    var depth = sig >= 150 ? 75 : (sig <= 80 ? 60 : 60 + ((sig - 80) / 70) * 15);
-    if (d.ddHigh != null && d.ddHigh < 20) depth = Math.min(75, depth + 5);   // near ATH: more room to fall
-    if (d.ddHigh != null && d.ddHigh > 50) depth = Math.max(60, depth - 5);   // already crashed: less
-    depth = Math.round(depth);
-    // bid-ask share: rises with σ and with sell-skewed flow (deep fills likelier)
-    var share = 0.55 + (sig - 100) / 1000 +
-      ((d.ofi1h != null && d.ofi1h > 1) ? 0.05 : 0) +   // sell pressure (sells/buys > 1)
-      (d.path === "FREEFALL" ? 0.05 : 0);
-    share = Math.min(0.80, Math.max(0.60, share));
-    share = Math.round(share * 20) / 20;
-    return { show: "full", depth: depth, share: share };
+    var e = analysis.events;
+    body.appendChild(el("div", "mql-accum-line",
+      "CANDLE EVIDENCE · " + stateLabel + " · " + fmtNum(analysis.historyHours, 2) + "h · 5% pullbacks " + e.total +
+      ": " + e.recovered + " recovered · " + e.timedOut + " timed out · " + e.pending + " pending"));
+    var outcome = e.matured > 0
+      ? e.recovered + "/" + e.matured + " matured outcomes recovered within 6h (" + fmtNum(e.recoveryRatePct, 1) + "% descriptive; not a win probability)"
+      : "no matured outcomes yet — current events are still within the six-hour observation window";
+    body.appendChild(el("div", "mql-accum-line mql-muted", outcome));
+    var drawdown = analysis.currentDrawdownPct == null ? "n/a" : fmtNum(analysis.currentDrawdownPct, 1) + "%";
+    var volume = analysis.recentVolumeRatio == null ? "n/a" : fmtNum(analysis.recentVolumeRatio, 2) + "×";
+    body.appendChild(el("div", "mql-accum-line mql-muted",
+      "median max dip " + (analysis.medianDepthPct == null ? "n/a" : fmtNum(analysis.medianDepthPct, 1) + "%") +
+      " · median recovery " + (analysis.medianRecoveryMinutes == null ? "n/a" : fmtNum(analysis.medianRecoveryMinutes, 0) + "m") +
+      " · current close drawdown " + drawdown));
+    body.appendChild(el("div", "mql-accum-line mql-muted",
+      "last-hour total pool volume / prior hourly median " + volume +
+      " (" + (analysis.volumeBaselineHours || 0) + " baseline hours)"));
+    body.appendChild(el("div", "mql-accum-prior",
+      "BID ASK candle checks: 0.5× volume floor · 2 recoveries with 1 within 3h · two non-lower 15m support comparisons · provisional thresholds"));
   }
 
   var renderAccumBlock = safe(function renderAccumBlock(hud, d) {
@@ -352,7 +378,8 @@
         (chk.reasons || [chk.volMsg || "signal gates not met"]).slice(0, 4).forEach(function (reason) {
           body.appendChild(el("div", "mql-accum-note", reason));
         });
-        body.appendChild(el("div", "mql-accum-prior", "WAIT — waiting for a current, complete pool snapshot"));
+        appendCandleEvidence(body, d.candleAnalysis || (chk.signal && chk.signal.candleAnalysis), chk.signal && chk.signal.candleQualification);
+        body.appendChild(el("div", "mql-accum-prior", (chk.state || "WAIT") + " — candle-qualified BID ASK is required before the manual guide is enabled"));
         wrap.appendChild(body); hud.appendChild(wrap); return;
       }
       var rangeLine = el("div", "mql-accum-line", "range 0% → -" + chk.depth + "% (σ-scaled depth)");
@@ -387,6 +414,7 @@
       body.appendChild(el("div", "mql-accum-line mql-muted",
         "σ " + fmtNum(d.sigma, 0) + "%/d → depth " + chk.depth + "% · fees 1h " + fmtNum(d.feeRate1h, 1) +
         " vs 24h " + fmtNum(d.feeRate24h, 1) + "%/d (persisting) · OFI " + fmtNum(d.ofi1h, 2)));
+      appendCandleEvidence(body, d.candleAnalysis || (chk.signal && chk.signal.candleAnalysis), chk.signal && chk.signal.candleQualification);
       body.appendChild(el("div", "mql-rec-warn", "⚠ directional bag risk: if the token dies you own it the whole way down — size for total loss"));
       body.appendChild(el("div", "mql-accum-prior", "uncalibrated heuristic · pool-wide fees and position costs are not modeled"));
       var applyBtn = el("button", "mql-apply", "⚡ Guide Bid-Ask + Spot (2 legs)");
@@ -614,8 +642,11 @@
 
   var startCombo = safe(function startCombo(depth, share, totalSol) {
     var ba = state.data && state.data.bidAsk;
+    var comboNow = Date.now();
+    var comboTs = Number(state.data && state.data.ts);
     if (!ba || !ba.ready || ba.state !== 'READY' || state.data.supportedSolPair !== true
-        || !state.data.ts || Date.now() - state.data.ts > 120000) return;
+        || !isFinite(comboTs) || comboNow < comboTs || comboNow - comboTs > 120000
+        || !bidAskCandleFresh(ba)) return;
     var startCount = (state.apiPos && state.apiPos.count) || 0;
     // journal the combo's OWN entry plan: correct class label, correct fee baseline
     // (previously the combo wrote no plan, so a stale Apply-click plan could bind)
@@ -1096,14 +1127,24 @@
     }
     r.items.forEach(function (it) {
       var isBidAsk = it.kind === "BID_ASK";
-      var chip = el("button", "mql-chip " + (it.kind === "FULL" ? "mql-chip-full mql-chip-" + it.cls.toLowerCase() : isBidAsk ? "mql-chip-full mql-chip-carry" : "mql-chip-near"));
+      var isBidWatch = it.kind === "BID_WATCH";
+      var chip = el("button", "mql-chip " + (it.kind === "FULL" ? "mql-chip-full mql-chip-" + it.cls.toLowerCase() : isBidAsk ? "mql-chip-full mql-chip-carry" : isBidWatch ? "mql-chip-watch" : "mql-chip-near"));
       var bs = it.binStep ? (it.binStep + "bps ") : "";
       var lbl = it.kind === "FULL" ? ("🔥 " + it.name + " " + bs + "· " + it.cls + " · edge " + fmtNum(it.edge, 2))
         : isBidAsk ? ("🪣 " + it.name + " " + bs + "· BID ASK READY · 0→-" + (it.bidAsk && it.bidAsk.depthPct) + "%")
+        : isBidWatch ? ("⚠ " + it.name + " " + bs + "· BID ASK WATCH · candle gates pending")
         : ("⚠ " + it.name + " " + bs + "· edge " + fmtNum(it.edge, 2) + " · misses " + (it.fails || []).map(function(f){return f.split(" ")[0];}).join("+"));
+      if ((isBidAsk || isBidWatch) && it.candleAnalysis) {
+        var ca = it.candleAnalysis;
+        if (ca.events) lbl += ca.events.matured > 0
+          ? " · dips " + ca.events.total + " (" + ca.events.recovered + "/" + ca.events.matured + " rec)"
+          : " · dips " + ca.events.total + " (" + ca.events.pending + " pending)";
+        else if (ca.state === "WAIT") lbl += " · candles WAIT";
+      }
       chip.textContent = lbl;
       chip.title = it.kind === "FULL" ? "All gates green — full " + it.cls + " signal. Click to open."
-        : isBidAsk ? "Fresh accumulation gates pass. Manual Bid-Ask + Spot guide; click to open."
+        : isBidAsk ? "Base and candle qualification gates pass. Manual Bid-Ask + Spot guide; click to open."
+        : isBidWatch ? "Base BID ASK gates pass, but candle qualification is incomplete. No entry guide yet; click to inspect the reason."
         : "Near-miss (override-eligible): fails " + (it.fails || []).join(", ") + ". Click to open.";
       chip.addEventListener("click", function () { window.location.href = "/dlmm/" + it.address; });
       bar.appendChild(chip);
