@@ -557,9 +557,15 @@ function buildRecommendation(s) {
   // (A clean pump-out of a +-W band only yields ~W/4 + traversal fees; chop/fees are the real engine.)
   // CAP-AWARE (mirror of dlmm-quant): min clamp 8->4 - a low-fee entry can only earn
   // ~W/4+fees, and a TP above that is fictional (OOR-UP books the pump-out anyway).
-  const tp = Math.round(clamp(W / 4 + (s.feeRate1h || 0) * 0.5, 4, 25));
-  // SL just inside the structural band-break value (~ -0.75W when fully exited below).
-  const sl = Math.round(clamp(0.75 * W + 2, 8, 20));
+  // ONE-SIDED (IGNITION deploys 0 -> -W SOL-only when organic sellers > 2:1):
+  // there is NO price-driven upside (above the band it is 100% SOL, unchanged),
+  // so the TP is the fee term only; and fully filled at the bottom it loses ~0.5W,
+  // not 0.75W (sim, equal SOL per log bin: 6.1 / 10.4 / 15.9% at W = 12/20/30 vs
+  // two-sided 9.1 / 15.2 / 22.9%). Same clamps as the two-sided brackets.
+  const single = typeof s.ofi1h === 'number' && s.ofi1h > 2;
+  const tp = Math.round(clamp((single ? 0 : W / 4) + (s.feeRate1h || 0) * 0.5, 4, 25));
+  // SL just inside the structural band-break value (~ -0.75W two-sided, ~ -0.5W one-sided).
+  const sl = Math.round(clamp((single ? 0.5 : 0.75) * W + 2, 8, 20));
   // hard warnings first
   if (s.path === 'FREEFALL') r.watch.push('🔪 Falling knife — price is actively dumping. Do NOTHING until the 5m flattens (then it may become a BASING entry).');
   if (!s.mintAuthorityDisabled) r.watch.push('⚠️ Mint authority is LIVE — team can print supply. Scalp only, never park capital.');
@@ -571,8 +577,8 @@ function buildRecommendation(s) {
       minPct: r.params.minPct, maxPct: r.params.maxPct, mode: r.params.mode };
     r.action = 'SCALP'; r.headline = 'Event-driven scalp — fees overpay for risk AND a catalyst is live.';
     r.steps = [
-      (s.ofi1h > 2 ? 'Single-sided SOL below price (flow is sell-skewed)' : 'Two-sided Spot centered on price') + ', width ±' + W + '%',
-      'Brackets: TP +' + tp + '% / SL -' + sl + '% (σ-scaled)',
+      (s.ofi1h > 2 ? 'Single-sided SOL below price (flow is sell-skewed), range 0 → -' + W + '%' : 'Two-sided Spot centered on price, width ±' + W + '%'),
+      'Brackets: TP +' + tp + '% / SL -' + sl + '% (σ-scaled' + (single ? '; one-sided: TP is fees only, no price upside' : '') + ')',
       'Exit early if the 1h fee rate halves or surge decays below ~1.05x',
       'Size small — this is a fee harvest, not a conviction bet'
     ];

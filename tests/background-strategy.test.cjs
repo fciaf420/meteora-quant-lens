@@ -624,3 +624,19 @@ test('one-sided IGNITION prices IL on the one-sided width (same capital, half th
   assert.equal(api.ilPerDayForRange(60, 75), 3600 / 150);
   assert.equal(api.computeBreakeven(60, 37.5), api.ilPerDayForRange(60, 75));
 });
+
+test('one-sided IGNITION brackets: TP is fees only, SL sits at the ~0.5W band break', () => {
+  const { api } = loadBackground();
+  const s = { verdict: { class: 'IGNITION' }, sigma: 80, feeRate1h: 10, path: 'CHOP',
+    mintAuthorityDisabled: true, recipeEdges: { IGNITION: 2, BASING: 0, CARRY: 0 } };
+  const W = 20;                                     // ignitionWidth(80) = 80/4
+  const two = api.buildRecommendation({ ...s, ofi1h: 1 });
+  assert.equal(two.params.mode, 'two');
+  assert.equal(two.plan.tp, Math.round(W / 4 + 10 * 0.5));      // 10
+  assert.equal(two.plan.sl, Math.round(0.75 * W + 2));          // 17
+  const one = api.buildRecommendation({ ...s, ofi1h: 2.5 });
+  assert.equal(one.params.mode, 'single');
+  assert.equal(one.plan.tp, Math.round(10 * 0.5));              // 5: no W/4 price upside
+  assert.equal(one.plan.sl, Math.round(0.5 * W + 2));           // 12
+  assert.ok(one.steps.some((x) => /fees only/.test(x)));
+});
