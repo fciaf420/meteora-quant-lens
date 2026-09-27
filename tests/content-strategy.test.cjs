@@ -253,7 +253,23 @@ test('WATCH/WAIT exposes an intentional override only with a structural depth an
   assert.equal(checked.overridePlan.depth, 64);
   assert.equal(checked.overridePlan.share, 0.6);
   assert.ok(checked.overridePlan.ignoredGates.includes('fee persistence'));
-  assert.ok(checked.overridePlan.ignoredGates.includes('support'));
+  // candle keys are shown in plain words, each once, with no raw keys or long reason text
+  assert.ok(checked.overridePlan.ignoredGates.includes('flat-or-rising 15m lows'));
+  assert.ok(checked.overridePlan.ignoredGates.includes('a recovery in the last 3h'));
+  assert.equal(checked.overridePlan.ignoredGates.includes('support'), false);
+  assert.equal(new Set(checked.overridePlan.ignoredGates).size, checked.overridePlan.ignoredGates.length);
+
+  // base checks failed so candles never ran: one honest "not run" line, not 8 failures,
+  // and the card must not claim the (never loaded) candle data is "stale"
+  const notRun = baseData(now, null, false);
+  notRun.bidAsk.gates = [{ label: 'fee persistence', pass: false }];
+  notRun.bidAsk.candleAnalysis = { state: 'NOT_COLLECTED' };
+  notRun.bidAsk.candleQualification = { ready: false, reasons: ['fresh', 'history', 'volume', 'repeatedRecoveries', 'recentRecovery', 'support', 'cycle'] };
+  notRun.bidAsk.reasons = ['\u2717 fee persistence'];
+  const notRunCheck = exports.accumComboCheck(notRun);
+  assert.deepEqual([...notRunCheck.overridePlan.ignoredGates], ['fee persistence', 'candle checks not run (base checks failing)']);
+  assert.equal(notRunCheck.reasons.some((r) => /candle data stale/.test(r)), false);
+  assert.ok(notRunCheck.reasons.some((r) => /candle checks run once the base checks pass/.test(r)));
 
   const unsupported = exports.bidAskOverridePlan({ ...d, supportedSolPair: false });
   assert.equal(unsupported.ok, false);
@@ -285,6 +301,11 @@ test('override confirmation requires two matching clicks before its wall-clock d
   assert.equal(flow.isArmed(), true);
   assert.equal(flow.click(snapshot).confirmed, true);
   assert.equal(flow.isArmed(), false);
+
+  // a 60s HUD refresh between the clicks changes only the data timestamp: same plan, still confirms
+  const refreshed = create(8000);
+  refreshed.click(snapshot);
+  assert.equal(refreshed.click({ ...snapshot, dataTs: 160 }).confirmed, true);
 
   const changed = create(8000);
   changed.click(snapshot);
@@ -368,4 +389,15 @@ test('expanded WATCH BID ASK override runs the real two-click flow and journals 
   assert.equal(journal.totalSol, 1);
   assert.equal(journal.ts, entryPlan.ts, 'entry plan and override journal share the captured timestamp');
   assert.equal(Object.prototype.hasOwnProperty.call(journalPayload.mqlEntryPlan, poolB), false);
+});
+
+test('BID ASK bin plan follows P_i = (1 + binStep/10000)^i and flags the 1,400-bin cap', () => {
+  const plan = loadContentExports().bidAskBinPlan;
+  // 0 -> -75% at 100 bps: ln(4)/ln(1.01) = 139.3 -> 140 steps + the top bin
+  assert.deepEqual({ ...plan(100, 75) }, { bins: 141, maxArrays: 4, maxNonRefundableSol: 0.3, overMax: false });
+  assert.equal(plan(20, 75).bins, 695);
+  assert.equal(plan(10, 75).overMax, false);   // 1,388 bins: right under the cap
+  assert.equal(plan(5, 75).overMax, true);
+  assert.equal(plan(0, 75), null);
+  assert.equal(plan(100, 100), null);
 });

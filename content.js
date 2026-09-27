@@ -334,19 +334,32 @@
     var sharePct = Number(ba && ba.allocation && ba.allocation.bidAskPct);
     var share = sharePct / 100;
     if (!isFinite(sharePct) || !isFinite(share) || share <= 0 || share >= 1) reasons.push("valid Bid-Ask / Spot split is unavailable");
+    // What the override actually skips: only checks that ran and failed, in
+    // plain words, each once. Candle checks only run after the base checks pass,
+    // so when they never ran they are reported as "not run", not as 11 failures
+    // (the old list mixed raw keys, long reason text and duplicates).
     var ignored = [];
     var gates = ba && Array.isArray(ba.gates) ? ba.gates : [];
     gates.forEach(function (g) {
       if (g && g.pass === false) ignored.push(String(g.label || g.key || "base gate"));
     });
+    var baseFailed = ignored.length > 0;
+    var ca = (ba && ba.candleAnalysis) || (d && d.candleAnalysis) || null;
+    var candlesRan = !!ca && ca.state !== "NOT_COLLECTED" && (ca.state != null || ca.latestCompletedTs != null);
     var cq = ba && ba.candleQualification;
-    (cq && Array.isArray(cq.reasons) ? cq.reasons : []).forEach(function (key) { ignored.push(String(key)); });
-    if (!cq || cq.ready !== true) ignored.push("candle qualification incomplete");
-    // Some background payloads expose only the combined reasons. Retain them
-    // too, while de-duplicating the display and journal snapshot.
-    (ba && Array.isArray(ba.reasons) ? ba.reasons : []).forEach(function (reason) {
-      if (!/base and candle qualification gates pass/i.test(String(reason))) ignored.push(String(reason));
-    });
+    if (!candlesRan) {
+      if (!(cq && cq.ready === true)) ignored.push(baseFailed ? "candle checks not run (base checks failing)" : "candle checks not run yet");
+    } else {
+      var candleCurrent = Number(ca.latestCompletedTs) === currentCompleted5mTs();
+      if (!candleCurrent) ignored.push("candle data stale");
+      (cq && Array.isArray(cq.reasons) ? cq.reasons : []).forEach(function (key) {
+        if (key === "fresh" && !candleCurrent) return;   // same fact as "candle data stale"
+        ignored.push(CANDLE_GATE_LABELS[key] || String(key));
+      });
+      if (!cq) ignored.push("candle qualification unavailable");
+    }
+    var snapTs = Number(d && d.ts);
+    if (!isFinite(snapTs) || Date.now() - snapTs > 120000) ignored.push("pool data older than 2 min");
     var uniqueIgnored = [];
     ignored.forEach(function (reason) {
       if (uniqueIgnored.indexOf(reason) < 0) uniqueIgnored.push(reason);
@@ -377,9 +390,36 @@
     return { ok: true, totalSol: total, bidAskSol: bidAskSol, spotSol: spotSol };
   }
 
+  // Plain-word names for the candle checks (background candle-analysis keys)
+  var CANDLE_GATE_LABELS = {
+    fresh: "latest 5m candle",
+    history: "complete candle history",
+    volume: "last hour volume \u2265 half a typical hour",
+    repeatedRecoveries: "2+ recovered 5% dips",
+    recentRecovery: "a recovery in the last 3h",
+    support: "flat-or-rising 15m lows",
+    cycle: "current dip bouncing"
+  };
+
+  // Identity of an override = the plan you are confirming: pool, range, split,
+  // amount. NOT the data snapshot time: the HUD refreshes every 60s, and a
+  // refresh landing between the two clicks used to reset/reject the override
+  // even though nothing about the plan changed.
   function sameOverrideSnapshot(a, b) {
-    return !!(a && b && a.pool === b.pool && a.dataTs === b.dataTs
+    return !!(a && b && a.pool === b.pool
       && a.depth === b.depth && a.share === b.share && a.totalSol === b.totalSol);
+  }
+  // one confirmation state machine per pool+plan, kept outside the button so a
+  // HUD re-render (new button element) does not drop the first click
+  var overrideConfirmations = {};
+  function overrideConfirmationFor(key) {
+    if (!overrideConfirmations[key]) {
+      overrideConfirmations[key] = createAccumOverrideConfirmation(8000, function () {
+        var b = document.getElementById && document.getElementById("mql-ba-override");
+        if (b) b.textContent = "\u26a0 Override BID ASK anyway (2 clicks)";
+      });
+    }
+    return overrideConfirmations[key];
   }
 
   // Small pure seam for the two-click override confirmation. The DOM button
@@ -441,18 +481,20 @@
         return { show: "full", state: "READY", depth: ba.depthPct,
           share: ba.allocation.bidAskPct / 100, reasons: ba.reasons || [], signal: ba };
       }
-      var reasons = (ba.reasons || []).slice();
+      var reasons = (ba.reasons || []).filter(function (r) {
+        return !/base and candle qualification gates pass/i.test(String(r));
+      });
+      var ca = ba.candleAnalysis;
+      var candlesRan = !!ca && ca.state !== "NOT_COLLECTED" && (ca.state != null || ca.latestCompletedTs != null);
       if (stale) reasons.unshift("✗ data stale — wait for a fresh snapshot");
-      if (!candleCurrent) reasons.unshift("✗ candle data stale — wait for the latest completed 5m candle");
+      // Only call candles "stale" when they were actually loaded. When the base
+      // checks fail, candles are never fetched; saying "stale" there was wrong.
+      if (candlesRan && !candleCurrent) reasons.unshift("✗ candle data stale — wait for the latest completed 5m candle");
+      else if (!candlesRan) reasons.push("candle checks run once the base checks pass");
       if (!reasons.length) reasons.push("BID ASK candle qualification is not complete");
       var state = ba.state || "WAIT";
       if (state === "READY") state = "WATCH";
       var overridePlan = bidAskOverridePlan(d);
-      reasons.forEach(function (reason) {
-        var text = String(reason);
-        if (!/base and candle qualification gates pass/i.test(text)
-            && overridePlan.ignoredGates.indexOf(text) < 0) overridePlan.ignoredGates.push(text);
-      });
       return { show: "wait", state: state, reasons: reasons, signal: ba, overridePlan: overridePlan };
     }
     // A missing BID ASK payload is unsafe to treat as a legacy-compatible
@@ -468,6 +510,7 @@
     window.__mqlTestExports.bidAskOverridePlan = bidAskOverridePlan;
     window.__mqlTestExports.validateComboTotal = validateComboTotal;
     window.__mqlTestExports.createAccumOverrideConfirmation = createAccumOverrideConfirmation;
+    window.__mqlTestExports.bidAskBinPlan = bidAskBinPlan;
   }
 
   function appendCandleEvidence(body, analysis) {
@@ -498,6 +541,38 @@
       " (" + (analysis.volumeBaselineHours || 0) + " baseline hours)"));
     body.appendChild(el("div", "mql-accum-prior",
       "BID ASK candle checks: 0.5× volume floor · 2 recoveries with 1 within 3h · three wall-clock 15m support lows, each the minimum of 3 completed 5m closes · provisional thresholds"));
+  }
+
+  // Bins and rent for a 0 -> -depth range, from the DLMM bin formula
+  // P_i = (1 + binStep/10000)^i (docs.meteora.ag/core-products/dlmm/formulas).
+  // Bins are grouped in bin arrays of 70; creating an array nobody has used costs
+  // ~0.075 SOL non-refundable (Meteora getting-started docs). One position holds
+  // at most 1,400 bins. Worst case shown; Meteora prints the exact cost pre-sign.
+  function bidAskBinPlan(binStep, depth) {
+    var bs = Number(binStep), dp = Number(depth);
+    if (!(bs > 0) || !(dp > 0) || !(dp < 100)) return null;
+    var bins = Math.ceil(Math.abs(Math.log(1 - dp / 100)) / Math.log(1 + bs / 10000)) + 1;
+    var arrays = Math.ceil(bins / 70) + 1;
+    return { bins: bins, maxArrays: arrays, maxNonRefundableSol: Math.round(arrays * 0.075 * 100) / 100, overMax: bins > 1400 };
+  }
+  function appendBidAskPoolFacts(body, d, depth) {
+    try {
+      var pool = (d && d.pool) || {};
+      var plan = bidAskBinPlan(pool.binStep, depth);
+      if (plan) {
+        body.appendChild(el("div", plan.overMax ? "mql-rec-warn" : "mql-accum-note",
+          "\u2248" + plan.bins + " bins at " + pool.binStep + " bps" +
+          (plan.overMax ? " \u2014 over the 1,400-bin max for one position" : "") +
+          " \u00b7 if nobody has used these price levels: up to ~" + plan.maxNonRefundableSol +
+          " SOL non-refundable bin-array rent (+ refundable position rent). Meteora shows the exact cost before you sign."));
+      }
+      var sym = (pool.tokenX && pool.tokenX.symbol) || "the token";
+      if (pool.collectFeeMode === "InputOnly") {
+        body.appendChild(el("div", "mql-accum-note", "fees: paid in " + sym + " when sellers hit your bins (this pool collects fees in the token entering the swap)"));
+      } else if (pool.collectFeeMode === "OnlyY") {
+        body.appendChild(el("div", "mql-accum-note", "fees: paid in SOL (this pool collects all fees in token Y)"));
+      }
+    } catch (e) {}
   }
 
   function appendAccumTotalControls(body, chk, total, actionText, onValid) {
@@ -574,6 +649,7 @@
         }
         body.appendChild(el("div", "mql-accum-line", "override plan · range 0% → -" + ovPlan.depth + "% · " +
           Math.round(ovPlan.share * 100) + "/" + Math.round((1 - ovPlan.share) * 100) + " Bid-Ask / Spot"));
+        appendBidAskPoolFacts(body, d, ovPlan.depth);
         body.appendChild(el("div", "mql-accum-note", "⚠ Intentional override: standard BID ASK gates are ignored only after two clicks; review every failed gate."));
         body.appendChild(el("div", "mql-accum-note", "ignored gates: " +
           (ovPlan.ignoredGates.length ? ovPlan.ignoredGates.join(" · ") : "none reported")));
@@ -581,13 +657,12 @@
           pool: state.pool, dataTs: Number(d.ts), depth: ovPlan.depth, share: ovPlan.share
         };
         var overrideTotal = isFinite(Number(comboUI.total)) && Number(comboUI.total) > 0 ? Number(comboUI.total) : 1.0;
-        appendAccumTotalControls(body, { share: ovPlan.share }, overrideTotal,
+        var ovControls = appendAccumTotalControls(body, { share: ovPlan.share }, overrideTotal,
           "⚠ Override BID ASK anyway (2 clicks)", function (check, button) {
             var liveGateCheck = accumComboCheck(state.data);
             var planNow = liveGateCheck && liveGateCheck.overridePlan;
             if (!planNow) planNow = bidAskOverridePlan(state.data);
             if (!planNow || !planNow.ok || state.pool !== renderedOverrideIdentity.pool
-                || Number(state.data && state.data.ts) !== renderedOverrideIdentity.dataTs
                 || planNow.depth !== renderedOverrideIdentity.depth
                 || planNow.share !== renderedOverrideIdentity.share) {
               button.textContent = "✗ pool or BID ASK plan changed — refresh and review";
@@ -602,13 +677,8 @@
               button.textContent = "✗ BID ASK plan changed — refresh and review";
               return;
             }
-            var confirmation = button.__mqlOverrideConfirmation;
-            if (!confirmation) {
-              confirmation = createAccumOverrideConfirmation(8000, function () {
-                button.textContent = "⚠ Override BID ASK anyway (2 clicks)";
-              });
-              button.__mqlOverrideConfirmation = confirmation;
-            }
+            button.id = "mql-ba-override";
+            var confirmation = overrideConfirmationFor(snapshot.pool + "|" + snapshot.depth + "|" + snapshot.share);
             var result = confirmation.click(snapshot);
             if (result.confirmed) {
               var finalGateCheck = accumComboCheck(state.data);
@@ -636,11 +706,20 @@
               button.textContent = "⚠ Ignoring: " + (snapshot.ignoredGates.join(" · ") || "failed BID ASK gates") + " — click again within 8s";
             }
           });
+        // a 60s refresh rebuilds this button; keep an armed first click visible
+        var ovKey = renderedOverrideIdentity.pool + "|" + renderedOverrideIdentity.depth + "|" + renderedOverrideIdentity.share;
+        if (ovControls && ovControls.button) {
+          ovControls.button.id = "mql-ba-override";
+          if (overrideConfirmations[ovKey] && overrideConfirmations[ovKey].isArmed()) {
+            ovControls.button.textContent = "⚠ Armed — click again within 8s to start the override";
+          }
+        }
         wrap.appendChild(body); hud.appendChild(wrap); return;
       }
       var rangeLine = el("div", "mql-accum-line", "range 0% → -" + chk.depth + "% (σ-scaled depth)");
       tipify(rangeLine, "accumdepth");
       body.appendChild(rangeLine);
+      appendBidAskPoolFacts(body, d, chk.depth);
       var total = isFinite(Number(comboUI.total)) && Number(comboUI.total) > 0 ? Number(comboUI.total) : 1.0;
       body.appendChild(el("div", "mql-accum-line mql-muted",
         "σ " + fmtNum(d.sigma, 0) + "%/d → depth " + chk.depth + "% · fees 1h " + fmtNum(d.feeRate1h, 1) +
@@ -963,6 +1042,7 @@
       entryFeeRate24h: (entryContext.feeRate24h > 0) ? entryContext.feeRate24h : null,
       feeBasis: entryContext.feeBasis || undefined,
       entryEdge: (entryContext.edge != null) ? Math.round(entryContext.edge * 100) / 100 : null,
+      entryEdgeBasis: startData.edgeBasis || null,
       entrySigma: (entryContext.sigma != null) ? Math.round(entryContext.sigma * 10) / 10 : null,
       entrySigmaSource: entryContext.sigmaSource || null };
     if (isOverride) {
@@ -989,7 +1069,7 @@
           var overrides = jr9.mqlOverrideJournal || [];
           overrides.push({ ts: entryTs, pool: startPool, cls: 'BID_ASK', override: true,
             ignoredGates: ignoredGates.slice(), depth: Number(depth), share: Number(share),
-            totalSol: amount.totalSol, dataTs: comboTs, edge: entryContext.edge,
+            totalSol: amount.totalSol, dataTs: comboTs, edge: entryContext.edge, edgeBasis: startData.edgeBasis || null,
             sigma: entryContext.sigma, feeRate1h: entryContext.feeRate1h });
           payload.mqlOverrideJournal = overrides.slice(-100);
         }
@@ -1059,7 +1139,7 @@
     "accum": "BID ASK is a manual accumulation signal: a deep single-sided SOL band below price, built as Bid-Ask (bottom-heavy) plus Spot (uniform) in the same range. READY means its uncalibrated safety and persistence gates pass; it is not a profit forecast. You choose the amount and approve both wallet transactions.",
     "accumdepth": "How deep the band goes, scaled from realized vol: \u03c3\u2265150%/day \u2192 -75%, \u03c3\u226480 \u2192 -60% (linear between), nudged deeper near ATH and shallower if already crashed. A -70% wick is a normal day for a high-\u03c3 memecoin \u2014 the band must survive it. Prior pending calibration.",
     "accumsplit": "Capital split between the two legs. The Bid-Ask share rises with \u03c3 and with sell-skewed flow (deep fills more likely), clamped 60-80%. Default lands \u2248 70/30. Prior pending calibration.",
-    "accumfill": "How much of your accumulation band has converted from SOL into the token — the progress bar of the bag you're building. Value-based when the API provides amounts; otherwise \u2248 a linear price-traversal estimate (labeled)."
+    "accumfill": "How much of the SOL you deposited has already been spent buying the token: 1 - SOL still in your bins / net SOL deposited (Meteora position data, fees excluded). Only when that data is missing does it fall back to \u2248 a linear price-traversal guess (labeled), which runs ahead of reality on a bottom-heavy Bid-Ask band."
   };
   var tipEl = null;
   function ensureTipEl() {
@@ -1298,13 +1378,25 @@
         if (decayFire && flowFire) {
           verdict = "EXIT"; cls = "mql-pw-exit";
           reasons.push("token dying while you accumulate — fee engine " + Math.round(decayPct) + "% below baseline AND organic distribution " + fmtNum(d.ofi1h, 1) + ":1. Both kill-rules fired.");
-        } else if (decayFire || flowFire || decayPct > 25 || d.trend === "COOLING") {
+        } else if (decayFire || flowFire) {
+          // Same lifecycle as the background watcher / Discord alerts: WAIT only
+          // when one of the two kill-rules has actually fired.
           verdict = "WATCH"; cls = "mql-pw-warn";
           if (decayFire) reasons.push("fee engine decayed " + Math.round(decayPct) + "% — EXIT arms if the flow flips too");
           if (flowFire) reasons.push("organic distribution " + fmtNum(d.ofi1h, 1) + ":1 into your band — EXIT arms if the fee engine dies too");
-          if (!decayFire && !flowFire) reasons.push("fee trend softening (" + fmtNum(d.feeRate1h, 1) + "%/d, " + Math.round(decayPct) + "% below baseline) — the band only pays if volume persists");
         } else {
           reasons.push("accumulating as designed — volume alive (" + fmtNum(d.feeRate1h, 1) + "%/d), flow OFI " + fmtNum(d.ofi1h, 2));
+          // Softening used to flip this card to WAIT ("stop adding") at 25% below
+          // the entry rate. Entries usually happen on a fee spike, so that fired on
+          // the normal post-spike cool-off (the FEE-DECAY spike bias the CLI fixed
+          // in f2ea60d) while the Discord watcher stayed silent. Now a note only.
+          if (decayPct > 25 || d.trend === "COOLING") {
+            reasons.push(!isFinite(normFee)
+              ? "note: fees " + Math.round(decayPct) + "% below your entry rate — decay arms at 50% below entry, two reads in a row"
+              : d.feeRate1h >= normFee
+              ? "note: fees " + Math.round(decayPct) + "% below your entry rate but still above the pool's normal (" + fmtNum(normFee, 1) + "%/d) — post-spike cool-off, not decay"
+              : "note: fees " + Math.round(decayPct) + "% below your entry rate and under the pool's normal — decay arms at 50% below entry, two reads in a row");
+          }
         }
         if (d.path === "FREEFALL" && verdict !== "EXIT") reasons.push("FREEFALL: band filling fast — that is the design; the kill-switch is fee-decay + flow-flip, not price");
         }
@@ -1400,13 +1492,16 @@
             bandTxt += fmtNum(hiRel, 0) + "% → " + fmtNum(loRel, 0) + "% vs price";
             var pnlA = (ap.pnlPct != null && !isNaN(ap.pnlPct)) ? ap.pnlPct : null;
             if (pnlA != null) bandTxt += "  ·  PnL " + (pnlA >= 0 ? "+" : "") + fmtNum(pnlA, 1) + "%";
-          } else bandTxt += "\u00b1" + Wp + "%";
+          } else if (state.entryPlan && state.entryPlan.pool === state.pool && Number(state.entryPlan.depthPct) > 0) {
+            // no live price range yet: an accumulation band is 0 -> -depth below entry, not +-W
+            bandTxt += "0% \u2192 -" + fmtNum(Number(state.entryPlan.depthPct), 0) + "% (entry plan)";
+          } else bandTxt += "(range unavailable)";
           card.appendChild(el("div", "mql-pw-brackets", bandTxt));
           // fill progress bar — the bag you're building
           var fw = el("div", "mql-fillwrap");
           var flab = el("div", "mql-fill-label",
             (ap && ap.fillPct != null)
-              ? ("FILLED " + ap.fillPct + "%" + (ap.fillMethod === "traversal" ? " (\u2248 price traversal)" : ""))
+              ? ("FILLED " + ap.fillPct + "%" + (ap.fillMethod === "traversal" ? " (\u2248 price traversal)" : ap.fillMethod === "sol-spent" ? " of your SOL spent" : ""))
               : "fill: unknown");
           tipify(flab, "accumfill");
           fw.appendChild(flab);
@@ -1557,7 +1652,7 @@
     edgeRow.appendChild(edgeVal);
     // edge at the recipe's actual width (edge scales linearly with band width)
     if (d.edgeRecipe != null && d.recipeW != null) {
-      var er = el("span", "mql-sub " + colorForEdge(d.edgeRecipe), " \u00b1" + d.recipeW + "%: " + fmtNum(d.edgeRecipe, 2));
+      var er = el("span", "mql-sub " + colorForEdge(d.edgeRecipe), (d.recipeSingle ? " 0\u2192-" + d.recipeW + "%: " : " \u00b1" + d.recipeW + "%: ") + fmtNum(d.edgeRecipe, 2));
       er.title = "Edge re-quoted at the recommended band width (\u00b1" + d.recipeW + "%). The headline number assumes the default \u00b1" + (d._W || 20) + "% \u2014 wider bands pay less IL per unit of vol, so the same pool quotes better at the recipe width.";
       edgeRow.appendChild(er);
     }
@@ -1566,7 +1661,8 @@
       var tr9 = (d.trail || []).filter(function (x) { return x.src === (d.sigmaSource === "rv5m" ? "rv" : "lg") && x.sigma > 0; }).slice(-60);
       if (tr9.length >= 5) {
         var Wsp = d._W || 20;
-        var es = tr9.map(function (x) { return (x.feeRate * 0.9 / x.sigma) / Math.max(1.3 * x.sigma / (8 * Wsp), 0.001); });
+        // same formula as background computeEdge: LP-net fees / (1.3 * sigma^2/(4W))
+        var es = tr9.map(function (x) { return (x.feeRate / x.sigma) / Math.max(1.3 * x.sigma / (4 * Wsp), 0.001); });
         var mx = Math.max.apply(null, es.concat([1.5])), mn = 0;
         var pts = es.map(function (v, i) {
           return (i / (es.length - 1) * 96 + 2).toFixed(1) + "," + (16 - ((v - mn) / (mx - mn)) * 14 + 1).toFixed(1);
@@ -1702,6 +1798,7 @@
                   // full entry-time signal snapshot: joined into the close journal row
                   // so every round trip is origin-tagged for calibration
                   entryEdge: (state.data && state.data.edge != null) ? Math.round(state.data.edge * 100) / 100 : null,
+                  entryEdgeBasis: (state.data && state.data.edgeBasis) || null,
                   entrySigma: (state.data && state.data.sigma != null) ? Math.round(state.data.sigma * 10) / 10 : null,
                   entrySigmaSource: (state.data && state.data.sigmaSource) || null });
                 chrome.storage.local.set({ mqlEntryPlan: plans });
@@ -1735,6 +1832,7 @@
                   entryFeeRate24h: state.data && state.data.feeRate24h > 0 ? state.data.feeRate24h : null,
                   feeBasis: state.data && state.data.feeBasis || undefined,
                   entryEdge: state.data && state.data.edge != null ? Math.round(state.data.edge * 100) / 100 : null,
+                  entryEdgeBasis: state.data && state.data.edgeBasis || null,
                   entrySigma: state.data && state.data.sigma != null ? Math.round(state.data.sigma * 10) / 10 : null,
                   entrySigmaSource: state.data && state.data.sigmaSource || null });
                 chrome.storage.local.set({ mqlEntryPlan: plans });
@@ -1743,7 +1841,7 @@
             }
             chrome.storage.local.get({ mqlOverrideJournal: [] }, function (st) {
               var j = st.mqlOverrideJournal || [];
-              j.push({ ts: Date.now(), pool: state.pool, cls: ov.cls, ignoredGates: ov.ignoredGates, edge: state.data && state.data.edge, sigma: state.data && state.data.sigma, feeRate1h: state.data && state.data.feeRate1h });
+              j.push({ ts: Date.now(), pool: state.pool, cls: ov.cls, ignoredGates: ov.ignoredGates, edge: state.data && state.data.edge, edgeBasis: state.data && state.data.edgeBasis || null, sigma: state.data && state.data.sigma, feeRate1h: state.data && state.data.feeRate1h });
               chrome.storage.local.set({ mqlOverrideJournal: j.slice(-100) });
             });
           } catch (e) {}
@@ -1942,9 +2040,13 @@
     return null;
   }
 
+  // Equivalent +-W half-width = full band width / 2, so the background's
+  // sigma^2/(4W) equals sigma^2/(2 * full width) for any range shape:
+  // +-W -> W, one-sided 0 -> -75% -> 37.5, off-price -50% -> -20% -> 15.
+  // (The old (|min| + |max|)/2 gave 35 for that last case instead of 15.)
   function widthPctFromRange(r) {
     if (!r) return 20;
-    var w = (Math.abs(r.min) + Math.abs(r.max)) / 2;
+    var w = (r.max - r.min) / 2;
     if (!w || isNaN(w) || w <= 0) return 20;
     return w;
   }
@@ -2022,20 +2124,36 @@
 
     if (!state.pool) { strip.textContent = "range analysis: no pool"; return; }
 
+    // A range entirely below (or above) price is a one-sided ladder: it only
+    // trades while price is inside it, where its IL is sigma^2/(2 * width) (same
+    // capital in half the width of a +-W band). Show that number neutrally: on a
+    // BID ASK accumulation, buying the dip is the plan, not a loss to avoid.
+    var oneSided = !!r && (r.max <= 0 || r.min >= 0);
+    var symmetric = !r || Math.abs(r.max + r.min) < 0.5;
+    var rangeLbl = !r ? "\u00b1" + fmtNum(w, 1) + "%"
+      : oneSided ? fmtNum(r.max, 0) + "% \u2192 " + fmtNum(r.min, 0) + "% (one-sided)"
+      : symmetric ? "\u00b1" + fmtNum(w, 1) + "%"
+      : fmtNum(r.min, 0) + "% \u2192 +" + fmtNum(r.max, 0) + "%";
     sendMessage({ type: "getBreakeven", pool: state.pool, widthPct: w }).then(safe(function (resp) {
       var strip2 = document.getElementById("mql-guard-strip");
       if (!strip2) return;
       if (!resp || !resp.ok) {
         strip2.className = "mql-guard-strip mql-muted";
-        strip2.textContent = "±" + fmtNum(w, 1) + "% breakeven unavailable" +
+        strip2.textContent = rangeLbl + " breakeven unavailable" +
           (resp && resp.error ? " (" + resp.error + ")" : "");
         return;
       }
       var need = resp.breakevenFeePerDay;
       var pays = resp.poolFeePerDay;
       var clears = !!resp.clears;
+      if (oneSided) {
+        strip2.className = "mql-guard-strip mql-muted";
+        strip2.textContent = rangeLbl + " needs ≥" + fmtPct(need, 1) + "/day fees while price is inside it — this pool pays " +
+          fmtPct(pays, 1) + "/day " + (clears ? "✓" : "✗") + " · on a BID ASK accumulation, buying the dip is the plan";
+        return;
+      }
       strip2.className = "mql-guard-strip " + (clears ? "mql-good" : "mql-bad");
-      strip2.textContent = "±" + fmtNum(w, 1) + "% needs ≥" + fmtPct(need, 1) +
+      strip2.textContent = rangeLbl + " needs ≥" + fmtPct(need, 1) +
         "/day fees to breakeven — this pool pays " + fmtPct(pays, 1) + "/day " +
         (clears ? "✓" : "✗");
     }));

@@ -78,8 +78,28 @@ Three estimators in a quality ladder, chosen automatically:
 ### EDGE — the core number
 
 ```
-edge = fee income ÷ expected IL   (at a given band width)
+edge = LP fee rate ÷ (1.3 × IL)        IL = σ² ÷ (4W)   %/day
 ```
+
+σ is realized volatility in %/day and W is the band's half-width in % (±W).
+`σ²/(4W)` is the small-range impermanent-loss rate of a uniform band (the
+full-range `σ²/8` concentrated by `2/W`); a DLMM Spot bin simulation lands
+slightly above it, so it is not pessimistic. The fee rate is Meteora's
+`fee_tvl_ratio`, which is **already net of the protocol cut**: on every pool
+checked, `fees ÷ volume` sits below the base fee and `(fees + protocol_fees) ÷
+volume` restores it (cut ≈10% standard, ≈20% launch pools, as in Meteora's
+formulas page), so nothing more is deducted.
+
+Before v0.7.13 the IL term was `σ²/(8W)` (half) and the fee was cut by 0.9 a
+second time, so edge read **1.8× too high**. Gate thresholds were left as they
+were, so entries are now correspondingly stricter; shadow and journal rows carry
+`eb` / `edgeBasis` so old and new edges are never compared directly.
+
+**One-sided bands.** The general form is `IL = σ² ÷ (2 × full band width)` while
+price is inside the band. A `±W` band has full width `2W`, giving `σ²/(4W)`. A
+one-sided `0 → −W` band puts the same capital in half the width, giving `σ²/(2W)`,
+so IGNITION's recipe edge is halved when it deploys single-sided (organic sellers
+> 2:1) and the HUD re-quotes it as `0→-W%`.
 
 `≥1` means the pool-wide fee rate clears this IL proxy with its safety margin.
 It is a screening heuristic, not a profit estimate: it does not model the bins
@@ -113,8 +133,11 @@ Two things worth understanding:
 - **Edge sparkline** — 60 minutes of edge history with a dashed line at the 1.0
   gate, so you can see whether the current reading is a trend or a blip.
 - **Form guardian** — under the range picker: the fee/day a `±W%` band needs to
-  break even vs what the pool actually pays, plus a warning if Meteora's
-  Auto-Fill silently resets your Min/Max range.
+  break even (`σ² ÷ (2 × range width)`) vs what the pool actually pays, plus a
+  warning if Meteora's Auto-Fill silently resets your Min/Max range. A one-sided
+  range (entirely below or above price) shows the fee it needs *while price is
+  inside it*, in neutral colors: on a BID ASK accumulation, buying the dip is the
+  plan, not a loss to avoid.
 
 ### New pools (pool age, not token age)
 
@@ -187,9 +210,25 @@ buyers present, persistent volume, and no unbought freefall. **Guide Bid-Ask + S
 state survives page reloads. You choose the SOL amount; the extension only fills
 the form and every leg still requires your wallet approval.
 
+The card also shows, for the pool's bin step, how many bins the range needs
+(`P_i = (1 + binStep/10000)^i`, one position holds at most 1,400) and the
+worst-case non-refundable bin-array rent (~0.075 SOL per 70-bin array nobody has
+used yet; Meteora shows the exact cost before you sign), plus which token the
+pool pays fees in: on `InputOnly` pools, sellers hitting your bins pay fees in
+the token you are buying, not SOL.
+
+**Fill %** is the share of your deposited SOL already spent buying the token:
+`1 − SOL still in the bins ÷ net SOL deposited`, from Meteora's position data
+(`unrealizedPnl.balanceTokenY`, `allTimeDeposits/Withdrawals.tokenY`). Only when
+that is missing does it fall back to a labeled linear price-traversal guess.
+
 Accumulation books get their own rulebook: no scalp TP/SL, and price falling into
 the band is *the design*, not a failure. The only kill-rule is the token dying
-while you accumulate — fee-decay **and** flow-flip together.
+while you accumulate — fee-decay **and** flow-flip together. The HUD card and the
+Discord alerts use the same lifecycle: `WAIT` only when one kill-rule has fired,
+`EXIT` when both have. Fees cooling off after the entry spike is shown as a note,
+not a `WAIT` (entries usually land on a spike, so a 25%-below-entry trigger fired
+on normal cool-off).
 
 **Take the warning seriously: if the token dies you own it the whole way down.
 Size for total loss.**
@@ -219,6 +258,10 @@ its latest close is above its running trough; an active dip that times out block
 `READY`. A completed recent recovery can qualify while the setup waits for the
 next dip. Total pool volume is separate from Jupiter's organic buy/sell flow.
 
+If Meteora has not published the just-closed 5-minute candle when a bucket is
+first checked, the extension asks again after 20 seconds instead of holding
+`WAIT` for the rest of the bucket.
+
 Full 24-hour history is preferred. A known young pool uses only complete candles
 since its first full 5-minute bucket and is labeled `LIMITED HISTORY`; missing
 candles after creation produce `WAIT`. Pool creation age and Jupiter's token age
@@ -235,7 +278,13 @@ node candle-analysis.cjs <POOL_ADDRESS> --json
 
 ### Cap-aware take-profits
 
-A two-sided band's maximum price-driven gain is exactly **W/4** — above the band
+A one-sided IGNITION band (`0 → −W`, deployed when organic sellers are > 2:1) has
+**no** price-driven upside, since above the band it is 100% SOL, so its TP is the
+fee term alone. Fully filled at the bottom it loses about `0.5W` (vs `0.75W`
+two-sided), so its SL is `0.5W + 2`.
+
+A two-sided band's maximum price-driven gain is about **W/4** (a uniform-bin
+simulation gives 4.5% at ±20% and 7.4% at ±35%, so slightly less) — above the band
 you're 100% quote and done. Everything beyond that must come from fees. TPs are
 computed against that cap rather than set optimistically, so a TP you see is a
 number the position can actually reach. Pump-outs are booked by the OOR-UP rule
