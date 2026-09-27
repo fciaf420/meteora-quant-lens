@@ -278,6 +278,11 @@ node candle-analysis.cjs <POOL_ADDRESS> --json
 
 ### Cap-aware take-profits
 
+A one-sided IGNITION band (`0 → −W`, deployed when organic sellers are > 2:1) has
+**no** price-driven upside, since above the band it is 100% SOL, so its TP is the
+fee term alone. Fully filled at the bottom it loses about `0.5W` (vs `0.75W`
+two-sided), so its SL is `0.5W + 2`.
+
 A two-sided band's maximum price-driven gain is about **W/4** (a uniform-bin
 simulation gives 4.5% at ±20% and 7.4% at ±35%, so slightly less) — above the band
 you're 100% quote and done. Everything beyond that must come from fees. TPs are
