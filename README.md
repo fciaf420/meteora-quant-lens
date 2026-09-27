@@ -99,10 +99,12 @@ Two things worth understanding:
 ### The rest of the HUD
 
 - **Fee rate** — 1h fee/TVL annualized to %/day vs the 24h figure, with
-  `▲ HEATING` / `▼ COOLING`.
+  `▲ HEATING` / `▼ COOLING`. On a pool younger than a day the comparison reads
+  `since launch (Nh)` (see *New pools* below).
 - **Surge** — dynamic fee ÷ base fee (`≥1.25` = the pool's fee mechanism is
   ramping, i.e. a live catalyst).
-- **Accel** — 30m volume run-rate ÷ 4h run-rate (`≥1.2` = volume accelerating).
+- **Accel** — 30m volume run-rate ÷ 4h run-rate (`≥1.2` = volume accelerating),
+  each over the time the pool has actually existed.
 - **Flow (OFI)** — organic sell ÷ buy volume. `<0.5` accumulation (green),
   `>2` distribution (red — real wallets are exiting through you).
 - **Path** — price structure: `FREEFALL`, `BASING`, `BLOWOFF`, `GRIND-UP`, `CHOP`.
@@ -113,6 +115,29 @@ Two things worth understanding:
 - **Form guardian** — under the range picker: the fee/day a `±W%` band needs to
   break even vs what the pool actually pays, plus a warning if Meteora's
   Auto-Fill silently resets your Min/Max range.
+
+### New pools (pool age, not token age)
+
+Meteora's windows (30m, 1h, 2h, 4h, 12h, 24h) can only cover the time a **pool**
+has existed. On a 1.7-hour-old pool, the 2h, 4h, 12h and 24h numbers are all
+the same since-launch total. Every window-based rate is therefore divided by the
+hours it really covered (`window value × 24 ÷ min(window, pool age)`, with a
+15-minute floor):
+
+| Pool age | Stage | Treatment |
+|---|---|---|
+| under 1h | `LAUNCH` | Fee rate shown as provisional; HUD trend reads `NEW POOL`. No class (IGNITION, BASING, CARRY, BID ASK fee persistence) can pass on minutes of fees. Every manual override still works. Radar skips these pools. |
+| 1h to 24h | `YOUNG` | Rates are real %/day; the "24h" comparison is **fees since launch ÷ pool age** and is labeled `since launch (Nh)`. All normal gates apply. |
+| 24h+ | `MATURE` | Unchanged. |
+
+Token age (Jupiter) stays a separate fact for the token checks. Caught live on
+NEARPAD-SOL (2026-09-27): 6.4% of fees in 1.7h was being read as 6.4%/day
+(really ~90%/day), which failed BID ASK fee persistence and stored a "pool
+normal" so low that Position Watch's DECAY rule could not fire. Baselines
+journaled before v0.7.12 are rescaled by the pool's age when they were recorded,
+so positions already open get the corrected baseline too. Shadow-log rows now
+carry `fb` (fee basis) and `pAgeH`, so replay can keep old and new young-pool
+rates apart.
 
 ---
 

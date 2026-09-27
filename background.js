@@ -310,6 +310,50 @@ function computeSigma(ageH, pc5, pc1, pc24, rvSigma) {
   return Math.max(a5 * 17, a1 * 4.9, 60);
 }
 
+// ---- pool-age-aware window rates -------------------------------------------
+// Meteora's datapi windows (30m/1h/2h/4h/12h/24h) can only cover the time a pool
+// has existed. On a 1.7h-old pool every window from 2h up returns the same
+// since-creation total, so reading fee_tvl_ratio['24h'] as "%/day" understated
+// a young pool ~14x (caught live on NEARPAD-SOL, 2026-09-27: 6.4% in 1.7h was
+// read as 6.4%/day and failed BID ASK fee persistence; it also froze Position
+// Watch's "pool normal" baseline so low that DECAY could not fire).
+// Every window-based rate is divided by the hours the window actually covered.
+// POOL age drives this (these are pool windows); token age stays a separate fact.
+const FEE_BASIS = 'pool-age-v1';   // stamped on stored baselines computed this way
+const MIN_FEE_HISTORY_H = 1;       // under 1h of fees, persistence/entry checks cannot judge
+const MIN_COVERED_H = 0.25;        // floor so a minutes-old pool never divides by ~0
+function poolAgeHours(createdAt, nowMs) {
+  const n = Number(createdAt);
+  if (!isFinite(n) || n <= 0) return null;
+  const ms = n > 1e11 ? n : n * 1000;   // datapi sends ms; accept seconds too
+  const h = ((isFinite(nowMs) ? nowMs : Date.now()) - ms) / 3600e3;
+  return h >= 0 ? h : null;
+}
+function coveredHours(windowH, ageH) {
+  return ageH == null ? windowH : Math.min(windowH, Math.max(ageH, MIN_COVERED_H));
+}
+// a window's fee/TVL (or volume) expressed per day over the time it really covered
+function windowPerDay(windowValue, windowH, ageH) {
+  return num(windowValue, 0) * 24 / coveredHours(windowH, ageH);
+}
+function poolAgeStage(ageH) {
+  if (ageH == null) return 'UNKNOWN';
+  if (ageH < MIN_FEE_HISTORY_H) return 'LAUNCH';
+  if (ageH < 24) return 'YOUNG';
+  return 'MATURE';
+}
+// Baselines journaled before FEE_BASIS were computed as ratio*24/windowH even when
+// the pool was younger than the window. Rescale them by the pool's age at the time
+// they were recorded so already-open positions get a correct "pool normal" too.
+function legacyWindowRate(value, windowH, recordedAtMs, poolCreatedAt, basis) {
+  const v = Number(value);
+  if (!(v > 0)) return null;
+  if (basis === FEE_BASIS) return v;
+  const ageAt = poolAgeHours(poolCreatedAt, Number(recordedAtMs));
+  if (ageAt == null || ageAt >= windowH) return v;
+  return v * windowH / coveredHours(windowH, ageAt);
+}
+
 // edge = (feeRate1h*0.9/max(sigma,0.001)) / max(1.3*sigma/(8*W),0.001)
 function computeEdge(feeRate1h, sigma, W) {
   const s = Math.max(num(sigma), 0.001);
@@ -371,6 +415,7 @@ function computeBidAskSignal(d, now) {
     && finite(d.feeRate24h) && d.feeRate24h >= 0 && finite(d.ofi1h) && d.ofi1h >= 0
     && finite(d.sigma) && d.sigma > 0 && knownPath
     && typeof d.mintAuthorityDisabled === 'boolean' && typeof d.freezeAuthorityDisabled === 'boolean';
+  const feeHistoryShort = finite(d.poolAgeH) && d.poolAgeH < MIN_FEE_HISTORY_H;
   const gates = [
     gate('fresh', finite(d.ts) && now >= d.ts && now - d.ts <= BID_ASK_FRESH_MS),
     gate('complete inputs', complete),
@@ -378,7 +423,10 @@ function computeBidAskSignal(d, now) {
     gate('mint+freeze disabled', d.mintAuthorityDisabled === true && d.freezeAuthorityDisabled === true),
     gate('top10<=35%', finite(d.topHoldersPct) && d.topHoldersPct <= 35),
     gate('organic buyers present', finite(d.orgBuy1h) && d.orgBuy1h > 0),
-    gate('fee persistence', finite(d.feeRate1h) && finite(d.feeRate24h) && d.feeRate24h >= 8 && d.feeRate1h >= 0.5 * d.feeRate24h),
+    // feeRate24h is pool-age-aware (since-launch %/day on a young pool). Under an
+    // hour there is no history to measure persistence against, so it cannot pass.
+    gate(feeHistoryShort ? 'fee persistence (pool ' + Math.max(1, Math.round(d.poolAgeH * 60)) + 'm old; needs 1h of fees)' : 'fee persistence',
+      !feeHistoryShort && finite(d.feeRate1h) && finite(d.feeRate24h) && d.feeRate24h >= 8 && d.feeRate1h >= 0.5 * d.feeRate24h),
     gate('no unbought freefall', typeof d.path === 'string' && finite(d.ofi1h) && !(d.path === 'FREEFALL' && d.ofi1h >= 1.43))
   ];
   const baseReady = gates.every((g) => g.pass);
@@ -534,13 +582,20 @@ function buildRecommendation(s) {
     // WAIT: find the closest class and say what would flip it
     const flips = [];
     const near = [];
+    const launchMsg = (s.poolStage === 'LAUNCH' && s.poolAgeH != null)
+      ? 'pool is ' + Math.max(1, Math.round(s.poolAgeH * 60)) + 'm old → need ≥1h of fee history before an entry signal'
+      : null;
     const igGates = [
       ['recipe edge ' + fmt2(recipeEdges.IGNITION) + ' → need ≥1.0 (pool-wide fee/IL heuristic at the recommended width)', recipeEdges.IGNITION >= 1.0],
       ['surge ' + fmt2(s.surge) + 'x → need ≥1.25x (no catalyst yet)', s.surge >= 1.25],
       ['accel ' + fmt2(s.accel) + 'x → need ≥1.2x (volume not accelerating)', s.accel >= 1.2]
     ];
+    // the launch hold is an ignorable gate like any other, so the SCALP override
+    // stays reachable on a sub-1h pool whose other scalp gates already pass
+    if (launchMsg) igGates.unshift([launchMsg, false]);
     const igFails = igGates.filter(g => !g[1]);
     if (igFails.length && igFails.length <= 2) { near.push('SCALP'); igFails.forEach(g => flips.push(g[0])); }
+    else if (launchMsg) flips.push(launchMsg);
     if (s.path !== 'BASING' && s.ddHigh != null && s.ddHigh >= 40) flips.push('down ' + Math.round(s.ddHigh) + '% from high — becomes a BASING entry once the 5m flattens and 1h > -15%');
     if (recipeEdges.CARRY >= 1.3 && s.ofi6h != null && s.ofi6h >= 1.0) flips.push('CARRY blocked only by flow: 6h organic sellers ' + fmt2(s.ofi6h) + ':1 → flips when < 1.0');
     if (recipeEdges.CARRY >= 1.3 && s.ofi6h != null && s.ofi6h < 1.0 && s.feeRate1h < 2) flips.push('CARRY-grade quality but fees ' + fmt2(s.feeRate1h) + '%/day too thin — flips if activity picks up');
@@ -589,10 +644,16 @@ function computeVerdict(m) {
   } = m;
   const recipeEdges = m.recipeEdges || computeRecipeEdges(m);
   const pairOK = m.supportedSolPair === true;
+  // Every class below is priced off the pool's fee rate. Under an hour of fee
+  // history that rate is a few minutes of launch trading scaled to a day, so no
+  // class issues an entry yet (the manual override remains available).
+  const feeHistoryOK = m.poolAgeH == null || m.poolAgeH >= MIN_FEE_HISTORY_H;
+  const feeHistoryGate = () => gate('pool fee history>=1h', feeHistoryOK);
 
   // IGNITION gates
   const ign = [
     gate('token X / SOL Y pair', pairOK),
+    feeHistoryGate(),
     gate('recipe edge>=1.0', recipeEdges.IGNITION >= 1.0),
     gate('surge>=1.25', surge >= 1.25),
     gate('accel>=1.2', accel >= 1.2),
@@ -606,6 +667,7 @@ function computeVerdict(m) {
   // BASING gates
   const bas = [
     gate('token X / SOL Y pair', pairOK),
+    feeHistoryGate(),
     gate('path==BASING', path === 'BASING'),
     gate('ofi1h<=1.0', ofi1h <= 1.0),
     gate('organicScore>=60', organicScore >= 60),
@@ -625,6 +687,7 @@ function computeVerdict(m) {
     || (feeRate1h >= 0.6 && recipeEdges.CARRY >= 3 && sigma < 10);
   const car = [
     gate('token X / SOL Y pair', pairOK),
+    feeHistoryGate(),
     gate('recipe edge>=1.3', recipeEdges.CARRY >= 1.3),
     gate('ofi6h<1.0', ofi6h < 1.0),
     gate('organicScore>=60', organicScore >= 60),
@@ -689,12 +752,20 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
     tokenX: pair.tokenX, tokenY: pair.tokenY, supportedSolPair: pair.supportedSolPair };
 
   const ftr = pick(p, 'fee_tvl_ratio', 'feeTvlRatio') || {};
-  const feeRate24h = num(pick(ftr, '24h', '24H', 'h24'), 0); // already %/day
-  const feeRate1h = num(pick(ftr, '1h', '1H', 'h1'), 0) * 24; // *24 -> %/day
+  // Pool-age-aware: each window is divided by the hours it actually covered, so a
+  // young pool's "24h" (really since-creation) is a true %/day. Mature pools are
+  // unchanged: 24h ratio * 24/24, 1h ratio * 24/1.
+  const poolAgeH = poolAgeHours(poolCreatedAt, sourceTs);
+  const poolStage = poolAgeStage(poolAgeH);
+  const feeRate24h = windowPerDay(pick(ftr, '24h', '24H', 'h24'), 24, poolAgeH);
+  const feeRate1h = windowPerDay(pick(ftr, '1h', '1H', 'h1'), 1, poolAgeH);
+  const feeWindowH = coveredHours(24, poolAgeH);   // hours behind feeRate24h ("since launch" when <24)
+  const ageCtx = { poolAgeH, poolStage, feeWindowH, feeBasis: FEE_BASIS };
 
-  // trend
+  // trend (meaningless until there is at least an hour of fee history)
   let trend = 'steady';
-  if (feeRate1h >= feeRate24h * 1.05) trend = 'HEATING';
+  if (poolStage === 'LAUNCH') trend = 'NEW';
+  else if (feeRate1h >= feeRate24h * 1.05) trend = 'HEATING';
   else if (feeRate1h <= feeRate24h * 0.6) trend = 'COOLING';
 
   // surge
@@ -705,7 +776,9 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
   const vol = pick(p, 'volume', 'volumes') || {};
   const v30m = num(pick(vol, '30m', '30M', 'm30'), 0);
   const v4h = num(pick(vol, '4h', '4H', 'h4'), 0);
-  const accel = (v30m * 48) / Math.max(v4h * 6, 1);
+  // hourly pace over the last 30m vs over the last 4h, each over the time it covered
+  // (the old fixed 4h divisor inflated accel ~2x on a 2h-old pool)
+  const accel = (v30m / coveredHours(0.5, poolAgeH)) / Math.max(v4h / coveredHours(4, poolAgeH), 1 / 24);
 
   // --- OHLCV (best effort) ---
   let ddHigh = null, rangePos = null, dayLow = null, low6h = null;
@@ -778,7 +851,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
     });
     return finalize({
       ok: true, pool: poolMeta, supportedSolPair: false,
-      feeRate1h, feeRate24h, trend, surge, accel,
+      feeRate1h, feeRate24h, trend, surge, accel, ...ageCtx,
       ddHigh, rangePos, dayLow, ts: sourceTs
     }, unsupported);
   }
@@ -787,7 +860,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
     return finalize({
       ok: true,
       pool: poolMeta, supportedSolPair: true,
-      feeRate1h, feeRate24h, trend, surge, accel,
+      feeRate1h, feeRate24h, trend, surge, accel, ...ageCtx,
       ddHigh, rangePos, dayLow,
       ts: sourceTs
     }, jupNullPayload);
@@ -800,7 +873,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
     return finalize({
       ok: true,
       pool: poolMeta, supportedSolPair: true,
-      feeRate1h, feeRate24h, trend, surge, accel,
+      feeRate1h, feeRate24h, trend, surge, accel, ...ageCtx,
       ddHigh, rangePos, dayLow,
       ts: sourceTs
     }, degraded);
@@ -874,7 +947,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
   const verdict = computeVerdict({
     edge, surge, accel, organicScore, path, ageH, ofi1h, ofi6h,
     feeRate1h, tvl, sigma, mintAuthorityDisabled, freezeAuthorityDisabled, floorPct,
-    currentPrice, low6h, dayLow, recipeEdges, supportedSolPair: pair.supportedSolPair
+    currentPrice, low6h, dayLow, recipeEdges, supportedSolPair: pair.supportedSolPair, poolAgeH
   });
 
   // ---- delta history + squeeze detection (data-gated) ----
@@ -925,7 +998,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
       note: 'Volatility compression is informational only; passive Bid-Ask liquidity is not a long-vol breakout payoff.'
     };
   }
-  const recommendation = buildRecommendation({ verdict, squeezeDiagnostic, sigmaTrail, sigmaRatio, edge, recipeEdges, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, low6h, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl });
+  const recommendation = buildRecommendation({ verdict, squeezeDiagnostic, sigmaTrail, sigmaRatio, edge, recipeEdges, surge, accel, sigma, ofi1h, ofi6h, organicScore, feeRate1h, path, ddHigh, dayLow, low6h, currentPrice, mintAuthorityDisabled, freezeAuthorityDisabled, ageH, tvl, poolAgeH, poolStage });
   // Keep the configured-width yardstick and expose the selected recipe-width quote.
   // Verdict gates above use the same recipe-width value; both remain pool-wide
   // heuristics and do not model a position's bin shape, share, or execution costs.
@@ -937,7 +1010,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
   const data = {
     ok: true,
     pool: poolMeta, supportedSolPair: true,
-    feeRate1h, feeRate24h, trend, surge, accel,
+    feeRate1h, feeRate24h, trend, surge, accel, ...ageCtx,
     sigma, sigmaRaw, sigmaSource: (rvSigma != null ? 'rv5m' : 'legacy'), edge, edgeRecipe, recipeEdges, recipeW, trail: trailOut,
     ofi1h, ofi6h, organicScore,
     orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
@@ -1177,13 +1250,21 @@ async function getRadar() {
       && getPoolPairMeta(p).supportedSolPair
   );
   arr.forEach((p) => { p._mqlBoardTs = boardTs; });
-  arr.forEach((p) => { p._fr = ((p.fee_tvl_ratio && p.fee_tvl_ratio['1h']) || 0) * 24; });
-  arr.sort((a, b) => b._fr - a._fr);
+  // Pool-age-aware 1h rate for ranking. Pools under an hour old cannot issue any
+  // entry yet (fee history too short), so they are not given one of the 8 slots.
+  const radarPools = arr.filter((p) => {
+    const a = poolAgeHours(p.created_at, boardTs);
+    return a == null || a >= MIN_FEE_HISTORY_H;
+  });
+  radarPools.forEach((p) => {
+    p._fr = windowPerDay(p.fee_tvl_ratio && p.fee_tvl_ratio['1h'], 1, poolAgeHours(p.created_at, boardTs));
+  });
+  radarPools.sort((a, b) => b._fr - a._fr);
   const items = [];
   // First fetch only the normal pool/Jupiter metrics. Candle history is loaded
   // after this pass so sibling pools for the same token cannot consume several
   // history slots before Radar deduplicates them.
-  const top8 = arr.slice(0, 8);
+  const top8 = radarPools.slice(0, 8);
   const results = [];
   for (let ci = 0; ci < top8.length; ci += 4) {
     const chunk = await Promise.all(top8.slice(ci, ci + 4).map((p) => getPoolData(p.address, p, { deferCandle: true }).then((d) => ({ p, d })).catch(() => null)));
@@ -1264,6 +1345,9 @@ async function getRadar() {
         edge: d.edge != null ? +d.edge.toFixed(3) : null, ofi: d.ofi1h != null ? +d.ofi1h.toFixed(2) : null,
         ofi6: d.ofi6h != null ? +d.ofi6h.toFixed(2) : null, org: Math.round(d.organicScore || 0), path: d.path,
         ageH: d.tokenAgeHours != null ? +d.tokenAgeHours.toFixed(1) : null,
+        // fee-rate basis tag: rows before this field used the full-window divisor,
+        // so replay must not mix young-pool fr/ac values across the two bases
+        fb: d.feeBasis || null, pAgeH: d.poolAgeH != null ? +d.poolAgeH.toFixed(2) : null,
         dd: d.ddHigh != null ? Math.round(d.ddHigh) : null,
         sig: (d.verdict && d.verdict.class !== 'NONE') ? d.verdict.class : (d.bidAsk && d.bidAsk.ready ? 'BID_ASK' : null),
         w: (d.recommendation && d.recommendation.plan && d.recommendation.plan.widthPct) || null,
@@ -1548,16 +1632,26 @@ async function watchPositions() {
         const planRaw9 = plans[pool] || null;
         const planEarly = planMatchesPosition(planRaw9, W, pos.createdAt, Date.now()) ? planRaw9 : null;
         const hudBase = posBaseAll[pool];
-        const entryFeeRate = (planEarly && planEarly.entryFeeRate > 0) ? planEarly.entryFeeRate
-          : (hudBase && hudBase.entryFeeRate > 0) ? hudBase.entryFeeRate
-          : (prevSnap && prevSnap.entryFeeRate != null) ? prevSnap.entryFeeRate : feeRate;
-        // pool's NORMAL fee level at entry (spike-bias guard for DECAY)
-        const norm24 = (planEarly && planEarly.entryFeeRate24h > 0) ? planEarly.entryFeeRate24h
-          : (hudBase && hudBase.feeRate24h > 0) ? hudBase.feeRate24h
-          : (prevSnap && prevSnap.entryFeeRate24h > 0) ? prevSnap.entryFeeRate24h
-          : ((pd && pd.ok && pd.feeRate24h > 0) ? pd.feeRate24h : null);
+        // Baselines stored before FEE_BASIS used the full-window divisor even on a
+        // young pool (a 1.7h pool's "24h normal" stored ~14x too low, which left
+        // DECAY effectively unarmable). Rescale each by the pool's age when recorded.
+        const poolCreated = (pd && pd.ok && pd.pool) ? pd.pool.createdAt : null;
+        const basisKnown = poolAgeHours(poolCreated, Date.now()) != null;
+        const baseRate = (rec, field, windowH, tsField) => (rec
+          ? legacyWindowRate(rec[field], windowH, rec[tsField], poolCreated, rec.feeBasis) : null);
+        const snapE1 = baseRate(prevSnap, 'entryFeeRate', 1, 'firstSeen');
+        const entryFeeRate = baseRate(planEarly, 'entryFeeRate', 1, 'ts')
+          || baseRate(hudBase, 'entryFeeRate', 1, 'ts')
+          || ((prevSnap && prevSnap.entryFeeRate != null) ? (snapE1 != null ? snapE1 : prevSnap.entryFeeRate) : feeRate);
+        // pool's NORMAL fee level at entry (spike-bias guard for DECAY); since-launch
+        // %/day when the pool was younger than 24h at entry
+        const norm24 = baseRate(planEarly, 'entryFeeRate24h', 24, 'ts')
+          || baseRate(hudBase, 'feeRate24h', 24, 'ts')
+          || baseRate(prevSnap, 'entryFeeRate24h', 24, 'firstSeen')
+          || ((pd && pd.ok && pd.feeRate24h > 0) ? pd.feeRate24h : null);
         if (!hudBase && feeRate > 0) {
-          posBaseAll[pool] = { entryFeeRate, feeRate24h: norm24, sigma: (pd && pd.ok) ? pd.sigma : null, ts: Date.now() };
+          posBaseAll[pool] = { entryFeeRate, feeRate24h: norm24, sigma: (pd && pd.ok) ? pd.sigma : null, ts: Date.now(),
+            feeBasis: basisKnown ? FEE_BASIS : undefined };
         }
         let belowCount = (prevSnap && prevSnap.belowCount) || 0;
         // spike-bias guard: decay must be below entry-relative threshold AND the pool's normal
@@ -1568,7 +1662,8 @@ async function watchPositions() {
         }
         st.mqlLastPos[key] = { pool, name, wallet, pnl: Number(pos.pnlSolPctChange), ts: Date.now(),
           firstSeen: (prevSnap && prevSnap.firstSeen) || Date.now(),
-          entryFeeRate, entryFeeRate24h: norm24, belowCount, feeDataTs: feeDataTs != null ? feeDataTs : (prevSnap && prevSnap.feeDataTs) };
+          entryFeeRate, entryFeeRate24h: norm24, belowCount, feeDataTs: feeDataTs != null ? feeDataTs : (prevSnap && prevSnap.feeDataTs),
+          feeBasis: basisKnown ? FEE_BASIS : ((prevSnap && prevSnap.feeBasis) || undefined) };
         const pnl = Number(pos.pnlSolPctChange);
         // Entry plan (journaled by the HUD Apply button) outranks generic width-math:
         // the class brackets the user actually entered on (e.g. BASING +20/-15 + stop).
