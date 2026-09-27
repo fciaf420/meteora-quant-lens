@@ -100,8 +100,8 @@ function loadJournal() {
         else if (x.realizedPnlUsd != null) pnlTxt += ' ($' + (x.realizedPnlUsd >= 0 ? '+' : '') + Number(x.realizedPnlUsd).toFixed(2) + ') · provisional';
         else if (isFinite(pnl)) pnlTxt += ' (last seen)';
         var entryTxt = '—';
-        if (x.entryOrigin === 'override') entryTxt = (x.entryCls || '?') + ' OVERRIDE' + (x.entryEdge != null ? ' @ ' + Number(x.entryEdge).toFixed(2) : '');
-        else if (x.entryOrigin === 'signal') entryTxt = (x.entryCls || '?') + (x.entryEdge != null ? ' @ ' + Number(x.entryEdge).toFixed(2) : '') + (x.entrySigma != null ? ' σ' + Math.round(x.entrySigma) : '');
+        if (x.entryOrigin === 'override') entryTxt = (x.entryCls || '?') + ' OVERRIDE' + (x.entryEdge != null ? ' @ ' + Number(x.entryEdge).toFixed(2) + (x.entryEdgeBasis ? '' : ' (old edge)') : '');
+        else if (x.entryOrigin === 'signal') entryTxt = (x.entryCls || '?') + (x.entryEdge != null ? ' @ ' + Number(x.entryEdge).toFixed(2) + (x.entryEdgeBasis ? '' : ' (old edge)') : '') + (x.entrySigma != null ? ' σ' + Math.round(x.entrySigma) : '');
         const tr = row($('jrCloses'), [fmtTs(x.closedDetected), poolLink(x.pool, x.name), pnlTxt, (x.holdMinutes != null ? (x.holdMinutes >= 90 ? (x.holdMinutes / 60).toFixed(1) + 'h' : x.holdMinutes + 'm') : '—'), entryTxt]);
         if (isFinite(pnl)) tr.children[2].className = pnl >= 0 ? 'jr-pos' : 'jr-neg';
       }
@@ -109,19 +109,19 @@ function loadJournal() {
         row($('jrOpens'), [fmtTs(x.finishedAt || x.startedAt), poolLink(x.pool, null), (x.totalSol != null ? x.totalSol : '—'), (x.depth != null ? '-' + x.depth + '%' : '—'), (x.share != null ? Math.round(x.share * 100) + '%' : '—')]);
       }
       for (const x of (ovr || []).slice().reverse().slice(0, 30)) {
-        row($('jrOverrides'), [fmtTs(x.ts), poolLink(x.pool, null), x.cls || '—', (x.edge != null ? Number(x.edge).toFixed(2) : '—'), (x.sigma != null ? Math.round(x.sigma) : '—'), (x.feeRate1h != null ? Number(x.feeRate1h).toFixed(1) : '—'), (x.ignoredGates || []).join(', ') || '—']);
+        row($('jrOverrides'), [fmtTs(x.ts), poolLink(x.pool, null), x.cls || '—', (x.edge != null ? Number(x.edge).toFixed(2) + (x.edgeBasis ? '' : ' (old)') : '—'), (x.sigma != null ? Math.round(x.sigma) : '—'), (x.feeRate1h != null ? Number(x.feeRate1h).toFixed(1) : '—'), (x.ignoredGates || []).join(', ') || '—']);
       }
     });
   } catch (e) {}
 }
 function exportCsv() {
   const esc = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-  const lines = ['kind,ts,pool,name,pnlPct,realizedPnlPct,realizedPnlUsd,feesUsd,officialPnlSolPct,officialPnlSol,officialPnlUsd,settled,holdMinutes,entryOrigin,entryCls,entryEdge,entrySigma,entrySigmaSource,entryFeeRateAtOpen,totalSol,depth,share,cls,edge,sigma,feeRate1h,ignoredGates'];
+  const lines = ['kind,ts,pool,name,pnlPct,realizedPnlPct,realizedPnlUsd,feesUsd,officialPnlSolPct,officialPnlSol,officialPnlUsd,settled,holdMinutes,entryOrigin,entryCls,entryEdge,entrySigma,entrySigmaSource,entryFeeRateAtOpen,totalSol,depth,share,cls,edge,sigma,feeRate1h,ignoredGates,edgeBasis'];
   for (const x of jrRaw.log) {
-    if (x.closedDetected != null) lines.push(['close', new Date(x.closedDetected).toISOString(), x.pool, x.name, x.lastSeenPnlPct, x.realizedPnlPct, x.realizedPnlUsd, x.feesUsd, x.officialPnlSolPct, x.officialPnlSol, x.officialPnlUsd, x.settled, x.holdMinutes, x.entryOrigin, x.entryCls, x.entryEdge, x.entrySigma, x.entrySigmaSource, x.entryFeeRateAtOpen, '', '', '', '', '', '', '', ''].map(esc).join(','));
-    else if (x.type === 'COMBO_OPEN') lines.push(['combo_open', new Date(x.finishedAt || x.startedAt).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', x.totalSol, x.depth, x.share, '', '', '', '', ''].map(esc).join(','));
+    if (x.closedDetected != null) lines.push(['close', new Date(x.closedDetected).toISOString(), x.pool, x.name, x.lastSeenPnlPct, x.realizedPnlPct, x.realizedPnlUsd, x.feesUsd, x.officialPnlSolPct, x.officialPnlSol, x.officialPnlUsd, x.settled, x.holdMinutes, x.entryOrigin, x.entryCls, x.entryEdge, x.entrySigma, x.entrySigmaSource, x.entryFeeRateAtOpen, '', '', '', '', '', '', '', '', x.entryEdgeBasis || ''].map(esc).join(','));
+    else if (x.type === 'COMBO_OPEN') lines.push(['combo_open', new Date(x.finishedAt || x.startedAt).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', x.totalSol, x.depth, x.share, '', '', '', '', '', ''].map(esc).join(','));
   }
-  for (const x of jrRaw.ovr) lines.push(['override', new Date(x.ts).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', x.cls, x.edge, x.sigma, x.feeRate1h, (x.ignoredGates || []).join('|')].map(esc).join(','));
+  for (const x of jrRaw.ovr) lines.push(['override', new Date(x.ts).toISOString(), x.pool, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', x.cls, x.edge, x.sigma, x.feeRate1h, (x.ignoredGates || []).join('|'), x.edgeBasis || ''].map(esc).join(','));
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);

@@ -80,6 +80,9 @@ function loadBackground({ sync = {}, local = {}, session = {}, fetch } = {}) {
     ,windowPerDay: typeof windowPerDay === 'function' ? windowPerDay : null
     ,poolAgeStage: typeof poolAgeStage === 'function' ? poolAgeStage : null
     ,legacyWindowRate: typeof legacyWindowRate === 'function' ? legacyWindowRate : null
+    ,positionFill: typeof positionFill === "function" ? positionFill : null
+    ,summarizePositions: typeof summarizePositions === "function" ? summarizePositions : null
+    ,computeBreakeven: typeof computeBreakeven === "function" ? computeBreakeven : null
   };`;
   vm.runInContext(source + exports, context, { filename: 'background.js' });
   return { api: context.__mql, sync: syncArea.data, local: localArea.data, session: sessionArea.data };
@@ -87,7 +90,9 @@ function loadBackground({ sync = {}, local = {}, session = {}, fetch } = {}) {
 
 test('verdict gates IGNITION on the recommended 12% band, not the 35% settings band', () => {
   const { api } = loadBackground();
-  const feeRate1h = 5.2;
+  // 9.4 (was 5.2): the corrected edge (LP-net fees, sigma^2/(4W) IL) is 0.556x the
+  // old one, so the same scenario needs ~1.8x the fee rate to clear 1.0 at 35%.
+  const feeRate1h = 9.4;
   const sigma = 30;
   const settingsEdge = api.computeEdge(feeRate1h, sigma, 35);
   assert.ok(settingsEdge > 1);
@@ -547,4 +552,60 @@ test('an open young-pool BID ASK position re-arms DECAY once its legacy baseline
   assert.ok(Math.abs(snap.entryFeeRate24h - 6.375 * 24 / 1.68) < 1e-6);
   assert.equal(snap.feeBasis, 'pool-age-v1');
   assert.equal(snap.belowCount, 1);
+});
+
+// ---- fee/IL math and position fill (checked against docs.meteora.ag) ---------
+
+test('edge uses LP-net fees and sigma^2/(4W) IL; breakeven is the IL itself', () => {
+  const { api } = loadBackground();
+  // hand-checkable: fee 20%/day, sigma 100%/day, W 25% -> IL = 100^2/(4*25) = 100%/day
+  assert.equal(api.computeBreakeven(100, 25), 100);
+  // edge = 20 / (1.3 * 100) = 0.1538...
+  assert.ok(Math.abs(api.computeEdge(20, 100, 25) - 20 / 130) < 1e-12);
+  // exactly 0.5556x the old (fee*0.9)/(1.3*sigma^2/(8W)) on any input
+  const old = (f, s, w) => (f * 0.9 / s) / Math.max(1.3 * s / (8 * w), 0.001);
+  for (const [f, s, w] of [[5.2, 30, 35], [147, 459, 12], [40, 60, 20]]) {
+    assert.ok(Math.abs(api.computeEdge(f, s, w) / old(f, s, w) - 4 / (0.9 * 8)) < 1e-9);
+  }
+});
+
+// datapi PositionPnL schema (docs.meteora.ag positions/pnl): amounts are strings
+const accumPos = (over = {}) => ({
+  positionAddress: 'POS', minPrice: '25', maxPrice: '100', poolActivePrice: '60', pnlSolPctChange: -3,
+  allTimeDeposits: { tokenX: { amount: '0', usd: '0' }, tokenY: { amount: '10', usd: '2000' }, total: { usd: '2000', sol: '10' } },
+  allTimeWithdrawals: { tokenX: { amount: '0', usd: '0' }, tokenY: { amount: '0', usd: '0' }, total: { usd: '0' } },
+  unrealizedPnl: { balances: 1900, balancesSol: '9.7', balanceTokenX: { amount: '1234', usd: '...' }, balanceTokenY: { amount: '7.5', usd: '...' },
+    unclaimedFeeTokenX: { amount: '0', usd: '0' }, unclaimedFeeTokenY: { amount: '0', usd: '0' },
+    unclaimedRewardTokenX: { amount: '0', usd: '0' }, unclaimedRewardTokenY: { amount: '0', usd: '0' } },
+  ...over
+});
+
+test('fill = share of deposited SOL already spent, from the real datapi fields', () => {
+  const { api } = loadBackground();
+  // 10 SOL in, 7.5 SOL still in the bins -> 25% of the SOL has bought the token
+  const f = api.positionFill(accumPos(), 60);
+  assert.equal(f.method, 'sol-spent');
+  assert.equal(f.fill, 0.25);
+  // withdrawals reduce the base: 10 in, 2 withdrawn, 6 left -> 2/8 spent
+  const w = api.positionFill(accumPos({ allTimeWithdrawals: { tokenY: { amount: '2' }, tokenX: { amount: '0' }, total: { usd: '0' } },
+    unrealizedPnl: { ...accumPos().unrealizedPnl, balanceTokenY: { amount: '6' } } }), 60);
+  assert.equal(w.fill, 0.25);
+  // a two-sided deposit is not a SOL ladder: no sol-spent fill, falls back (labeled)
+  const two = api.positionFill(accumPos({ allTimeDeposits: { tokenX: { amount: '500' }, tokenY: { amount: '10' }, total: { usd: '1' } } }), 60);
+  assert.equal(two.method, 'traversal');
+  // the linear guess this replaces would have said 53% at this price
+  assert.ok(Math.abs(api.positionFill({ minPrice: '25', maxPrice: '100' }, 60).fill - 40 / 75) < 1e-9);
+});
+
+test('position summary weights PnL by real SOL value and pools fill as total SOL spent', () => {
+  const { api } = loadBackground();
+  const a = accumPos({ positionAddress: 'A', pnlSolPctChange: -10,
+    unrealizedPnl: { ...accumPos().unrealizedPnl, balancesSol: '9', balanceTokenY: { amount: '9' } } });           // 1 of 10 spent
+  const b = accumPos({ positionAddress: 'B', pnlSolPctChange: 10,
+    allTimeDeposits: { tokenX: { amount: '0', usd: '0' }, tokenY: { amount: '30' }, total: { usd: '1', sol: '30' } },
+    unrealizedPnl: { ...accumPos().unrealizedPnl, balancesSol: '27', balanceTokenY: { amount: '15' } } });       // 15 of 30 spent
+  const s = api.summarizePositions([a, b], null);
+  assert.equal(s.fillMethod, 'sol-spent');
+  assert.equal(s.fillPct, Math.round(100 * 16 / 40));          // 40%, not the leg mean (30%)
+  assert.equal(s.pnlPct, Math.round(((-10 * 9 + 10 * 27) / 36) * 10) / 10);   // value-weighted: +5.0
 });

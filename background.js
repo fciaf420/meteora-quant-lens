@@ -354,11 +354,30 @@ function legacyWindowRate(value, windowH, recordedAtMs, poolCreatedAt, basis) {
   return v * windowH / coveredHours(windowH, ageAt);
 }
 
-// edge = (feeRate1h*0.9/max(sigma,0.001)) / max(1.3*sigma/(8*W),0.001)
+// ---- fee vs IL math (checked against docs.meteora.ag DLMM formulas) ----------
+// LP_NET_FEES: datapi's fee_tvl_ratio is ALREADY net of the protocol cut. Proven
+// live 2026-09-27: on a 0.04%-base SOL-USDC pool fees/volume = 0.0382% (below the
+// base fee, impossible for gross fees); (fees + protocol_fees)/volume = 0.0424%.
+// protocol/(fees+protocol) is ~10% standard, ~20% on launch pools, matching the
+// docs. The old extra *0.9 took the cut a second time.
+const LP_NET_FEES = 1.0;
+// IL of a uniform +-W band (W = HALF-width %, sigma = %/day): sigma^2/(4W) %/day.
+// Small-range LVR of concentrated liquidity (sigma^2/8 full-range * 2/w). A DLMM
+// Spot bin simulation (uniform L per bin) fits k = 1.42 vs 1/(4w) = 1.25 at
+// w = 20%, so this is if anything slightly generous. The old sigma^2/(8W) was
+// half of it (and inconsistent with the W/4 cap derived from the same payoff).
+const EDGE_MARGIN = 1.3;
+const EDGE_BASIS = 'il4w-net-v1';   // stamped on stored/shadow edges (old basis read ~1.8x high)
+function ilPerDay(sigma, W) {
+  const s = num(sigma);
+  return (s * s) / (4 * Math.max(num(W), 0.001));
+}
+// edge = LP fee rate / (EDGE_MARGIN * IL): >= 1 means fees clear IL with margin.
+// Same guard structure as before so tiny sigma cannot divide by zero.
 function computeEdge(feeRate1h, sigma, W) {
   const s = Math.max(num(sigma), 0.001);
-  const numer = num(feeRate1h) * 0.9 / s;
-  const denom = Math.max(1.3 * num(sigma) / (8 * W), 0.001);
+  const numer = num(feeRate1h) * LP_NET_FEES / s;
+  const denom = Math.max(EDGE_MARGIN * num(sigma) / (4 * Math.max(num(W), 0.001)), 0.001);
   return numer / denom;
 }
 
@@ -493,10 +512,9 @@ function computeBidAskSignal(d, now) {
   };
 }
 
-// breakevenFeePerDay = sigma*sigma/(8*W) / 0.9 * 1.0
+// LP fee/day a +-W band needs just to offset expected IL (no margin)
 function computeBreakeven(sigma, W) {
-  const s = num(sigma);
-  return (s * s) / (8 * W) / 0.9 * 1.0;
+  return ilPerDay(sigma, W) / LP_NET_FEES;
 }
 
 // path classification
@@ -747,7 +765,12 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
   const baseFeePct = num(pick(p, 'pool_config.base_fee_pct', 'base_fee_pct', 'base_fee_percentage', 'baseFeePct'), 0);
   const currentPrice = num(pick(p, 'current_price', 'currentPrice', 'price'), 0);
   const poolCreatedAt = pick(p, 'created_at', 'createdAt');
-  const poolMeta = { name, address, tvl, binStep, baseFeePct, currentPrice,
+  // Collect Fee Mode (docs: 0 = InputOnly, fees in the token ENTERING the swap;
+  // 1 = OnlyY, fees always in token Y). For a below-price SOL ladder, sellers
+  // bring token X into your bins, so InputOnly pays you in the token you buy.
+  const cfmRaw = pick(p.pool_config || {}, 'collect_fee_mode', 'collectFeeMode');
+  const collectFeeMode = (cfmRaw === 0 || cfmRaw === 1) ? (cfmRaw === 1 ? 'OnlyY' : 'InputOnly') : null;
+  const poolMeta = { name, address, tvl, binStep, baseFeePct, currentPrice, collectFeeMode,
     createdAt: poolCreatedAt,
     tokenX: pair.tokenX, tokenY: pair.tokenY, supportedSolPair: pair.supportedSolPair };
 
@@ -760,7 +783,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
   const feeRate24h = windowPerDay(pick(ftr, '24h', '24H', 'h24'), 24, poolAgeH);
   const feeRate1h = windowPerDay(pick(ftr, '1h', '1H', 'h1'), 1, poolAgeH);
   const feeWindowH = coveredHours(24, poolAgeH);   // hours behind feeRate24h ("since launch" when <24)
-  const ageCtx = { poolAgeH, poolStage, feeWindowH, feeBasis: FEE_BASIS };
+  const ageCtx = { poolAgeH, poolStage, feeWindowH, feeBasis: FEE_BASIS, edgeBasis: EDGE_BASIS };
 
   // trend (meaningless until there is at least an hour of fee history)
   let trend = 'steady';
@@ -1348,6 +1371,7 @@ async function getRadar() {
         // fee-rate basis tag: rows before this field used the full-window divisor,
         // so replay must not mix young-pool fr/ac values across the two bases
         fb: d.feeBasis || null, pAgeH: d.poolAgeH != null ? +d.poolAgeH.toFixed(2) : null,
+        eb: d.edgeBasis || null,
         dd: d.ddHigh != null ? Math.round(d.ddHigh) : null,
         sig: (d.verdict && d.verdict.class !== 'NONE') ? d.verdict.class : (d.bidAsk && d.bidAsk.ready ? 'BID_ASK' : null),
         w: (d.recommendation && d.recommendation.plan && d.recommendation.plan.widthPct) || null,
@@ -1389,26 +1413,25 @@ async function postDiscord(url, content) {
 function clampB(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
 // ---- position summarization (ACCUM/COMBO-aware) ---------------------------
-// Fill fraction of a below-price accumulation position = token-side share of
-// position value. Prefers explicit value fields from the pnl API; falls back to
-// amount*price if scales look sane; last resort = linear price-traversal
-// estimate (honest approximation, labeled as such downstream). Never fakes math.
+// Fill of a below-price SOL ladder = share of the deposited SOL that swaps have
+// already spent buying the token:  1 - SOL still in the bins / net SOL deposited.
+// Fields per the datapi PositionPnL schema (docs.meteora.ag, positions pnl):
+//   unrealizedPnl.balanceTokenY.amount (current SOL in bins, fees excluded)
+//   allTimeDeposits.tokenY.amount / allTimeWithdrawals.tokenY.amount
+// The previous version read currentXValue/totalXAmount, which that schema does
+// not have, so it always fell through to the price-traversal guess ("fill:
+// unknown" / linear), and a value share would understate SOL spent once price
+// sits below your average buy. Only meaningful for SOL-only deposits.
 function positionFill(pos, cur) {
   try {
-    const xVal = num(pick(pos, 'currentXValue', 'current_x_value', 'xValueUsd', 'totalXValueUsd', 'currentTokenXValue'), NaN);
-    const yVal = num(pick(pos, 'currentYValue', 'current_y_value', 'yValueUsd', 'totalYValueUsd', 'currentTokenYValue'), NaN);
-    if (isFinite(xVal) && isFinite(yVal) && (xVal + yVal) > 0) {
-      const f = xVal / (xVal + yVal);
-      if (f >= 0 && f <= 1) return { fill: f, method: 'value' };
-    }
-    const xAmt = num(pick(pos, 'totalXAmount', 'total_x_amount', 'xAmount', 'amountX'), NaN);
-    const yAmt = num(pick(pos, 'totalYAmount', 'total_y_amount', 'yAmount', 'amountY'), NaN);
-    if (isFinite(xAmt) && isFinite(yAmt) && isFinite(cur) && cur > 0) {
-      const xv = xAmt * cur, tot = xv + yAmt;
-      if (tot > 0) {
-        const f = xv / tot;
-        if (f >= 0 && f <= 1) return { fill: f, method: 'amount' };
-      }
+    const depX = num(pick(pos, 'allTimeDeposits.tokenX.amount'), NaN);
+    const depY = num(pick(pos, 'allTimeDeposits.tokenY.amount'), NaN);
+    const wdY = num(pick(pos, 'allTimeWithdrawals.tokenY.amount'), 0);
+    const balY = num(pick(pos, 'unrealizedPnl.balanceTokenY.amount'), NaN);
+    const netY = depY - (isFinite(wdY) ? wdY : 0);
+    if (isFinite(netY) && netY > 0 && isFinite(balY) && balY >= 0 && !(depX > 0)) {
+      const spentY = Math.max(0, netY - balY);
+      return { fill: Math.min(1, spentY / netY), method: 'sol-spent', spentY, netY };
     }
     const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice);
     if (isFinite(minP) && isFinite(maxP) && maxP > minP && isFinite(cur)) {
@@ -1440,10 +1463,12 @@ function summarizePositions(ps, entryPlan) {
   const maxAll = Math.max(...legs.map((l) => l.maxPrice));
   const midAll = (minAll + maxAll) / 2;
   const wAll = midAll > 0 ? Math.round(((maxAll - minAll) / 2 / midAll) * 100) : 20;
-  // aggregate PnL: value-weighted when the API exposes position value, else simple mean
+  // aggregate PnL: weighted by current position value in SOL (datapi
+  // unrealizedPnl.balancesSol; the old field names did not exist, so this was
+  // always a simple mean), else simple mean
   let wsum = 0, vsum = 0, weighted = true;
   for (let i = 0; i < ps.length; i++) {
-    const tv = num(pick(ps[i], 'totalValue', 'total_value', 'currentValue', 'current_value', 'positionValue', 'totalCurrentValue'), NaN);
+    const tv = num(pick(ps[i], 'unrealizedPnl.balancesSol', 'unrealizedPnl.balances'), NaN);
     if (!isFinite(tv) || tv <= 0) { weighted = false; break; }
     wsum += legs[i].pnlPct * tv; vsum += tv;
   }
@@ -1466,12 +1491,17 @@ function summarizePositions(ps, entryPlan) {
     profile = inferredAccum ? 'ACCUM_INFERRED' : 'TRADE_INFERRED';
   }
   const accum = profile === 'ACCUM' || profile === 'ACCUM_INFERRED';
-  let fillSum = 0, fillN = 0, fillMethod = null;
+  // pool-level fill: total SOL spent / total SOL deposited when every leg has
+  // exact SOL figures, else the mean of whatever each leg could report
+  let fillSum = 0, fillN = 0, fillMethod = null, spentSum = 0, netSum = 0, allExact = true;
   for (let i = 0; i < ps.length; i++) {
     const f = positionFill(ps[i], cur);
     if (f.fill != null) { fillSum += f.fill; fillN++; if (!fillMethod) fillMethod = f.method; legs[i].fillPct = Math.round(f.fill * 100); }
+    if (f.method === 'sol-spent') { spentSum += f.spentY; netSum += f.netY; } else allExact = false;
   }
-  const fillPct = fillN ? Math.round((fillSum / fillN) * 100) : null;
+  const fillPct = (allExact && netSum > 0) ? Math.round((spentSum / netSum) * 100)
+    : (fillN ? Math.round((fillSum / fillN) * 100) : null);
+  if (allExact && netSum > 0) fillMethod = 'sol-spent';
   return {
     ok: true, has: true,
     count: legs.length,
@@ -1614,7 +1644,7 @@ async function watchPositions() {
         && typeof pd.feeRate1h === 'number' && isFinite(pd.feeRate1h)
         && typeof pd.ofi1h === 'number' && isFinite(pd.ofi1h)
         && typeof pd.pc1h === 'number' && isFinite(pd.pc1h));
-      const poolFill = { sum: 0, n: 0 };   // aggregate fill across accumulation legs (COMBO-aware)
+      const poolFill = { sum: 0, n: 0, spent: 0, net: 0, exact: true };   // aggregate fill across accumulation legs (COMBO-aware)
       for (const pos of pr.json.positions) {
         const key = pool + ':' + (pos.positionAddress || '');
         seen[key] = true;
@@ -1731,6 +1761,7 @@ async function watchPositions() {
           msgs.FLOW = '🩸 DISTRIBUTION INTO YOUR BAND: ' + name + ' — organic sellers ' + (ofi1h != null ? ofi1h.toFixed(1) : '?') + ':1 while price ' + (pc1h != null ? pc1h.toFixed(1) : '?') + '%/1h. You are the exit liquidity for the token you are accumulating. PnL ' + pnl.toFixed(1) + '%';
           const pf = positionFill(pos, cur);
           if (pf.fill != null) { poolFill.sum += pf.fill; poolFill.n++; }
+          if (pf.method === 'sol-spent') { poolFill.spent += pf.spentY; poolFill.net += pf.netY; } else poolFill.exact = false;
         }
         for (const k of Object.keys(cond)) {
           const skey = key + ':' + k;
@@ -1756,7 +1787,8 @@ async function watchPositions() {
       }
       // pool-level fill crossings for accumulation books (averaged across combo legs)
       if (poolFill.n) {
-        const fp = (poolFill.sum / poolFill.n) * 100;
+        const fp = (poolFill.exact && poolFill.net > 0)
+          ? (poolFill.spent / poolFill.net) * 100 : (poolFill.sum / poolFill.n) * 100;
         for (const th of [25, 50, 75]) {
           const fkey = pool + ':FILL_' + th;
           seen[fkey] = true; // protect from state pruning below
@@ -1827,7 +1859,7 @@ async function watchPositions() {
         // ---- ENTRY-CONTEXT JOIN: stitch the entry-time signal snapshot into the
         // close row so the journal is a calibration dataset (trade-origin-tagged
         // per the standing rule), not just a diary.
-        let entryOrigin = 'untracked', entryCls = null, entryEdge = null, entrySigma = null, entrySigmaSource = null;
+        let entryOrigin = 'untracked', entryCls = null, entryEdge = null, entrySigma = null, entrySigmaSource = null, entryEdgeBasis = null;
         try {
           const planC = plans[rec.pool] || null;
           const ovrsC = ovrAll.filter((o) => o.pool === rec.pool && Date.now() - (o.ts || 0) < 7 * 86400e3);
@@ -1836,18 +1868,20 @@ async function watchPositions() {
             entryOrigin = 'override'; entryCls = ovrC.cls || null;
             entryEdge = (ovrC.edge != null) ? ovrC.edge : null;
             entrySigma = (ovrC.sigma != null) ? ovrC.sigma : null;
+            entryEdgeBasis = ovrC.edgeBasis || null;
           } else if (planC) {
             entryOrigin = 'signal'; entryCls = planC.cls || null;
             entryEdge = (planC.entryEdge != null) ? planC.entryEdge : null;
             entrySigma = (planC.entrySigma != null) ? planC.entrySigma : null;
             entrySigmaSource = planC.entrySigmaSource || null;
+            entryEdgeBasis = planC.entryEdgeBasis || null;   // null = pre-v0.7.13 edge (read ~1.8x high)
           }
         } catch (e) {}
         logArr.push({ pool: rec.pool, name: rec.name, wallet: rec.wallet || null, positionAddress: posAddr, ownerAddress,
           evSigs, evTokenMint, evWindow,
           settled: false, lastSeenPnlPct: rec.pnl,
           realizedPnlPct, realizedPnlUsd, feesUsd,
-          entryOrigin, entryCls, entryEdge, entrySigma, entrySigmaSource,
+          entryOrigin, entryCls, entryEdge, entrySigma, entrySigmaSource, entryEdgeBasis,
           entryFeeRateAtOpen: (rec.entryFeeRate != null ? Math.round(rec.entryFeeRate * 100) / 100 : null),
           openedFirstSeen: rec.firstSeen, closedDetected: Date.now(),
           holdMinutes: Math.round((Date.now() - rec.firstSeen) / 60e3) });

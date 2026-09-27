@@ -78,8 +78,22 @@ Three estimators in a quality ladder, chosen automatically:
 ### EDGE — the core number
 
 ```
-edge = fee income ÷ expected IL   (at a given band width)
+edge = LP fee rate ÷ (1.3 × IL)        IL = σ² ÷ (4W)   %/day
 ```
+
+σ is realized volatility in %/day and W is the band's half-width in % (±W).
+`σ²/(4W)` is the small-range impermanent-loss rate of a uniform band (the
+full-range `σ²/8` concentrated by `2/W`); a DLMM Spot bin simulation lands
+slightly above it, so it is not pessimistic. The fee rate is Meteora's
+`fee_tvl_ratio`, which is **already net of the protocol cut**: on every pool
+checked, `fees ÷ volume` sits below the base fee and `(fees + protocol_fees) ÷
+volume` restores it (cut ≈10% standard, ≈20% launch pools, as in Meteora's
+formulas page), so nothing more is deducted.
+
+Before v0.7.13 the IL term was `σ²/(8W)` (half) and the fee was cut by 0.9 a
+second time, so edge read **1.8× too high**. Gate thresholds were left as they
+were, so entries are now correspondingly stricter; shadow and journal rows carry
+`eb` / `edgeBasis` so old and new edges are never compared directly.
 
 `≥1` means the pool-wide fee rate clears this IL proxy with its safety margin.
 It is a screening heuristic, not a profit estimate: it does not model the bins
@@ -113,8 +127,10 @@ Two things worth understanding:
 - **Edge sparkline** — 60 minutes of edge history with a dashed line at the 1.0
   gate, so you can see whether the current reading is a trend or a blip.
 - **Form guardian** — under the range picker: the fee/day a `±W%` band needs to
-  break even vs what the pool actually pays, plus a warning if Meteora's
-  Auto-Fill silently resets your Min/Max range.
+  break even (`σ²/(4W)`) vs what the pool actually pays, plus a warning if Meteora's
+  Auto-Fill silently resets your Min/Max range. A one-sided range (entirely below
+  or above price) is a limit ladder that only trades when price moves into it, so
+  it says so instead of showing a two-sided breakeven.
 
 ### New pools (pool age, not token age)
 
@@ -187,6 +203,18 @@ buyers present, persistent volume, and no unbought freefall. **Guide Bid-Ask + S
 state survives page reloads. You choose the SOL amount; the extension only fills
 the form and every leg still requires your wallet approval.
 
+The card also shows, for the pool's bin step, how many bins the range needs
+(`P_i = (1 + binStep/10000)^i`, one position holds at most 1,400) and the
+worst-case non-refundable bin-array rent (~0.075 SOL per 70-bin array nobody has
+used yet; Meteora shows the exact cost before you sign), plus which token the
+pool pays fees in: on `InputOnly` pools, sellers hitting your bins pay fees in
+the token you are buying, not SOL.
+
+**Fill %** is the share of your deposited SOL already spent buying the token:
+`1 − SOL still in the bins ÷ net SOL deposited`, from Meteora's position data
+(`unrealizedPnl.balanceTokenY`, `allTimeDeposits/Withdrawals.tokenY`). Only when
+that is missing does it fall back to a labeled linear price-traversal guess.
+
 Accumulation books get their own rulebook: no scalp TP/SL, and price falling into
 the band is *the design*, not a failure. The only kill-rule is the token dying
 while you accumulate — fee-decay **and** flow-flip together.
@@ -235,7 +263,8 @@ node candle-analysis.cjs <POOL_ADDRESS> --json
 
 ### Cap-aware take-profits
 
-A two-sided band's maximum price-driven gain is exactly **W/4** — above the band
+A two-sided band's maximum price-driven gain is about **W/4** (a uniform-bin
+simulation gives 4.5% at ±20% and 7.4% at ±35%, so slightly less) — above the band
 you're 100% quote and done. Everything beyond that must come from fees. TPs are
 computed against that cap rather than set optimistically, so a TP you see is a
 number the position can actually reach. Pump-outs are booked by the OOR-UP rule
