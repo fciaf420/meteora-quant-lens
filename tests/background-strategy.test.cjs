@@ -76,6 +76,10 @@ function loadBackground({ sync = {}, local = {}, session = {}, fetch } = {}) {
     ,chooseRadarBidCandidates: typeof chooseRadarBidCandidates === 'function' ? chooseRadarBidCandidates : null
     ,radarBidAskFresh: typeof radarBidAskFresh === 'function' ? radarBidAskFresh : null
     ,loadCandleEvidence: typeof loadCandleEvidence === 'function' ? loadCandleEvidence : null
+    ,buildPoolData: typeof buildPoolData === 'function' ? buildPoolData : null
+    ,windowPerDay: typeof windowPerDay === 'function' ? windowPerDay : null
+    ,poolAgeStage: typeof poolAgeStage === 'function' ? poolAgeStage : null
+    ,legacyWindowRate: typeof legacyWindowRate === 'function' ? legacyWindowRate : null
   };`;
   vm.runInContext(source + exports, context, { filename: 'background.js' });
   return { api: context.__mql, sync: syncArea.data, local: localArea.data, session: sessionArea.data };
@@ -230,16 +234,19 @@ test('watcher confirms BID ASK fee decay on two distinct pool snapshots', async 
     fetch: fakeFetch
   });
   const data = (ts) => ({ ok: true, pool: { name: 'TOK-SOL' }, feeRate1h: 4, feeRate24h: 8, ofi1h: 1, pc1h: 1, surge: 1, path: 'CHOP', sigma: 100, ts });
-  api.poolCache.set(pool, { ts: Date.now(), data: data(Date.now() - 30_000) });
+  // Explicit, distinct snapshot times. Date.now() - 30_000 twice in the same
+  // millisecond produced two "distinct" samples with one timestamp (flaky ~50%).
+  const t0 = Date.now();
+  api.poolCache.set(pool, { ts: Date.now(), data: data(t0 - 40_000) });
   await api.watchPositions();
   await api.watchPositions();
   assert.equal(local.mqlLastPos[`${pool}:${position}`].belowCount, 1);
   assert.equal(webhookBodies.some((body) => body.content.includes('BID ASK WAIT')), false);
-  api.poolCache.set(pool, { ts: Date.now(), data: data(Date.now() - 30_000) });
+  api.poolCache.set(pool, { ts: Date.now(), data: data(t0 - 30_000) });
   await api.watchPositions();
   assert.equal(local.mqlLastPos[`${pool}:${position}`].belowCount, 2);
   assert.equal(webhookBodies.some((body) => body.content.includes('BID ASK WAIT')), true);
-  api.poolCache.set(pool, { ts: Date.now(), data: { ...data(Date.now() - 30_000), ofi1h: null } });
+  api.poolCache.set(pool, { ts: Date.now(), data: { ...data(t0 - 20_000), ofi1h: null } });
   await api.watchPositions();
   assert.equal(local.mqlLastPos[`${pool}:${position}`].belowCount, 2);
   assert.equal(webhookBodies.some((body) => body.content.includes('current fee/organic-flow data is unavailable')), true);
@@ -404,4 +411,140 @@ test('invalid candle history is not sanitized into a trusted restart cache', asy
   const secondWorker = loadBackground({ fetch: conflictingFetch, session: firstWorker.session });
   await secondWorker.api.loadCandleEvidence('BAD', Date.now() - 48 * 3600e3);
   assert.ok(requests > 0);
+});
+
+// ---- pool-age-aware fee rates (NEARPAD-SOL, 2026-09-27) --------------------
+// Live numbers: pool 1.68h old, fee_tvl_ratio 1h 6.1257 and 2h=4h=12h=24h 6.375
+// (every window past the pool's age is the same since-creation total).
+
+test('window rates are divided by the hours the window actually covered', () => {
+  const { api } = loadBackground();
+  // young pool: "24h" is really 1.68h of fees
+  assert.ok(Math.abs(api.windowPerDay(6.375, 24, 1.68) - 6.375 * 24 / 1.68) < 1e-9);   // ~91%/day, not 6.4
+  assert.ok(Math.abs(api.windowPerDay(6.1257, 1, 1.68) - 6.1257 * 24) < 1e-9);         // full 1h window: unchanged
+  // mature pool and unknown age: unchanged from the old math
+  assert.equal(api.windowPerDay(6.375, 24, 100), 6.375);
+  assert.equal(api.windowPerDay(6.375, 24, null), 6.375);
+  // 20-minute pool: its 1h window holds 20 minutes of fees
+  assert.ok(Math.abs(api.windowPerDay(1, 1, 1 / 3) - 72) < 1e-9);
+  // minutes-old pool is floored at 15 minutes of coverage, never divides by ~0
+  assert.equal(api.windowPerDay(1, 1, 2 / 60), 96);
+  assert.equal(api.poolAgeStage(0.5), 'LAUNCH');
+  assert.equal(api.poolAgeStage(1.68), 'YOUNG');
+  assert.equal(api.poolAgeStage(24), 'MATURE');
+  assert.equal(api.poolAgeStage(null), 'UNKNOWN');
+});
+
+test('buildPoolData reports NEARPAD at its real since-launch rate and age-corrects accel', async () => {
+  const now = Date.now();
+  const createdAt = now - 1.68 * 3600e3;
+  const seed = {
+    address: 'NEARPAD', name: 'NEARPAD-SOL', current_price: 1, tvl: 215000, dynamic_fee_pct: 2,
+    created_at: createdAt, _mqlBoardTs: now,
+    token_x: { address: 'TOKEN' }, token_y: { address: 'So11111111111111111111111111111111111111112' },
+    pool_config: { base_fee_pct: 2, bin_step: 100 },
+    fee_tvl_ratio: { '30m': 4.97, '1h': 6.1257, '2h': 6.375, '4h': 6.375, '12h': 6.375, '24h': 6.375 },
+    volume: { '30m': 100000, '1h': 300000, '4h': 465000, '24h': 465000 }
+  };
+  const { api } = loadBackground({ fetch: async () => ({ ok: true, json: async () => ({ data: [] }) }) });
+  const d = await api.buildPoolData('NEARPAD', { mqlWidthPct: 20 }, seed);
+  assert.equal(d.ok, true);
+  assert.equal(d.poolStage, 'YOUNG');
+  assert.equal(d.feeBasis, 'pool-age-v1');
+  assert.ok(Math.abs(d.feeRate24h - 6.375 * 24 / 1.68) < 0.5, 'since-launch %/day, not 6.4');
+  assert.ok(Math.abs(d.feeRate1h - 6.1257 * 24) < 1e-6);
+  // accel = hourly pace over 30m vs hourly pace over the 1.68h the "4h" window covered
+  const expectedAccel = (100000 / 0.5) / (465000 / 1.68);
+  assert.ok(Math.abs(d.accel - expectedAccel) < 0.01);
+  assert.ok(d.accel < (100000 * 48) / (465000 * 6), 'old fixed-4h divisor inflated accel');
+});
+
+test('BID ASK fee persistence passes a young pool on its real rate and holds a sub-1h pool', () => {
+  const { api } = loadBackground();
+  const now = 5_000_000;
+  const base = {
+    ok: true, ts: now - 30_000, supportedSolPair: true,
+    mintAuthorityDisabled: true, freezeAuthorityDisabled: true,
+    topHoldersPct: 13, orgBuy1h: 100, path: 'GRIND-UP', ofi1h: 0.96, sigma: 459, ddHigh: 15,
+    candleAnalysis: null
+  };
+  const feeGate = (s) => s.gates.find((g) => g.key === 'fees');
+  // old math: 24h read as 6.4%/day -> failed the 8%/day floor
+  assert.equal(feeGate(api.computeBidAskSignal({ ...base, feeRate1h: 147, feeRate24h: 6.375, poolAgeH: 1.68 }, now)).pass, false);
+  // age-corrected: ~91%/day since launch, 1h 147 >= half of it -> passes
+  assert.equal(feeGate(api.computeBidAskSignal({ ...base, feeRate1h: 147, feeRate24h: 91.07, poolAgeH: 1.68 }, now)).pass, true);
+  // 30-minute-old pool: not enough fee history to judge persistence, says so plainly
+  const launch = api.computeBidAskSignal({ ...base, feeRate1h: 300, feeRate24h: 300, poolAgeH: 0.5 }, now);
+  assert.equal(feeGate(launch).pass, false);
+  assert.match(feeGate(launch).label, /30m old; needs 1h of fees/);
+});
+
+test('no class issues an entry on under an hour of fee history, but the scalp override stays reachable', () => {
+  const { api } = loadBackground();
+  const m = {
+    feeRate1h: 40, sigma: 30, supportedSolPair: true,
+    surge: 1.3, accel: 1.3, organicScore: 80, path: 'CHOP', ageH: 100,
+    ofi1h: 1, ofi6h: 0.8, tvl: 200000, floorPct: 10,
+    currentPrice: 100, low6h: 90, dayLow: 80,
+    mintAuthorityDisabled: true, freezeAuthorityDisabled: true
+  };
+  assert.equal(api.computeVerdict({ ...m, poolAgeH: 5 }).class, 'IGNITION');
+  assert.equal(api.computeVerdict({ ...m, poolAgeH: null }).class, 'IGNITION');
+  const held = api.computeVerdict({ ...m, poolAgeH: 0.5 });
+  assert.equal(held.class, 'NONE');
+  assert.ok(held.reasons.some((r) => r.includes('pool fee history>=1h')));
+  const rec = api.buildRecommendation({ ...m, verdict: held, recipeEdges: { IGNITION: 3, BASING: 0, CARRY: 0 },
+    poolStage: 'LAUNCH', poolAgeH: 0.5 });
+  assert.equal(rec.action, 'WAIT');
+  assert.equal(rec.override && rec.override.cls, 'SCALP');
+  assert.match(rec.override.ignoredGates[0], /30m old/);
+});
+
+test('baselines stored under the old math are rescaled by pool age at record time', () => {
+  const { api } = loadBackground();
+  const created = 1_000_000_000_000;
+  const at = created + 1.68 * 3600e3;
+  // legacy "24h normal" 6.375 recorded when the pool was 1.68h old -> ~91%/day
+  assert.ok(Math.abs(api.legacyWindowRate(6.375, 24, at, created, undefined) - 6.375 * 24 / 1.68) < 1e-9);
+  // already on the new basis, a mature record, or unknown pool age: untouched
+  assert.equal(api.legacyWindowRate(91, 24, at, created, 'pool-age-v1'), 91);
+  assert.equal(api.legacyWindowRate(6.375, 24, created + 30 * 3600e3, created, undefined), 6.375);
+  assert.equal(api.legacyWindowRate(6.375, 24, at, null, undefined), 6.375);
+  // legacy 1h rate recorded at 30 minutes old held only 30 minutes of fees
+  assert.equal(api.legacyWindowRate(50, 1, created + 0.5 * 3600e3, created, undefined), 100);
+  assert.equal(api.legacyWindowRate(0, 24, at, created, undefined), null);
+});
+
+test('an open young-pool BID ASK position re-arms DECAY once its legacy baseline is rescaled', async () => {
+  const pool = 'YOUNGPOOL';
+  const position = 'YOUNGPOS';
+  const now = Date.now();
+  const created = now - 3 * 3600e3;
+  const planTs = created + 1.68 * 3600e3;   // entered when the pool was 1.68h old
+  const fakeFetch = async (url) => {
+    if (url.includes('/portfolio/open?user=WALLET')) return { ok: true, json: async () => ({ pools: [{ address: pool }] }) };
+    if (url.includes(`/positions/${pool}/pnl?user=WALLET&status=open`)) return { ok: true, json: async () => ({ positions: [{
+      positionAddress: position, createdAt: Math.floor((planTs + 60_000) / 1000), minPrice: 25, maxPrice: 100,
+      poolActivePrice: 90, pnlSolPctChange: -2,
+      allTimeDeposits: { tokenX: { usd: 0 }, total: { usd: 100 } }
+    }] }) };
+    if (url === 'https://hook.example') return { ok: true, json: async () => ({}) };
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  const { api, local } = loadBackground({
+    sync: { webhookUrl: 'https://hook.example', walletAddress: 'WALLET' },
+    // journaled by the old code: "24h normal" 6.375 was really 1.68h of fees
+    local: { mqlEntryPlan: { [pool]: { pool, ts: planTs, cls: 'BID_ASK', profile: 'ACCUM', widthPct: 60,
+      entryFeeRate: 225, entryFeeRate24h: 6.375 } } },
+    fetch: fakeFetch
+  });
+  // fee rate has fallen to 60%/day: below half of entry (112.5) AND below the real
+  // since-launch normal (~91). Under the old baseline (6.4) this could never count.
+  api.poolCache.set(pool, { ts: Date.now(), data: { ok: true, pool: { name: 'YOUNG-SOL', createdAt: created },
+    feeRate1h: 60, feeRate24h: 70, ofi1h: 1, pc1h: -1, surge: 1, path: 'CHOP', sigma: 300, ts: now - 20_000 } });
+  await api.watchPositions();
+  const snap = local.mqlLastPos[`${pool}:${position}`];
+  assert.ok(Math.abs(snap.entryFeeRate24h - 6.375 * 24 / 1.68) < 1e-6);
+  assert.equal(snap.feeBasis, 'pool-age-v1');
+  assert.equal(snap.belowCount, 1);
 });

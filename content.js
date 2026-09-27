@@ -21,6 +21,33 @@
   // Total Bins to 69/70. We treat these as "reset" indicators.
   var DEFAULT_BIN_COUNTS = [69, 70];
 
+  // ---- pool-age-aware fee baselines (mirror of background.js) ------------
+  // Baselines stored before this basis divided a young pool's since-creation
+  // fee/TVL by the full window (a 1.7h pool's "24h normal" read ~14x too low).
+  // Rescale them by the pool's age when they were recorded.
+  var FEE_BASIS = "pool-age-v1";
+  function poolAgeHoursAt(createdAt, atMs) {
+    var n = Number(createdAt);
+    if (!isFinite(n) || n <= 0) return null;
+    var ms = n > 1e11 ? n : n * 1000;
+    var h = (Number(atMs) - ms) / 3600e3;
+    return isFinite(h) && h >= 0 ? h : null;
+  }
+  function legacyWindowRate(value, windowH, recordedAtMs, poolCreatedAt, basis) {
+    var v = Number(value);
+    if (!(v > 0)) return null;
+    if (basis === FEE_BASIS) return v;
+    var ageAt = poolAgeHoursAt(poolCreatedAt, recordedAtMs);
+    if (ageAt == null || ageAt >= windowH) return v;
+    return v * windowH / Math.min(windowH, Math.max(ageAt, 0.25));
+  }
+  // "24h" label for a pool rate: since launch when the pool is younger than a day
+  function feeWindowLabel(d) {
+    if (!d || d.poolStage === "MATURE" || d.poolStage === "UNKNOWN" || !isFinite(Number(d.poolAgeH))) return "24h";
+    var h = Number(d.poolAgeH);
+    return "since launch (" + (h < 1 ? Math.max(1, Math.round(h * 60)) + "m" : (Math.round(h * 10) / 10) + "h") + ")";
+  }
+
   // ---- module state ------------------------------------------------------
   var state = {
     pool: null,          // current pool address
@@ -617,7 +644,7 @@
       var total = isFinite(Number(comboUI.total)) && Number(comboUI.total) > 0 ? Number(comboUI.total) : 1.0;
       body.appendChild(el("div", "mql-accum-line mql-muted",
         "σ " + fmtNum(d.sigma, 0) + "%/d → depth " + chk.depth + "% · fees 1h " + fmtNum(d.feeRate1h, 1) +
-        " vs 24h " + fmtNum(d.feeRate24h, 1) + "%/d (persisting) · OFI " + fmtNum(d.ofi1h, 2)));
+        " vs " + feeWindowLabel(d) + " " + fmtNum(d.feeRate24h, 1) + "%/d (persisting) · OFI " + fmtNum(d.ofi1h, 2)));
       appendCandleEvidence(body, d.candleAnalysis || (chk.signal && chk.signal.candleAnalysis), chk.signal && chk.signal.candleQualification);
       body.appendChild(el("div", "mql-rec-warn", "⚠ directional bag risk: if the token dies you own it the whole way down — size for total loss"));
       body.appendChild(el("div", "mql-accum-prior", "uncalibrated heuristic · pool-wide fees and position costs are not modeled"));
@@ -923,6 +950,7 @@
     var entryContext = {
       feeRate1h: startData.feeRate1h,
       feeRate24h: startData.feeRate24h,
+      feeBasis: startData.feeBasis || null,
       edge: startData.edge,
       sigma: startData.sigma,
       sigmaSource: startData.sigmaSource
@@ -933,6 +961,7 @@
       totalSol: amount.totalSol,
       entryFeeRate: (entryContext.feeRate1h > 0) ? entryContext.feeRate1h : null,
       entryFeeRate24h: (entryContext.feeRate24h > 0) ? entryContext.feeRate24h : null,
+      feeBasis: entryContext.feeBasis || undefined,
       entryEdge: (entryContext.edge != null) ? Math.round(entryContext.edge * 100) / 100 : null,
       entrySigma: (entryContext.sigma != null) ? Math.round(entryContext.sigma * 10) / 10 : null,
       entrySigmaSource: entryContext.sigmaSource || null };
@@ -1014,7 +1043,7 @@
   var MQL_TIPS = {
     "verdict": "The bottom line. The Lens tests this pool against three entry playbooks (SCALP / REVERSION / CARRY). NO ENTRY means none of them clear their bars \u2014 whatever the APR looks like.",
     "edge": "Pool-wide fee/IL heuristic at the shown width. It does not model your bin shape, active-liquidity share, one-sided inventory path, execution costs, or rewards. Use it as a screening gate, not a profit forecast.",
-    "fee": "The truth about yield. The site's 24h number is backward-looking; the 1h rate is what the pool pays RIGHT NOW, annualized to %/day. \u25b2 HEATING = accelerating. \u25bc COOLING = the party already happened.",
+    "fee": "The truth about yield. The site's 24h number is backward-looking; the 1h rate is what the pool pays RIGHT NOW, annualized to %/day. On a pool younger than a day, the comparison rate is fees since launch divided by the pool's real age (Meteora's 24h window only covers the time the pool has existed). Under 1h old the rate is provisional and no entry can pass. \u25b2 HEATING = accelerating. \u25bc COOLING = the party already happened.",
     "sigma": "Realized volatility, %/day \u2014 EWMA over the last ~4h of 5m closes. A trailing ~ means the token is too fresh for candle data (<30 min): the number is the legacy single-print estimate, typically inflated on launches \u2014 trust it less. High \u03c3 means high IL risk: the same fees buy you much less safety.",
     "surge": "DLMM raises fees automatically during volatility (the accumulator). Surge = current dynamic fee \u00f7 base fee. \u22651.25x = the premium is elevated \u2014 the best moments to provide liquidity. ~0 = premium fully decayed.",
     "accel": "Volume acceleration: last-30-min pace vs last-4h pace. \u22651.2x = flow is building (a catalyst). Below 1 = activity fading \u2014 you'd be arriving after the party.",
@@ -1186,17 +1215,26 @@
       document.documentElement.setAttribute("data-mql-pw", "storage-cb");
       var base = st.mqlPosBaseline[state.pool];
       if (!base) {
-        base = { entryFeeRate: d.feeRate1h, feeRate24h: d.feeRate24h, sigma: d.sigma, ts: Date.now() };
+        base = { entryFeeRate: d.feeRate1h, feeRate24h: d.feeRate24h, sigma: d.sigma, ts: Date.now(),
+          feeBasis: d.feeBasis || undefined };
         st.mqlPosBaseline[state.pool] = base;
         chrome.storage.local.set({ mqlPosBaseline: st.mqlPosBaseline });
       }
+      var poolCreated = d.pool && d.pool.createdAt;
+      base = Object.assign({}, base, {
+        entryFeeRate: legacyWindowRate(base.entryFeeRate, 1, base.ts, poolCreated, base.feeBasis) || base.entryFeeRate,
+        feeRate24h: legacyWindowRate(base.feeRate24h, 24, base.ts, poolCreated, base.feeBasis) || base.feeRate24h
+      });
       var boundPlan = (state.entryPlan && state.entryPlan.pool === state.pool &&
         Date.now() - (state.entryPlan.ts || 0) < 7 * 86400e3 && planMatchesPos(state.entryPlan)) ? state.entryPlan : null;
       // Apply-time baseline outranks first-seen (parity with the background watcher).
       // PLAN-BINDING GUARD: only when the position was created within [plan-15m, plan+6h]
       // — an Apply click without a signed trade must never bind to a later position.
       if (boundPlan && boundPlan.entryFeeRate > 0) {
-        base = Object.assign({}, base, { entryFeeRate: boundPlan.entryFeeRate, feeRate24h: boundPlan.entryFeeRate24h || base.feeRate24h });
+        base = Object.assign({}, base, {
+          entryFeeRate: legacyWindowRate(boundPlan.entryFeeRate, 1, boundPlan.ts, poolCreated, boundPlan.feeBasis) || boundPlan.entryFeeRate,
+          feeRate24h: legacyWindowRate(boundPlan.entryFeeRate24h, 24, boundPlan.ts, poolCreated, boundPlan.feeBasis) || base.feeRate24h
+        });
       }
       // spike-bias guard: decay must ALSO be below the pool's normal (24h at entry)
       var normFee = (base.feeRate24h > 0) ? base.feeRate24h : Infinity;
@@ -1565,7 +1603,9 @@
     // Fee rate row
     var frRow = el("div", "mql-row");
     frRow.appendChild(el("span", "mql-label", "Fee"));
-    var frTxt = "1h " + fmtPct(d.feeRate1h, 1) + "/d vs 24h " + fmtPct(d.feeRate24h, 1);
+    var frTxt = d.poolStage === "LAUNCH"
+      ? fmtPct(d.feeRate1h, 1) + "/d · pool " + Math.max(1, Math.round(Number(d.poolAgeH) * 60)) + "m old (provisional)"
+      : "1h " + fmtPct(d.feeRate1h, 1) + "/d vs " + feeWindowLabel(d) + " " + fmtPct(d.feeRate24h, 1);
     var frVal = el("span", "mql-val", frTxt);
     frRow.appendChild(frVal);
     hud.appendChild(frRow);
@@ -1574,6 +1614,7 @@
     var tSpan = el("span", "mql-trend");
     if (trend === "HEATING") { tSpan.className = "mql-trend mql-good"; tSpan.textContent = "▲ HEATING"; }
     else if (trend === "COOLING") { tSpan.className = "mql-trend mql-bad"; tSpan.textContent = "▼ COOLING"; }
+    else if (trend === "NEW") { tSpan.className = "mql-trend mql-muted"; tSpan.textContent = "• NEW POOL (<1h)"; }
     else { tSpan.className = "mql-trend mql-muted"; tSpan.textContent = "– steady"; }
     trendRow.appendChild(tSpan);
     hud.appendChild(trendRow);
@@ -1657,6 +1698,7 @@
                   // this over the first-seen snapshot (which can catch a spike or a lull)
                   entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null,
                   entryFeeRate24h: (state.data && state.data.feeRate24h > 0) ? state.data.feeRate24h : null,
+                  feeBasis: (state.data && state.data.feeBasis) || undefined,
                   // full entry-time signal snapshot: joined into the close journal row
                   // so every round trip is origin-tagged for calibration
                   entryEdge: (state.data && state.data.edge != null) ? Math.round(state.data.edge * 100) / 100 : null,
@@ -1691,6 +1733,7 @@
                 plans[state.pool] = Object.assign({}, ov.plan, { pool: state.pool, ts: Date.now(),
                   entryFeeRate: state.data && state.data.feeRate1h > 0 ? state.data.feeRate1h : null,
                   entryFeeRate24h: state.data && state.data.feeRate24h > 0 ? state.data.feeRate24h : null,
+                  feeBasis: state.data && state.data.feeBasis || undefined,
                   entryEdge: state.data && state.data.edge != null ? Math.round(state.data.edge * 100) / 100 : null,
                   entrySigma: state.data && state.data.sigma != null ? Math.round(state.data.sigma * 10) / 10 : null,
                   entrySigmaSource: state.data && state.data.sigmaSource || null });
