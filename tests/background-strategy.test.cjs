@@ -83,6 +83,8 @@ function loadBackground({ sync = {}, local = {}, session = {}, fetch } = {}) {
     ,positionFill: typeof positionFill === "function" ? positionFill : null
     ,summarizePositions: typeof summarizePositions === "function" ? summarizePositions : null
     ,computeBreakeven: typeof computeBreakeven === "function" ? computeBreakeven : null
+    ,computeRecipeEdges: typeof computeRecipeEdges === "function" ? computeRecipeEdges : null
+    ,ilPerDayForRange: typeof ilPerDayForRange === "function" ? ilPerDayForRange : null
   };`;
   vm.runInContext(source + exports, context, { filename: 'background.js' });
   return { api: context.__mql, sync: syncArea.data, local: localArea.data, session: sessionArea.data };
@@ -608,4 +610,17 @@ test('position summary weights PnL by real SOL value and pools fill as total SOL
   assert.equal(s.fillMethod, 'sol-spent');
   assert.equal(s.fillPct, Math.round(100 * 16 / 40));          // 40%, not the leg mean (30%)
   assert.equal(s.pnlPct, Math.round(((-10 * 9 + 10 * 27) / 36) * 10) / 10);   // value-weighted: +5.0
+});
+
+test('one-sided IGNITION prices IL on the one-sided width (same capital, half the width)', () => {
+  const { api } = loadBackground();
+  const base = { feeRate1h: 40, sigma: 60, currentPrice: 100, low6h: 90, dayLow: 80 };
+  const two = api.computeRecipeEdges({ ...base, ofi1h: 1 });
+  const one = api.computeRecipeEdges({ ...base, ofi1h: 2.5 });
+  assert.ok(Math.abs(one.IGNITION / two.IGNITION - 0.5) < 1e-9);
+  assert.equal(one.CARRY, two.CARRY);          // CARRY and BASING are always two-sided
+  assert.equal(one.BASING, two.BASING);
+  // general form: sigma^2 / (2 * full width); +-W alias = full width 2W
+  assert.equal(api.ilPerDayForRange(60, 75), 3600 / 150);
+  assert.equal(api.computeBreakeven(60, 37.5), api.ilPerDayForRange(60, 75));
 });

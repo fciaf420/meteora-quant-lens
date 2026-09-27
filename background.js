@@ -368,9 +368,21 @@ const LP_NET_FEES = 1.0;
 // half of it (and inconsistent with the W/4 cap derived from the same payoff).
 const EDGE_MARGIN = 1.3;
 const EDGE_BASIS = 'il4w-net-v1';   // stamped on stored/shadow edges (old basis read ~1.8x high)
-function ilPerDay(sigma, W) {
+// General form: IL %/day = sigma^2 / (2 * full band width %), while price is in
+// the band. The edge heuristic assumes capital earns the pool fee rate while
+// active, so the matching IL is the in-range IL. A one-sided 0 -> -W band holds
+// the same capital in half the width of a +-W band (2x gamma): sigma^2/(2W).
+function ilPerDayForRange(sigma, fullWidthPct) {
   const s = num(sigma);
-  return (s * s) / (4 * Math.max(num(W), 0.001));
+  return (s * s) / (2 * Math.max(num(fullWidthPct), 0.001));
+}
+// two-sided +-W alias: full width 2W -> sigma^2/(4W)
+function ilPerDay(sigma, W) {
+  return ilPerDayForRange(sigma, 2 * num(W));
+}
+// the +-W half-width that has the same IL as a one-sided band of depth D
+function oneSidedEquivalentW(depthPct) {
+  return num(depthPct) / 2;
 }
 // edge = LP fee rate / (EDGE_MARGIN * IL): >= 1 means fees clear IL with margin.
 // Same guard structure as before so tiny sigma cannot divide by zero.
@@ -415,8 +427,12 @@ function basingGeometry(s) {
 }
 
 function computeRecipeEdges(m) {
+  // IGNITION deploys single-sided 0 -> -W when organic sellers outrun buyers
+  // 2:1 (see buildRecommendation), so its edge uses the one-sided IL there.
+  const igW = ignitionWidth(m.sigma);
+  const igSingle = typeof m.ofi1h === 'number' && m.ofi1h > 2;
   return {
-    IGNITION: computeEdge(m.feeRate1h, m.sigma, ignitionWidth(m.sigma)),
+    IGNITION: computeEdge(m.feeRate1h, m.sigma, igSingle ? oneSidedEquivalentW(igW) : igW),
     BASING: computeEdge(m.feeRate1h, m.sigma, basingGeometry(m).widthPct),
     CARRY: computeEdge(m.feeRate1h, m.sigma, 35)
   };
@@ -560,7 +576,7 @@ function buildRecommendation(s) {
       'Exit early if the 1h fee rate halves or surge decays below ~1.05x',
       'Size small — this is a fee harvest, not a conviction bet'
     ];
-    if (r.params.mode === 'single') r.watch.push('Single-sided inventory path is not modeled by EDGE; the displayed value remains a pool-wide symmetric fee/IL proxy.');
+    if (r.params.mode === 'single') r.watch.push('Single-sided 0 → -' + W + '%: the recipe edge uses the one-sided IL (same capital in half the width), so it is half the two-sided figure. Still a pool-wide fee/IL proxy.');
   } else if (s.verdict && s.verdict.class === 'BASING') {
     // BASE-ANCHORED BAND: the thesis is "price is chopping on a floor", so the band's
     // BOTTOM is placed AT that floor (recent consolidation low). Leaving the band
@@ -966,7 +982,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
   // distance from price down to the recent consolidation floor (BASING's tight-base gate)
   const floorPct = (low6h > 0 && currentPrice > 0 && low6h < currentPrice)
     ? ((currentPrice - low6h) / currentPrice) * 100 : null;
-  const recipeEdges = computeRecipeEdges({ feeRate1h, sigma, currentPrice, low6h, dayLow });
+  const recipeEdges = computeRecipeEdges({ feeRate1h, sigma, currentPrice, low6h, dayLow, ofi1h });
   const verdict = computeVerdict({
     edge, surge, accel, organicScore, path, ageH, ofi1h, ofi6h,
     feeRate1h, tvl, sigma, mintAuthorityDisabled, freezeAuthorityDisabled, floorPct,
@@ -1026,7 +1042,10 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
   // Verdict gates above use the same recipe-width value; both remain pool-wide
   // heuristics and do not model a position's bin shape, share, or execution costs.
   const recipeW = (recommendation && recommendation.plan && recommendation.plan.widthPct) ? recommendation.plan.widthPct : null;
-  const edgeRecipe = (recipeW && recipeW !== W) ? Math.round(edge * recipeW / W * 100) / 100 : null;
+  // one-sided recipes (IGNITION single when ofi > 2) re-quote at the one-sided IL
+  const recipeSingle = !!(recommendation && recommendation.plan && recommendation.plan.mode === 'single');
+  const recipeEqW = recipeW ? (recipeSingle ? oneSidedEquivalentW(recipeW) : recipeW) : null;
+  const edgeRecipe = (recipeEqW && recipeEqW !== W) ? Math.round(edge * recipeEqW / W * 100) / 100 : null;
   // health: legacy sigma on a mature (>1h) token should not happen when candles flow
   if (ageH > 1 && rvSigma == null) recordHealth('legacyMature', address);
 
@@ -1034,7 +1053,7 @@ async function buildPoolData(address, settings, poolSeed, options = {}) {
     ok: true,
     pool: poolMeta, supportedSolPair: true,
     feeRate1h, feeRate24h, trend, surge, accel, ...ageCtx,
-    sigma, sigmaRaw, sigmaSource: (rvSigma != null ? 'rv5m' : 'legacy'), edge, edgeRecipe, recipeEdges, recipeW, trail: trailOut,
+    sigma, sigmaRaw, sigmaSource: (rvSigma != null ? 'rv5m' : 'legacy'), edge, edgeRecipe, recipeEdges, recipeW, recipeSingle, trail: trailOut,
     ofi1h, ofi6h, organicScore,
     orgBuy1h: buy1,   // 1h organic buy volume (ACCUM gate: flow must exist)
     tokenAgeHours: ageH,

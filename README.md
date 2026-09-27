@@ -95,6 +95,12 @@ second time, so edge read **1.8× too high**. Gate thresholds were left as they
 were, so entries are now correspondingly stricter; shadow and journal rows carry
 `eb` / `edgeBasis` so old and new edges are never compared directly.
 
+**One-sided bands.** The general form is `IL = σ² ÷ (2 × full band width)` while
+price is inside the band. A `±W` band has full width `2W`, giving `σ²/(4W)`. A
+one-sided `0 → −W` band puts the same capital in half the width, giving `σ²/(2W)`,
+so IGNITION's recipe edge is halved when it deploys single-sided (organic sellers
+> 2:1) and the HUD re-quotes it as `0→-W%`.
+
 `≥1` means the pool-wide fee rate clears this IL proxy with its safety margin.
 It is a screening heuristic, not a profit estimate: it does not model the bins
 your position will occupy, your active-liquidity share, one-sided inventory path,
@@ -127,10 +133,11 @@ Two things worth understanding:
 - **Edge sparkline** — 60 minutes of edge history with a dashed line at the 1.0
   gate, so you can see whether the current reading is a trend or a blip.
 - **Form guardian** — under the range picker: the fee/day a `±W%` band needs to
-  break even (`σ²/(4W)`) vs what the pool actually pays, plus a warning if Meteora's
-  Auto-Fill silently resets your Min/Max range. A one-sided range (entirely below
-  or above price) is a limit ladder that only trades when price moves into it, so
-  it says so instead of showing a two-sided breakeven.
+  break even (`σ² ÷ (2 × range width)`) vs what the pool actually pays, plus a
+  warning if Meteora's Auto-Fill silently resets your Min/Max range. A one-sided
+  range (entirely below or above price) shows the fee it needs *while price is
+  inside it*, in neutral colors: on a BID ASK accumulation, buying the dip is the
+  plan, not a loss to avoid.
 
 ### New pools (pool age, not token age)
 
@@ -217,7 +224,11 @@ that is missing does it fall back to a labeled linear price-traversal guess.
 
 Accumulation books get their own rulebook: no scalp TP/SL, and price falling into
 the band is *the design*, not a failure. The only kill-rule is the token dying
-while you accumulate — fee-decay **and** flow-flip together.
+while you accumulate — fee-decay **and** flow-flip together. The HUD card and the
+Discord alerts use the same lifecycle: `WAIT` only when one kill-rule has fired,
+`EXIT` when both have. Fees cooling off after the entry spike is shown as a note,
+not a `WAIT` (entries usually land on a spike, so a 25%-below-entry trigger fired
+on normal cool-off).
 
 **Take the warning seriously: if the token dies you own it the whole way down.
 Size for total loss.**
@@ -246,6 +257,10 @@ completed 5-minute **closes** in that block. An active dip may qualify only whil
 its latest close is above its running trough; an active dip that times out blocks
 `READY`. A completed recent recovery can qualify while the setup waits for the
 next dip. Total pool volume is separate from Jupiter's organic buy/sell flow.
+
+If Meteora has not published the just-closed 5-minute candle when a bucket is
+first checked, the extension asks again after 20 seconds instead of holding
+`WAIT` for the rest of the bucket.
 
 Full 24-hour history is preferred. A known young pool uses only complete candles
 since its first full 5-minute bucket and is labeled `LIMITED HISTORY`; missing

@@ -1378,13 +1378,25 @@
         if (decayFire && flowFire) {
           verdict = "EXIT"; cls = "mql-pw-exit";
           reasons.push("token dying while you accumulate — fee engine " + Math.round(decayPct) + "% below baseline AND organic distribution " + fmtNum(d.ofi1h, 1) + ":1. Both kill-rules fired.");
-        } else if (decayFire || flowFire || decayPct > 25 || d.trend === "COOLING") {
+        } else if (decayFire || flowFire) {
+          // Same lifecycle as the background watcher / Discord alerts: WAIT only
+          // when one of the two kill-rules has actually fired.
           verdict = "WATCH"; cls = "mql-pw-warn";
           if (decayFire) reasons.push("fee engine decayed " + Math.round(decayPct) + "% — EXIT arms if the flow flips too");
           if (flowFire) reasons.push("organic distribution " + fmtNum(d.ofi1h, 1) + ":1 into your band — EXIT arms if the fee engine dies too");
-          if (!decayFire && !flowFire) reasons.push("fee trend softening (" + fmtNum(d.feeRate1h, 1) + "%/d, " + Math.round(decayPct) + "% below baseline) — the band only pays if volume persists");
         } else {
           reasons.push("accumulating as designed — volume alive (" + fmtNum(d.feeRate1h, 1) + "%/d), flow OFI " + fmtNum(d.ofi1h, 2));
+          // Softening used to flip this card to WAIT ("stop adding") at 25% below
+          // the entry rate. Entries usually happen on a fee spike, so that fired on
+          // the normal post-spike cool-off (the FEE-DECAY spike bias the CLI fixed
+          // in f2ea60d) while the Discord watcher stayed silent. Now a note only.
+          if (decayPct > 25 || d.trend === "COOLING") {
+            reasons.push(!isFinite(normFee)
+              ? "note: fees " + Math.round(decayPct) + "% below your entry rate — decay arms at 50% below entry, two reads in a row"
+              : d.feeRate1h >= normFee
+              ? "note: fees " + Math.round(decayPct) + "% below your entry rate but still above the pool's normal (" + fmtNum(normFee, 1) + "%/d) — post-spike cool-off, not decay"
+              : "note: fees " + Math.round(decayPct) + "% below your entry rate and under the pool's normal — decay arms at 50% below entry, two reads in a row");
+          }
         }
         if (d.path === "FREEFALL" && verdict !== "EXIT") reasons.push("FREEFALL: band filling fast — that is the design; the kill-switch is fee-decay + flow-flip, not price");
         }
@@ -1640,7 +1652,7 @@
     edgeRow.appendChild(edgeVal);
     // edge at the recipe's actual width (edge scales linearly with band width)
     if (d.edgeRecipe != null && d.recipeW != null) {
-      var er = el("span", "mql-sub " + colorForEdge(d.edgeRecipe), " \u00b1" + d.recipeW + "%: " + fmtNum(d.edgeRecipe, 2));
+      var er = el("span", "mql-sub " + colorForEdge(d.edgeRecipe), (d.recipeSingle ? " 0\u2192-" + d.recipeW + "%: " : " \u00b1" + d.recipeW + "%: ") + fmtNum(d.edgeRecipe, 2));
       er.title = "Edge re-quoted at the recommended band width (\u00b1" + d.recipeW + "%). The headline number assumes the default \u00b1" + (d._W || 20) + "% \u2014 wider bands pay less IL per unit of vol, so the same pool quotes better at the recipe width.";
       edgeRow.appendChild(er);
     }
@@ -2028,9 +2040,13 @@
     return null;
   }
 
+  // Equivalent +-W half-width = full band width / 2, so the background's
+  // sigma^2/(4W) equals sigma^2/(2 * full width) for any range shape:
+  // +-W -> W, one-sided 0 -> -75% -> 37.5, off-price -50% -> -20% -> 15.
+  // (The old (|min| + |max|)/2 gave 35 for that last case instead of 15.)
   function widthPctFromRange(r) {
     if (!r) return 20;
-    var w = (Math.abs(r.min) + Math.abs(r.max)) / 2;
+    var w = (r.max - r.min) / 2;
     if (!w || isNaN(w) || w <= 0) return 20;
     return w;
   }
@@ -2108,28 +2124,36 @@
 
     if (!state.pool) { strip.textContent = "range analysis: no pool"; return; }
 
-    // A range entirely below (or above) price is a one-sided limit ladder: it only
-    // trades when price moves INTO it. The +-W fee/IL breakeven models a two-sided
-    // band straddling price and does not apply (it showed a bogus red X on BID ASK).
-    if (r && (r.max <= 0 || r.min >= 0)) {
-      strip.className = "mql-guard-strip mql-muted";
-      strip.textContent = "one-sided range: earns only when price trades into it \u00b7 two-sided fee/IL breakeven does not apply";
-      return;
-    }
+    // A range entirely below (or above) price is a one-sided ladder: it only
+    // trades while price is inside it, where its IL is sigma^2/(2 * width) (same
+    // capital in half the width of a +-W band). Show that number neutrally: on a
+    // BID ASK accumulation, buying the dip is the plan, not a loss to avoid.
+    var oneSided = !!r && (r.max <= 0 || r.min >= 0);
+    var symmetric = !r || Math.abs(r.max + r.min) < 0.5;
+    var rangeLbl = !r ? "\u00b1" + fmtNum(w, 1) + "%"
+      : oneSided ? fmtNum(r.max, 0) + "% \u2192 " + fmtNum(r.min, 0) + "% (one-sided)"
+      : symmetric ? "\u00b1" + fmtNum(w, 1) + "%"
+      : fmtNum(r.min, 0) + "% \u2192 +" + fmtNum(r.max, 0) + "%";
     sendMessage({ type: "getBreakeven", pool: state.pool, widthPct: w }).then(safe(function (resp) {
       var strip2 = document.getElementById("mql-guard-strip");
       if (!strip2) return;
       if (!resp || !resp.ok) {
         strip2.className = "mql-guard-strip mql-muted";
-        strip2.textContent = "±" + fmtNum(w, 1) + "% breakeven unavailable" +
+        strip2.textContent = rangeLbl + " breakeven unavailable" +
           (resp && resp.error ? " (" + resp.error + ")" : "");
         return;
       }
       var need = resp.breakevenFeePerDay;
       var pays = resp.poolFeePerDay;
       var clears = !!resp.clears;
+      if (oneSided) {
+        strip2.className = "mql-guard-strip mql-muted";
+        strip2.textContent = rangeLbl + " needs ≥" + fmtPct(need, 1) + "/day fees while price is inside it — this pool pays " +
+          fmtPct(pays, 1) + "/day " + (clears ? "✓" : "✗") + " · on a BID ASK accumulation, buying the dip is the plan";
+        return;
+      }
       strip2.className = "mql-guard-strip " + (clears ? "mql-good" : "mql-bad");
-      strip2.textContent = "±" + fmtNum(w, 1) + "% needs ≥" + fmtPct(need, 1) +
+      strip2.textContent = rangeLbl + " needs ≥" + fmtPct(need, 1) +
         "/day fees to breakeven — this pool pays " + fmtPct(pays, 1) + "/day " +
         (clears ? "✓" : "✗");
     }));

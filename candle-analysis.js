@@ -8,6 +8,7 @@
   const DEFAULT_TIMEFRAME_SEC = 300;
   const DEFAULT_EXPECTED_BARS = 288;
   const DEFAULT_WINDOW_SEC = 6 * 3600;
+  const STALE_RETRY_MS = 20 * 1000;   // re-ask for a just-closed candle the API had not published yet
   const NOTE = 'historical candle evidence; recovery statistics are descriptive, not a profit forecast';
 
   const finite = (v) => typeof v === 'number' && Number.isFinite(v);
@@ -450,8 +451,15 @@
       const desiredStart = Math.max(currentBucket - expectedBars * timeframeSec,
         creationKnown ? Math.ceil(createdValue / timeframeSec) * timeframeSec : 0);
       let entry = cache.get(address);
+      // A 'stale-history' WAIT means the just-closed 5m candle was not published
+      // yet when this bucket was first fetched (indexer lag at the boundary).
+      // Holding that for the whole bucket kept BID ASK on WATCH ("waiting for the
+      // latest completed 5m candle") for up to 5 minutes; retry it after 20s.
+      const staleRetry = !!entry && !!entry.analysis && entry.analysis.state === 'WAIT'
+        && entry.analysis.reason === 'stale-history'
+        && !(now - (entry.fetchedAt || 0) < STALE_RETRY_MS);
       if (entry && entry.bucket === currentBucket && entry.poolCreatedAt === (creationKnown ? createdValue : null)
-          && (!entry.seeded || entry.analysis.state !== 'WAIT')) {
+          && (!entry.seeded || entry.analysis.state !== 'WAIT') && !staleRetry) {
         touch(address, entry);
         return { analysis: entry.analysis, candles: entry.candles.slice() };
       }
@@ -525,7 +533,7 @@
         ? analyzeCandleHistory(preparedWithAge.candles, analysisOptions)
         : emptyAnalysis(preparedWithAge);
       entry = { bucket: currentBucket, candles: preparedWithAge.candles, analysis,
-        poolCreatedAt: creationKnown ? createdValue : null, seeded: false };
+        poolCreatedAt: creationKnown ? createdValue : null, seeded: false, fetchedAt: now };
       touch(address, entry);
       return { analysis, candles: preparedWithAge.candles.slice() };
     }
