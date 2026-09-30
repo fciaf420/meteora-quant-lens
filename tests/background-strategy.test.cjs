@@ -640,3 +640,28 @@ test('one-sided IGNITION brackets: TP is fees only, SL sits at the ~0.5W band br
   assert.equal(one.plan.sl, Math.round(0.5 * W + 2));           // 12
   assert.ok(one.steps.some((x) => /fees only/.test(x)));
 });
+
+test('Evil Panda: plan-bound and deep one-sided bands resolve to the PANDA profile, BID ASK depths do not', () => {
+  const { api } = loadBackground();
+  const deep = { minPrice: 0.1, maxPrice: 1, poolActivePrice: 1 };
+  const bidAskDeep = { minPrice: 0.25, maxPrice: 1, poolActivePrice: 1 };   // BID ASK caps at -75%
+  assert.equal(api.resolvePositionProfile({ cls: 'PANDA', profile: 'PANDA' }, deep, null), 'PANDA');
+  assert.equal(api.resolvePositionProfile({ cls: 'PANDA_OVERRIDE', profile: 'PANDA' }, bidAskDeep, null), 'PANDA');
+  assert.equal(api.resolvePositionProfile(null, deep, 'ACCUM_INFERRED'), 'PANDA_INFERRED');
+  assert.notEqual(api.resolvePositionProfile(null, bidAskDeep, null), 'PANDA_INFERRED');
+  assert.equal(api.resolvePositionProfile({ cls: 'BID_ASK', profile: 'ACCUM' }, deep, null), 'ACCUM');
+});
+
+test('Evil Panda: radar keeps a Panda chip visible and treats PANDA ENTRY as actionable', () => {
+  const { api } = loadBackground();
+  const now = Date.now();
+  const near = Array.from({ length: 6 }, (_, i) => ({ address: 'n' + i, kind: 'NEAR', dataTs: now }));
+  const panda = { address: 'pz', kind: 'PANDA', dataTs: now };
+  const out = api.selectRadarPayload(near.concat([panda]), now);
+  assert.equal(out.items.length, 6);
+  assert.ok(out.items.some((it) => it.kind === 'PANDA'));
+  assert.ok(out.alertItems.some((it) => it.kind === 'PANDA'));
+  const watch = api.selectRadarPayload(near.concat([{ address: 'pw', kind: 'PANDA_WATCH', dataTs: now }]), now);
+  assert.ok(watch.items.some((it) => it.kind === 'PANDA_WATCH'));
+  assert.ok(!watch.alertItems.some((it) => it.kind === 'PANDA_WATCH'));
+});

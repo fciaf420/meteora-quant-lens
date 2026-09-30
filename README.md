@@ -442,5 +442,8 @@ Implements [@EvilPanda's Bootcamp #7 strat](https://x.com/EvilPanda/status/20043
 - **Entry:** closed candle breaks above Supertrend(10,3). 5m: 1 close; 1m: 2 closes. Break older than 3 (5m) / 6 (1m) candles = LATE.
 - **Exit:** same closed candle RSI(2) > 90 AND (close > BB(20,2) upper OR first green MACD(12,26,9) histogram bar).
 - **Recipe:** one-sided SOL, -86% .. -94%, bins shown per bin step (198-283 at 100bps).
-- **Alerts:** EXIT for open Panda-shaped positions (bottom ≤ 20% of top, via Position Watch); ENTRY for pools you pin. Desktop + Discord, 15 min cooldown.
+- **Apply / Override (v0.8.1):** pick depth (-86/-90/-94%) + shape (Spot / Bid Ask) on the card. ⚡ Apply when filters PASS + entry ENTRY; otherwise 2-click ⚠ Override (journaled with the ignored gates). Both fill Meteora's form (one-sided SOL, 0 → -depth) and journal a `PANDA` entry plan.
+- **Position Watch:** a `PANDA` plan (or any unplanned band ≥80% deep, `PANDA_INFERRED`) gets its own rulebook: no TP/SL/decay/flow/freefall (the dump is the trade), verdict FARMING DUMP → EXIT ARMING (RSI2 hot) → EXIT on the strategy confluence, plus below-floor / above-band facts. Background PANDA_EXIT alert via desktop + Discord.
+- **Radar:** 3 youngest board tokens passing the free prescreen (SOL pair, bin step 80/100/125, MC ≥ $250k) get the full GMGN check; filter-PASS rows show as 🐼 PANDA ENTRY (actionable, radar alerts) or PANDA WATCH (waiting for the break).
+- **Pins:** 📌 a pool for an ENTRY alert when its Supertrend breaks.
 - Pure math in `evil-panda.js`, tests in `tests/evil-panda.test.cjs`.

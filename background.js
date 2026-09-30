@@ -1246,12 +1246,12 @@ function freshRadarSnapshot(r) {
   if (!r || !Array.isArray(r.items)) return r;
   const now = Date.now();
   const fresh = (arr) => (arr || []).filter((it) => radarBidAskFresh(it, now));
-  return Object.assign({}, r, { items: fresh(r.items), alertItems: fresh(r.alertItems || r.items).filter((it) => it.kind === 'FULL' || it.kind === 'BID_ASK') });
+  return Object.assign({}, r, { items: fresh(r.items), alertItems: fresh(r.alertItems || r.items).filter((it) => it.kind === 'FULL' || it.kind === 'BID_ASK' || it.kind === 'PANDA') });
 }
 function selectRadarPayload(items, now) {
   now = isFinite(now) ? now : Date.now();
   const freshItems = items.filter((it) => radarBidAskFresh(it, now));
-  const actionable = freshItems.filter((it) => (it.kind === 'FULL' || it.kind === 'BID_ASK')
+  const actionable = freshItems.filter((it) => (it.kind === 'FULL' || it.kind === 'BID_ASK' || it.kind === 'PANDA')
     && radarBidAskFresh(it, now));
   const visible = freshItems.slice(0, 6);
   const firstBidAsk = actionable.find((it) => it.kind === 'BID_ASK')
@@ -1259,6 +1259,15 @@ function selectRadarPayload(items, now) {
   if (firstBidAsk && !visible.some((it) => it.kind === 'BID_ASK' || it.kind === 'BID_WATCH')) {
     if (visible.length >= 6) visible[visible.length - 1] = firstBidAsk;
     else visible.push(firstBidAsk);
+  }
+  const firstPanda = freshItems.find((it) => it.kind === 'PANDA') || freshItems.find((it) => it.kind === 'PANDA_WATCH');
+  if (firstPanda && !visible.includes(firstPanda)) {
+    if (visible.length >= 6) {
+      // replace the lowest-priority non-BID-ASK chip so neither module gets evicted
+      let idx = -1;
+      for (let i = visible.length - 1; i >= 0; i--) if (!/^BID_/.test(visible[i].kind)) { idx = i; break; }
+      if (idx >= 0) visible[idx] = firstPanda;
+    } else visible.push(firstPanda);
   }
   return { items: visible, alertItems: actionable };
 }
@@ -1376,7 +1385,39 @@ async function getRadar() {
     }));
     items.push(...chunk);
   }
-  const rank = { FULL: 0, BID_ASK: 1, BID_WATCH: 2, NEAR: 3 };
+  // ---- EVIL PANDA candidates. Source: sort by AGE, MC >= 250k, SOL pair, bin step
+  // 80/100/125. Board fields prescreen for free; GMGN (rate-limited) only for the
+  // 3 youngest distinct tokens. Young pools are allowed here (unlike the fee
+  // radar's >=1h gate): Panda is a young-token play.
+  try {
+    const PZ = globalThis.MQLEvilPanda;
+    const allBoard = (boardResp.json.data || boardResp.json.pools || boardResp.json || []);
+    const seenMint = new Set();
+    const pandaPre = allBoard.filter((p) => {
+      const meta = getPoolPairMeta(p);
+      if (!meta.supportedSolPair) return false;
+      const bs = num(pick(p.pool_config || {}, 'bin_step', 'binStep'), 0) || num(pick(p, 'bin_step', 'binStep'), 0);
+      if (!PZ.DEFAULTS.binSteps.includes(bs)) return false;
+      const mc = num(pick(p, 'token_x.market_cap'), NaN);
+      if (isFinite(mc) && mc < PZ.DEFAULTS.minMcapUsd) return false;
+      if ((p.tvl || 0) < 10000) return false;
+      return true;
+    }).sort((a, b) => num(b.created_at, 0) - num(a.created_at, 0))
+      .filter((p) => { const m = getPoolPairMeta(p).tokenX.address; if (seenMint.has(m)) return false; seenMint.add(m); return true; })
+      .slice(0, 3);
+    for (const p of pandaPre) {
+      p._mqlBoardTs = p._mqlBoardTs || boardTs;
+      const z = await getPanda(p.address, { seed: p });
+      if (!z || !z.ok || !z.signals || !z.screen || z.screen.state !== 'PASS') continue;
+      const e = z.signals.entry.state;
+      if (e === 'LATE' || e === 'NO_DATA') continue;
+      items.push({ address: p.address, mint: z.mint, name: z.name, binStep: z.recipe && z.recipe.binStep,
+        cls: 'PANDA', kind: e === 'ENTRY' ? 'PANDA' : 'PANDA_WATCH', dataTs: z.ts,
+        panda: { entry: e, why: z.signals.entry.why || null, tf: z.timeframe, ageMin: z.screen.facts.ageMin,
+          lastClosedTs: z.signals.lastClosedTs, depth: z.recipe && z.recipe.deep && z.recipe.deep.depthPct } });
+    }
+  } catch (ePz) {}
+  const rank = { FULL: 0, BID_ASK: 1, PANDA: 1.5, BID_WATCH: 2, PANDA_WATCH: 2.5, NEAR: 3 };
   items.sort((a, b) => (a.kind === b.kind ? (b.edge || b.feeRate1h || 0) - (a.edge || a.feeRate1h || 0) : rank[a.kind] - rank[b.kind]));
   // SHADOW LOG (mirror of dlmm-quant): persist every fresh radar evaluation for
   // counterfactual replay. Chrome is open far more than the daemon runs, so this
@@ -1513,7 +1554,8 @@ function summarizePositions(ps, entryPlan) {
   } else {
     const inferredAccum = depAcc.length ? depAcc.every((v) => v === true)
       : (isFinite(cur) && (maxAll <= cur * 1.05 || cur < minAll));
-    profile = inferredAccum ? 'ACCUM_INFERRED' : 'TRADE_INFERRED';
+    profile = globalThis.MQLEvilPanda.isPandaShaped(minAll, maxAll) ? 'PANDA_INFERRED'
+      : (inferredAccum ? 'ACCUM_INFERRED' : 'TRADE_INFERRED');
   }
   const accum = profile === 'ACCUM' || profile === 'ACCUM_INFERRED';
   // pool-level fill: total SOL spent / total SOL deposited when every leg has
@@ -1609,7 +1651,15 @@ function planMatchesPosition(plan, widthPct, createdAtSec, now) {
   return !createdMs || (createdMs >= num(plan.ts, 0) - 900e3 && createdMs - num(plan.ts, 0) < 6 * 3600e3);
 }
 
+function isPandaPlan(plan) {
+  return !!(plan && (plan.profile === 'PANDA' || plan.cls === 'PANDA' || plan.cls === 'PANDA_OVERRIDE'));
+}
 function resolvePositionProfile(plan, pos, previousProfile) {
+  if (isPandaPlan(plan)) return 'PANDA';
+  // no plan + deep one-sided band (bottom <= 20% of top, i.e. >= 80% deep; BID ASK
+  // tops out at 75%) = a Panda-style dump-fee band. Checked before the persisted
+  // profile so legacy ACCUM_INFERRED snapshots of these bands upgrade.
+  if (!plan && globalThis.MQLEvilPanda.isPandaShaped(pos && pos.minPrice, pos && pos.maxPrice)) return 'PANDA_INFERRED';
   if (plan && (plan.profile === 'ACCUM' || plan.cls === 'BID_ASK' || plan.accum === true)) return 'ACCUM';
   if (plan && (plan.profile || ['IGNITION', 'BASING', 'CARRY', 'SQUEEZE', 'IGNITION_OVERRIDE', 'CARRY_OVERRIDE'].includes(plan.cls))) return 'TRADE';
   if (typeof previousProfile === 'string' && ['ACCUM', 'TRADE', 'ACCUM_INFERRED', 'TRADE_INFERRED'].includes(previousProfile)) return previousProfile;
@@ -1788,6 +1838,21 @@ async function watchPositions() {
           const pf = positionFill(pos, cur);
           if (pf.fill != null) { poolFill.sum += pf.fill; poolFill.n++; }
           if (pf.method === 'sol-spent') { poolFill.spent += pf.spentY; poolFill.net += pf.netY; } else poolFill.exact = false;
+        }
+        // ---- EVIL PANDA profile: the dump IS the trade (fees on the way down), so
+        // TP/SL/decay/flow/freefall/tighten are all wrong here. Only the strategy's
+        // own exit (RSI2>90 + BB upper | first green MACD, same closed candle) plus
+        // band-geometry facts fire.
+        if (profile === 'PANDA' || profile === 'PANDA_INFERRED') {
+          for (const k of ['HIT_TP', 'NEAR_TP', 'HIT_SL', 'NEAR_SL', 'DECAY', 'FLOW', 'FREEFALL', 'TIGHTEN', 'PLAN_STOP']) delete cond[k];
+          let pz = null;
+          try { pz = await getPanda(pool); } catch (eZ) {}
+          const ex = pz && pz.ok && pz.signals ? pz.signals.exit : null;
+          cond.PANDA_EXIT = !!(ex && ex.state === 'EXIT');
+          msgs.PANDA_EXIT = '🐼 PANDA EXIT: ' + name + ' — ' + (ex && ex.legs ? ex.legs.join(' | ') : '') + ' on the ' + (pz && pz.timeframe) + ' close. First bounce is here: close 100% → SOL. Don\'t wait for higher. PnL ' + pnl.toFixed(1) + '%';
+          msgs.OOR_DOWN = '🐼 BELOW PANDA FLOOR: ' + name + ' — price fell through the whole -86..-94% band. 100% token, no more fees. Panda rule: admit it and cut if the thesis is dead. PnL ' + pnl.toFixed(1) + '%';
+          msgs.OOR_UP = '🐼 ABOVE PANDA BAND: ' + name + ' — price back above your top, band is 100% SOL + fees. Nothing left to sell into; close to bank it. PnL ' + pnl.toFixed(1) + '%';
+          st.mqlLastPos[key].panda = true;
         }
         for (const k of Object.keys(cond)) {
           const skey = key + ':' + k;
@@ -2052,7 +2117,7 @@ async function getPanda(pool, opts = {}) {
   const P = globalThis.MQLEvilPanda;
   const s = await getPandaSettings();
   const tf = P.TIMEFRAMES[opts.timeframe] ? opts.timeframe : s.pandaTimeframe;
-  const pd = await getPoolData(pool, null, { deferCandle: true });
+  const pd = await getPoolData(pool, opts.seed || null, { deferCandle: true });
   if (!pd || !pd.ok) return { ok: false, error: (pd && pd.error) || 'pool data unavailable' };
   const meta = pd.pool || {};
   const mint = meta.tokenX && meta.tokenX.address;
@@ -2082,8 +2147,13 @@ async function pandaWatch() {
     const pins = st.mqlPandaPins || {}, alerted = st.mqlPandaAlerted || {};
     const now = Date.now();
     const targets = {};
-    for (const [pool, v] of Object.entries(pandaShapes)) if (now - v.ts < 3 * 60e3) targets[pool] = { name: v.name, why: 'position' };
-    for (const [pool, v] of Object.entries(pins)) if (!targets[pool]) targets[pool] = { name: v.name, why: 'pin' };
+    // positions get PANDA_EXIT through watchPositions; here only pinned pools that
+    // don't hold an open Panda-shaped position yet (ENTRY alerts)
+    for (const [pool, v] of Object.entries(pins)) {
+      const shp = pandaShapes[pool];
+      if (shp && now - shp.ts < 3 * 60e3) continue;
+      targets[pool] = { name: v.name, why: 'pin' };
+    }
     let dirty = false;
     for (const [pool, t] of Object.entries(targets).slice(0, 6)) {
       const d = await getPanda(pool);
@@ -2120,7 +2190,16 @@ async function radarAlertScan() {
   const alerted = stx.mqlRadarAlerted || {};
   const now = Date.now();
   for (const it of (r.alertItems || r.items)) {
-    if (it.kind !== 'FULL' && it.kind !== 'BID_ASK') continue;
+    if (it.kind !== 'FULL' && it.kind !== 'BID_ASK' && it.kind !== 'PANDA') continue;
+    if (it.kind === 'PANDA') {
+      const pk = 'PANDA:' + (it.mint || it.address);
+      if (alerted[pk] && now - alerted[pk] < 2 * 3600e3) continue;
+      const pz = it.panda || {};
+      await postDiscord(cfg.webhookUrl, '🐼 **Meteora Lens — EVIL PANDA ENTRY** · ' + it.name + ' ' + (it.binStep ? it.binStep + 'bps' : '') + '\nFilters pass · closed above Supertrend (' + pz.tf + ') · token ' + (pz.ageMin != null ? Math.round(pz.ageMin / 60 * 10) / 10 + 'h' : '?') + ' old\nOne-sided SOL, -86% .. -94%, Spot or Bid-Ask. Exit on RSI2>90 + BB upper / first green MACD.\nhttps://www.meteora.ag/dlmm/' + it.address);
+      try { chrome.notifications.create('mqlpz-' + now + '-' + it.address.slice(0,4), { type: 'basic', iconUrl: 'icon128.png', title: '🐼 PANDA ENTRY', message: it.name + ' · one-sided SOL -86..-94%', priority: 2 }); } catch (e) {}
+      alerted[pk] = now;
+      continue;
+    }
     const alertKey = it.kind === 'BID_ASK'
       ? 'BID_ASK:' + (it.mint || it.address)
       : it.address + ':' + it.kind;

@@ -320,3 +320,4 @@
 .mql-panda-ctrls { display: flex; gap: 6px; margin: 6px 0 4px; flex-wrap: wrap; }
 .mql-panda-btn { background: #1c1c28; color: #c9c9d6; border: 1px solid #2a2a3a; border-radius: 6px; padding: 3px 8px; font-size: 11px; cursor: pointer; }
 .mql-panda-btn.on { border-color: #4cd7f0; color: #4cd7f0; }
+.mql-chip-panda { background: #1e2a14 !important; color: #b8f04c !important; border-color: #4a6a20 !important; }

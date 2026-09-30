@@ -737,7 +737,37 @@
   });
 
   // ---- EVIL PANDA card (data + math live in background getPanda / evil-panda.js) ----
-  var pandaUI = { open: true, tf: null, fetching: false, pinned: {} };
+  var pandaUI = { open: true, tf: null, fetching: false, pinned: {}, depth: 90, shape: "Spot", armed: false };
+  // Position Watch measures width as half-range / mid; a 0..-d band is d/(2-d).
+  function pandaWidthPct(depth) { var d = depth / 100; return Math.round(d / (2 - d) * 1000) / 10; }
+  var applyPanda = safe(function applyPanda(p, btn, override) {
+    var depth = pandaUI.depth, shape = pandaUI.shape;
+    var params = { strategy: shape, minPct: -depth, maxPct: 0, mode: "single" };
+    applySetup(params, btn);
+    var sig = p.signals || {}, sc = p.screen || {};
+    var plan = { cls: override ? "PANDA_OVERRIDE" : "PANDA", profile: "PANDA", pool: state.pool, ts: Date.now(),
+      widthPct: pandaWidthPct(depth), minPct: -depth, maxPct: 0, mode: "single", strategy: shape, depthPct: depth,
+      timeframe: p.timeframe, entryState: sig.entry && sig.entry.state, screenState: sc.state,
+      entryPrice: sig.lastClose, entryCandleTs: sig.lastClosedTs,
+      entryFeeRate: (state.data && state.data.feeRate1h > 0) ? state.data.feeRate1h : null,
+      feeBasis: (state.data && state.data.feeBasis) || undefined };
+    try {
+      chrome.storage.local.get({ mqlEntryPlan: {}, mqlOverrideJournal: [] }, safe(function (jr) {
+        var plans = jr.mqlEntryPlan || {};
+        plans[state.pool] = plan;
+        var payload = { mqlEntryPlan: plans };
+        if (override) {
+          var j = jr.mqlOverrideJournal || [];
+          var ignored = (sc.failed || []).concat(sc.unknown || []).map(function (k) { return "filter:" + k; });
+          if (sig.entry && sig.entry.state !== "ENTRY") ignored.push("entry:" + sig.entry.state);
+          j.push({ ts: Date.now(), pool: state.pool, cls: "PANDA", ignoredGates: ignored, edge: null, sigma: state.data && state.data.sigma, feeRate1h: state.data && state.data.feeRate1h });
+          payload.mqlOverrideJournal = j.slice(-100);
+        }
+        chrome.storage.local.set(payload);
+        state.entryPlan = plan;
+      }));
+    } catch (e) {}
+  });
   var fetchPanda = safe(function fetchPanda() {
     if (ctxDead || !state.pool || pandaUI.fetching) return;
     pandaUI.fetching = true;
@@ -826,6 +856,51 @@
     }
     if (p.lateHour) body.appendChild(el("div", "mql-rec-warn", "⏰ After 6pm — Panda rule: don't open new positions you'd babysit overnight"));
     body.appendChild(el("div", "mql-rec-warn", "Split capital across ≥6 positions · exit when the strategy says, no revenge DLMM"));
+
+    // setup: depth + shape, then Apply (signal) or 2-click Override (anything else)
+    var setup = el("div", "mql-panda-ctrls");
+    setup.appendChild(el("span", "mql-sub", "depth"));
+    [86, 90, 94].forEach(function (dp) {
+      var b = el("button", "mql-panda-btn" + (pandaUI.depth === dp ? " on" : ""), "-" + dp + "%");
+      b.addEventListener("click", safe(function () { pandaUI.depth = dp; pandaUI.armed = false; renderHUD(); }));
+      setup.appendChild(b);
+    });
+    setup.appendChild(el("span", "mql-sub", " shape"));
+    ["Spot", "Bid Ask"].forEach(function (sh) {
+      var b = el("button", "mql-panda-btn" + (pandaUI.shape === sh ? " on" : ""), sh);
+      b.addEventListener("click", safe(function () { pandaUI.shape = sh; pandaUI.armed = false; renderHUD(); }));
+      setup.appendChild(b);
+    });
+    body.appendChild(setup);
+    if (rc && rc.binStep) {
+      var bins = Math.ceil(Math.log(1 / (1 - pandaUI.depth / 100)) / Math.log(1 + rc.binStep / 1e4));
+      body.appendChild(el("div", "mql-accum-prior", "selected: 0% → -" + pandaUI.depth + "% · " + bins + " bins · " + pandaUI.shape + " · SOL only (Auto-Fill OFF)"));
+    }
+    var sigOk = s && s.entry && s.entry.state === "ENTRY" && sc.state === "PASS";
+    if (sigOk) {
+      var apBtn = el("button", "mql-apply", "⚡ Apply Panda setup to form");
+      apBtn.addEventListener("click", safe(function () { applyPanda(p, apBtn, false); }));
+      body.appendChild(apBtn);
+    } else {
+      var why = [];
+      if (sc.state !== "PASS") why.push("filters " + sc.state + ((sc.failed || []).length ? " (" + sc.failed.join(", ") + ")" : ""));
+      if (!s || !s.entry || s.entry.state !== "ENTRY") why.push("entry " + (s && s.entry ? s.entry.state : "no data"));
+      var ovLabel = "⚠ Override: apply Panda setup anyway";
+      var ovB = el("button", "mql-apply mql-override", pandaUI.armed ? "Ignoring: " + why.join(" · ") + " — click again to apply" : ovLabel);
+      ovB.addEventListener("click", safe(function () {
+        if (!pandaUI.armed) {
+          pandaUI.armed = true; ovB.textContent = "Ignoring: " + why.join(" · ") + " — click again to apply";
+          setTimeout(function () { if (pandaUI.armed) { pandaUI.armed = false; ovB.textContent = ovLabel; } }, 8000);
+          return;
+        }
+        pandaUI.armed = false;
+        applyPanda(p, ovB, true);
+      }));
+      body.appendChild(ovB);
+    }
+    if (state.entryPlan && state.entryPlan.profile === "PANDA" && state.entryPlan.pool === state.pool && Date.now() - state.entryPlan.ts < 6 * 3600e3) {
+      body.appendChild(el("div", "mql-accum-note", "✓ Panda plan journaled " + Math.round((Date.now() - state.entryPlan.ts) / 60000) + "m ago — once the position opens, Position Watch tracks the Panda exit"));
+    }
 
     // controls
     var ctr = el("div", "mql-panda-ctrls");
@@ -1460,12 +1535,25 @@
       var decayPct = base.entryFeeRate > 0 ? (1 - d.feeRate1h / base.entryFeeRate) * 100 : 0;
       var ap = state.apiPos;
       var posProfile = boundPlan && boundPlan.profile ? boundPlan.profile : (ap && ap.profile);
-      var isAccum = posProfile === "ACCUM" || (!posProfile && !!(ap && ap.accum)) || posProfile === "ACCUM_INFERRED";
+      var isPanda = posProfile === "PANDA" || posProfile === "PANDA_INFERRED";
+      var isAccum = !isPanda && (posProfile === "ACCUM" || (!posProfile && !!(ap && ap.accum)) || posProfile === "ACCUM_INFERRED");
       var profileInferred = !boundPlan && !!(ap && ap.profileInferred);
       var isCombo = !!(ap && ap.combo);
       // exit rules (same as the bot manager) — accumulation books get their own rulebook
       var verdict = "HOLD", cls = "mql-pw-hold", reasons = [];
-      if (isAccum) {
+      if (isPanda) {
+        var pz = state.panda && state.panda.ok && state.panda.pool === state.pool ? state.panda : null;
+        var pex = pz && pz.signals ? pz.signals.exit : null;
+        if (!pex) { verdict = "WATCH"; cls = "mql-pw-warn"; reasons.push("Panda exit signals loading…"); if (!pz) fetchPanda(); }
+        else if (pex.state === "EXIT") { verdict = "EXIT"; cls = "mql-pw-exit"; reasons.push("Panda exit confluence on the " + pz.timeframe + " close: " + pex.legs.join(" | ")); }
+        else {
+          reasons.push("dumping = earning fees. Exit waits for RSI2>90 + (close>BB upper or first green MACD) on one closed " + pz.timeframe + " candle");
+          reasons.push("now: RSI2 " + (pex.rsi == null ? "—" : pex.rsi) + (pex.rsiHot ? " 🔥" : "") + " · BB↑ " + (pex.bbReady ? (pex.bbHit ? "above" : "below") : "warming") + " · MACD " + (pex.macdReady ? (pex.macdHist >= 0 ? "green" : "red") : "warming"));
+          if (pex.rsiHot) { verdict = "WATCH"; cls = "mql-pw-warn"; }
+          if (pex.partial) reasons.push(pex.partial);
+        }
+        if (profileInferred || posProfile === "PANDA_INFERRED") reasons.push("profile inferred from band shape (≥80% deep, one-sided) — Apply the Panda setup before opening to bind a plan");
+      } else if (isAccum) {
         // ACCUM profile: scalp TP/SL/TIGHTEN don't apply (priors pending calibration)
         var accumPositionKey = ap && ap.legs ? ap.legs.map(function (leg) { return leg.sig; }).sort().join(",") : String(ap && ap.createdAt || "unknown");
         if (state.accumPositionKey !== accumPositionKey || state.accumBaselineTs !== (base.ts || 0)) {
@@ -1542,7 +1630,11 @@
       }
       // explicit action guidance per verdict
       var doLine = null, assist = null;
-      if (isAccum) {
+      if (isPanda) {
+        if (verdict === "EXIT") { doLine = "DO: close 100% → SOL now. First bounce is the exit; don't wait for higher."; assist = { kind: "exit", label: "→ open the Withdraw panel" }; }
+        else if (verdict === "WATCH") doLine = "DO: get ready — RSI2 is hot; exit fires the moment a confirming leg closes with it.";
+        else doLine = "DO: nothing — let it dump into your band. Be happy, fees are accruing.";
+      } else if (isAccum) {
         if (verdict === "HOLD") doLine = "DO: nothing — let the band fill. You only buy dips here.";
         else if (verdict === "WATCH") doLine = "DO: stop adding size. If the second kill-rule fires, cut — no negotiating.";
         else if (verdict === "EXIT") { doLine = "DO: close and take what's left back to SOL — accumulating a dying token is just slow bleeding."; assist = { kind: "exit", label: "→ open the Withdraw panel" }; }
@@ -1552,7 +1644,8 @@
       else if (verdict === "TIGHTEN") { doLine = "DO: claim accrued fees NOW (bank the harvest) and consider pulling partial size. Keep a runner."; assist = { kind: "claim", label: "→ show me the Claim button" }; }
       else if (verdict === "EXIT") { doLine = "DO: close 100% → Zap Out to SOL. Do not negotiate with a fired rule."; assist = { kind: "exit", label: "→ open the Withdraw panel" }; }
 
-      var displayVerdict = isAccum ? (verdict === "HOLD" ? "ACCUMULATING" : verdict === "WATCH" ? "WAIT" : verdict) : verdict;
+      var displayVerdict = isPanda ? (verdict === "HOLD" ? "FARMING DUMP" : verdict === "WATCH" ? "EXIT ARMING" : verdict)
+        : isAccum ? (verdict === "HOLD" ? "ACCUMULATING" : verdict === "WATCH" ? "WAIT" : verdict) : verdict;
       var card = existing || el("div", "mql-card");
       card.id = "mql-poswatch";
       card.innerHTML = "";
@@ -1560,6 +1653,7 @@
       head.appendChild(el("span", "mql-pw-title", "POSITION WATCH"));
       if (isCombo) head.appendChild(el("span", "mql-pw-combo", "COMBO ×" + ap.count));
       if (isAccum) head.appendChild(el("span", "mql-pw-combo", "🪣 BID ASK" + (profileInferred ? " · inferred legacy" : "")));
+      if (isPanda) head.appendChild(el("span", "mql-pw-combo", "🐼 PANDA" + (posProfile === "PANDA_INFERRED" ? " · inferred" : "")));
       var pill = el("span", "mql-pw-pill " + cls, displayVerdict);
       tipify(pill, "poswatch");
       head.appendChild(pill);
@@ -1568,7 +1662,10 @@
       if (doLine) card.appendChild(el("div", "mql-pw-do", doLine));
       // live sigma-scaled brackets (scalp books) OR fill tracking (accum books)
       try {
-        if (!isAccum) {
+        if (isPanda) {
+          var pzp = state.entryPlan && state.entryPlan.profile === "PANDA" ? state.entryPlan : null;
+          card.appendChild(el("div", "mql-pw-brackets", "Panda band 0% → -" + (pzp ? pzp.depthPct : Math.round((1 - (ap && ap.minPrice / ap.maxPrice || 0.1)) * 100)) + "% · no TP/SL brackets — exit is indicator-driven (" + ((state.panda && state.panda.timeframe) || "5m") + ")"));
+        } else if (!isAccum) {
           var clampN = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
           // entry plan (journaled at Apply) outranks generic width-math
           var plan = boundPlan;
@@ -1676,7 +1773,7 @@
     bar.appendChild(head);
     if (radarCollapsed) {
       var n = (r && r.items) ? r.items.length : 0;
-      var full = (r && r.items) ? r.items.filter(function(i){return i.kind==="FULL" || i.kind==="BID_ASK";}).length : 0;
+      var full = (r && r.items) ? r.items.filter(function(i){return i.kind==="FULL" || i.kind==="BID_ASK" || i.kind==="PANDA";}).length : 0;
       bar.appendChild(el("span", "mql-radar-empty", full > 0 ? full + "🔥 " + (n-full) + "⚠" : n + " watched"));
       return;
     }
@@ -1687,9 +1784,11 @@
     r.items.forEach(function (it) {
       var isBidAsk = it.kind === "BID_ASK";
       var isBidWatch = it.kind === "BID_WATCH";
+      var isPandaChip = it.kind === "PANDA" || it.kind === "PANDA_WATCH";
       var chip = el("button", "mql-chip " + (it.kind === "FULL" ? "mql-chip-full mql-chip-" + it.cls.toLowerCase() : isBidAsk ? "mql-chip-full mql-chip-carry" : isBidWatch ? "mql-chip-watch" : "mql-chip-near"));
       var bs = it.binStep ? (it.binStep + "bps ") : "";
-      var lbl = it.kind === "FULL" ? ("🔥 " + it.name + " " + bs + "· " + it.cls + " · edge " + fmtNum(it.edge, 2))
+      var lbl = isPandaChip ? ("🐼 " + it.name + " " + bs + "· PANDA " + (it.kind === "PANDA" ? "ENTRY" : ((it.panda && it.panda.entry) || "WATCH")) + " · " + ((it.panda && it.panda.tf) || "") + (it.panda && it.panda.ageMin != null ? " · " + (it.panda.ageMin >= 120 ? Math.round(it.panda.ageMin / 6) / 10 + "h" : it.panda.ageMin + "m") + " old" : ""))
+        : it.kind === "FULL" ? ("🔥 " + it.name + " " + bs + "· " + it.cls + " · edge " + fmtNum(it.edge, 2))
         : isBidAsk ? ("🪣 " + it.name + " " + bs + "· BID ASK READY · 0→-" + (it.bidAsk && it.bidAsk.depthPct) + "%")
         : isBidWatch ? ("⚠ " + it.name + " " + bs + "· BID ASK WATCH · candle gates pending")
         : ("⚠ " + it.name + " " + bs + "· edge " + fmtNum(it.edge, 2) + " · misses " + (it.fails || []).map(function(f){return f.split(" ")[0];}).join("+"));
@@ -1701,7 +1800,9 @@
         else if (ca.state === "WAIT") lbl += " · candles WAIT";
       }
       chip.textContent = lbl;
-      chip.title = it.kind === "FULL" ? "All gates green — full " + it.cls + " signal. Click to open."
+      if (isPandaChip) chip.className = "mql-chip " + (it.kind === "PANDA" ? "mql-chip-full mql-chip-panda" : "mql-chip-watch");
+      chip.title = isPandaChip ? (it.kind === "PANDA" ? "Evil Panda: filters pass + fresh Supertrend break. Click to open; Apply from the Panda card." : "Evil Panda: filters pass, waiting for the Supertrend break (" + ((it.panda && it.panda.why) || "") + ").")
+        : it.kind === "FULL" ? "All gates green — full " + it.cls + " signal. Click to open."
         : isBidAsk ? "Base and candle qualification gates pass. Manual Bid-Ask + Spot guide; click to open."
         : isBidWatch ? "Base BID ASK gates pass, but candle qualification is incomplete. No entry guide yet; click to inspect the reason."
         : "Near-miss (override-eligible): fails " + (it.fails || []).join(", ") + ". Click to open.";
