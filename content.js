@@ -778,6 +778,7 @@
       state.panda = (r && r.ok) ? r : { ok: false, error: (r && r.error) || "panda data unavailable", pool: pool };
       state.panda.pool = pool;
       renderHUD();
+      try { renderPosWatch(); } catch (e) {}
     }));
     try { chrome.storage.local.get({ mqlPandaPins: {} }, function (st) { pandaUI.pinned = (st && st.mqlPandaPins) || {}; }); } catch (e) {}
   });
@@ -785,7 +786,13 @@
   function pandaHeadState(p) {
     if (!p || !p.ok) return { txt: "…", cls: "mql-rec-wait" };
     var s = p.signals;
-    if (s && s.exit && s.exit.state === "EXIT") return { txt: "EXIT", cls: "mql-rec-scalp" };
+    if (s && s.exit && s.exit.state === "EXIT") {
+      var ap0 = state.apiPos;
+      var g0 = (ap0 && ap0.has && window.MQLEvilPanda) ? window.MQLEvilPanda.pandaExitGate({ exit: s.exit, timeframe: p.timeframe,
+        fillPct: ap0.fillPct, createdAtSec: ap0.createdAt, lastClosedTs: s.lastClosedTs }) : null;
+      if (g0 && g0.state === "WAITING_DUMP") return { txt: "WAITING FOR DUMP", cls: "mql-rec-wait" };
+      return { txt: ap0 && ap0.has ? "EXIT" : "EXIT SIGNAL (no position)", cls: "mql-rec-scalp" };
+    }
     var e = s && s.entry ? s.entry.state : "NO_DATA";
     if (p.screen && p.screen.state === "FAIL") return { txt: "FILTER FAIL · " + e, cls: "mql-rec-wait" };
     if (e === "ENTRY") return { txt: "ENTRY", cls: "mql-rec-carry" };
@@ -1542,9 +1549,17 @@
       // exit rules (same as the bot manager) — accumulation books get their own rulebook
       var verdict = "HOLD", cls = "mql-pw-hold", reasons = [];
       if (isPanda) {
+        var pgate = null;
         var pz = state.panda && state.panda.ok && state.panda.pool === state.pool ? state.panda : null;
         var pex = pz && pz.signals ? pz.signals.exit : null;
-        if (!pex) { verdict = "WATCH"; cls = "mql-pw-warn"; reasons.push("Panda exit signals loading…"); if (!pz) fetchPanda(); }
+        if (!pex) { verdict = "LOADING"; cls = "mql-pw-hold"; reasons.push("Panda exit signals loading…"); if (!pz) fetchPanda(); }
+        else if ((pgate = window.MQLEvilPanda ? window.MQLEvilPanda.pandaExitGate({ exit: pex, timeframe: pz.timeframe,
+            fillPct: ap && ap.fillPct, createdAtSec: ap && ap.createdAt, lastClosedTs: pz.signals.lastClosedTs }) : null)
+            && pgate.state === "WAITING_DUMP") {
+          verdict = "WAITING"; cls = "mql-pw-hold";
+          reasons.push(pgate.reason + (pgate.signal ? " (the RSI2/BB pattern on screen is the pump you entered on, not a post-dump bounce — ignored)" : ""));
+          reasons.push("exit arms once price dumps into the band (≥" + window.MQLEvilPanda.MIN_FILL_PCT + "% filled) — that's when you start earning");
+        }
         else if (pex.state === "EXIT") { verdict = "EXIT"; cls = "mql-pw-exit"; reasons.push("Panda exit confluence on the " + pz.timeframe + " close: " + pex.legs.join(" | ")); }
         else {
           reasons.push("dumping = earning fees. Exit waits for RSI2>90 + (close>BB upper or first green MACD) on one closed " + pz.timeframe + " candle");
@@ -1633,6 +1648,7 @@
       if (isPanda) {
         if (verdict === "EXIT") { doLine = "DO: close 100% → SOL now. First bounce is the exit; don't wait for higher."; assist = { kind: "exit", label: "→ open the Withdraw panel" }; }
         else if (verdict === "WATCH") doLine = "DO: get ready — RSI2 is hot; exit fires the moment a confirming leg closes with it.";
+        else if (verdict === "WAITING") doLine = "DO: nothing — you're 100% SOL above the dump. Fees start when price falls into the band.";
         else doLine = "DO: nothing — let it dump into your band. Be happy, fees are accruing.";
       } else if (isAccum) {
         if (verdict === "HOLD") doLine = "DO: nothing — let the band fill. You only buy dips here.";
@@ -1644,7 +1660,7 @@
       else if (verdict === "TIGHTEN") { doLine = "DO: claim accrued fees NOW (bank the harvest) and consider pulling partial size. Keep a runner."; assist = { kind: "claim", label: "→ show me the Claim button" }; }
       else if (verdict === "EXIT") { doLine = "DO: close 100% → Zap Out to SOL. Do not negotiate with a fired rule."; assist = { kind: "exit", label: "→ open the Withdraw panel" }; }
 
-      var displayVerdict = isPanda ? (verdict === "HOLD" ? "FARMING DUMP" : verdict === "WATCH" ? "EXIT ARMING" : verdict)
+      var displayVerdict = isPanda ? (verdict === "LOADING" ? "…" : verdict === "HOLD" ? "FARMING DUMP" : verdict === "WAITING" ? "WAITING FOR DUMP" : verdict === "WATCH" ? "EXIT ARMING" : verdict)
         : isAccum ? (verdict === "HOLD" ? "ACCUMULATING" : verdict === "WATCH" ? "WAIT" : verdict) : verdict;
       var card = existing || el("div", "mql-card");
       card.id = "mql-poswatch";

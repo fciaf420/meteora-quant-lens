@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meteora Quant Lens",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Overlay for meteora.ag DLMM pool pages that surfaces quant signals the UI hides. Pure lens + warnings, no signing.",
   "permissions": [
     "storage",
@@ -24,7 +24,9 @@
         "https://meteora.ag/*",
         "https://app.meteora.ag/*"
       ],
-      "js": ["tv-bridge.js"],
+      "js": [
+        "tv-bridge.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
@@ -35,6 +37,7 @@
         "https://app.meteora.ag/*"
       ],
       "js": [
+        "evil-panda.js",
         "content.js"
       ],
       "css": [

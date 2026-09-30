@@ -305,6 +305,29 @@
     return finite(lo) && finite(hi) && hi > 0 && lo > 0 && lo / hi <= 0.2;
   }
 
+  // A Panda exit is "sell the token you collected on the first bounce". It only
+  // applies once (a) price has actually dumped INTO the band (the position holds
+  // token), and (b) the confluence candle closed AFTER the position was opened.
+  // Caught live 2026-09-30: an override entered mid-pump read EXIT on its very
+  // first candle (RSI2>90 + BB upper = the pump itself) while still 100% SOL.
+  const MIN_FILL_PCT = 3;
+  function pandaExitGate(o) {
+    o = o || {};
+    const ex = o.exit || {};
+    const tfSec = TIMEFRAMES[o.timeframe] || 300;
+    const fill = toNum(o.fillPct);
+    const created = toNum(o.createdAtSec);
+    const lastClosed = toNum(o.lastClosedTs);
+    const afterOpen = !finite(created) || (finite(lastClosed) && lastClosed + tfSec > created);
+    const filled = finite(fill) ? fill >= MIN_FILL_PCT : null;
+    if (filled === false) return { state: 'WAITING_DUMP', armed: false, signal: ex.state === 'EXIT',
+      reason: 'band ' + Math.round(fill) + '% filled — price has not dumped into it yet, nothing to sell' };
+    if (!afterOpen) return { state: 'WAITING_DUMP', armed: false, signal: ex.state === 'EXIT',
+      reason: 'no candle has closed since the position opened' };
+    if (ex.state === 'EXIT') return { state: 'EXIT', armed: true, signal: true, reason: (ex.legs || []).join(' | ') };
+    return { state: ex.state === 'WARMING' ? 'WARMING' : 'HOLD', armed: true, signal: false, reason: null };
+  }
+
   function lateHour(nowMs, p = DEFAULTS) {
     const h = new Date(finite(nowMs) ? nowMs : Date.now()).getHours();
     return h >= p.noNewPositionsAfterHour;
@@ -313,6 +336,6 @@
   return {
     TIMEFRAMES, DEFAULT_TIMEFRAME, DEFAULTS,
     normalizeCandles, ema, rma, rsi, bollinger, macd, supertrend, warmupNeeded,
-    evaluateSignals, screenCoin, binsForDepth, rangeRecipe, isPandaShaped, lateHour,
+    evaluateSignals, screenCoin, binsForDepth, rangeRecipe, isPandaShaped, lateHour, pandaExitGate, MIN_FILL_PCT,
   };
 });

@@ -151,3 +151,18 @@ test('isPandaShaped: deep one-sided ranges only', () => {
   assert.equal(P.isPandaShaped(0.1, 1), true);
   assert.equal(P.isPandaShaped(0.8, 1), false);
 });
+
+test('pandaExitGate: exit ignored while the band is unfilled or on pre-open candles', () => {
+  const exit = { state: 'EXIT', legs: ['RSI2>90 + close>BB upper'] };
+  // live 2026-09-30 case: opened mid-pump, 0% filled -> not an exit
+  assert.equal(P.pandaExitGate({ exit, fillPct: 0, createdAtSec: 1000, lastClosedTs: 1200, timeframe: '5m' }).state, 'WAITING_DUMP');
+  // filled but the confluence candle closed before the position existed
+  assert.equal(P.pandaExitGate({ exit, fillPct: 40, createdAtSec: 1000, lastClosedTs: 600, timeframe: '5m' }).state, 'WAITING_DUMP');
+  // filled + candle closed after open -> real exit
+  const g = P.pandaExitGate({ exit, fillPct: 40, createdAtSec: 1000, lastClosedTs: 1000, timeframe: '5m' });
+  assert.equal(g.state, 'EXIT');
+  assert.equal(g.armed, true);
+  // unknown fill falls through to the signal (can't prove unfilled)
+  assert.equal(P.pandaExitGate({ exit, createdAtSec: 1000, lastClosedTs: 1000 }).state, 'EXIT');
+  assert.equal(P.pandaExitGate({ exit: { state: 'HOLD' }, fillPct: 40 }).state, 'HOLD');
+});

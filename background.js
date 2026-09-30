@@ -1848,7 +1848,11 @@ async function watchPositions() {
           let pz = null;
           try { pz = await getPanda(pool); } catch (eZ) {}
           const ex = pz && pz.ok && pz.signals ? pz.signals.exit : null;
-          cond.PANDA_EXIT = !!(ex && ex.state === 'EXIT');
+          const pf = positionFill(pos, cur);
+          const gate = globalThis.MQLEvilPanda.pandaExitGate({ exit: ex, timeframe: pz && pz.timeframe,
+            fillPct: pf.fill != null ? pf.fill * 100 : null, createdAtSec: Number(pos.createdAt) || null,
+            lastClosedTs: pz && pz.signals ? pz.signals.lastClosedTs : null });
+          cond.PANDA_EXIT = gate.state === 'EXIT';
           msgs.PANDA_EXIT = '🐼 PANDA EXIT: ' + name + ' — ' + (ex && ex.legs ? ex.legs.join(' | ') : '') + ' on the ' + (pz && pz.timeframe) + ' close. First bounce is here: close 100% → SOL. Don\'t wait for higher. PnL ' + pnl.toFixed(1) + '%';
           msgs.OOR_DOWN = '🐼 BELOW PANDA FLOOR: ' + name + ' — price fell through the whole -86..-94% band. 100% token, no more fees. Panda rule: admit it and cut if the thesis is dead. PnL ' + pnl.toFixed(1) + '%';
           msgs.OOR_UP = '🐼 ABOVE PANDA BAND: ' + name + ' — price back above your top, band is 100% SOL + fees. Nothing left to sell into; close to bank it. PnL ' + pnl.toFixed(1) + '%';
