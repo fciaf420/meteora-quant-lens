@@ -431,3 +431,16 @@ calibration. DLMM liquidity provision carries real risk including impermanent
 loss and total loss of capital — particularly ACCUM setups, which are designed to
 end up holding the token. Do your own research and verify every number on-chain
 before committing funds.
+
+## Evil Panda module (v0.8.0)
+
+Implements [@EvilPanda's Bootcamp #7 strat](https://x.com/EvilPanda/status/2004311197995446725) as a HUD card + alerts.
+
+- **Data:** GMGN openapi (key in Options). Token-level candles (`/v1/market/token_kline`, 100 bars) so young tokens have history from launch, not just from when the Meteora pool was created; `/v1/token/info` + `/v1/token/security` for the filters. Without a key: Meteora pool 5m candles, filters INCOMPLETE.
+- **Timeframe:** 5m default, 1m optional (source uses 15m, which can't warm MACD on new tokens for ~9h). Warm-up: Supertrend 11 bars, BB 20, MACD 35. Before MACD warms, exit runs on RSI2 + BB only.
+- **Filters:** MC ≥ $250k, 24h vol ≥ $1M, has picture, GMGN fees > 30, phishing (`top_entrapment_trader_percentage`) < 30%, bundling < 60%, insiders (`top_rat_trader_percentage`) < 10%, top10 < 30%, SOL pair; bin step 80/100/125 is a soft gate.
+- **Entry:** closed candle breaks above Supertrend(10,3). 5m: 1 close; 1m: 2 closes. Break older than 3 (5m) / 6 (1m) candles = LATE.
+- **Exit:** same closed candle RSI(2) > 90 AND (close > BB(20,2) upper OR first green MACD(12,26,9) histogram bar).
+- **Recipe:** one-sided SOL, -86% .. -94%, bins shown per bin step (198-283 at 100bps).
+- **Alerts:** EXIT for open Panda-shaped positions (bottom ≤ 20% of top, via Position Watch); ENTRY for pools you pin. Desktop + Discord, 15 min cooldown.
+- Pure math in `evil-panda.js`, tests in `tests/evil-panda.test.cjs`.

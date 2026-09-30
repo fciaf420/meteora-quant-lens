@@ -6,7 +6,7 @@
 
 'use strict';
 
-importScripts('candle-analysis.js');
+importScripts('candle-analysis.js', 'evil-panda.js');
 
 // ---------------------------------------------------------------------------
 // Small utils
@@ -1684,6 +1684,7 @@ async function watchPositions() {
         // [plan - 15min, plan + 6h]. Intent is not execution.
         const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice), cur = Number(pos.poolActivePrice);
         const W = positionWidthPct(pos);
+        try { if (globalThis.MQLEvilPanda.isPandaShaped(minP, maxP)) pandaShapes[pool] = { name, wallet, minP, maxP, ts: Date.now() }; } catch (eP) {}
         const planRaw9 = plans[pool] || null;
         const planEarly = planMatchesPosition(planRaw9, W, pos.createdAt, Date.now()) ? planRaw9 : null;
         const hudBase = posBaseAll[pool];
@@ -1942,6 +1943,173 @@ async function watchPositions() {
   await chrome.storage.local.set({ mqlAlertStates: states, mqlLastPos: st.mqlLastPos || {}, mqlPosBaseline: posBaseAll });
 }
 
+// ===========================================================================
+// EVIL PANDA module (see evil-panda.js for the strategy + math)
+// Data: GMGN openapi token-level candles (follow the token across venues, so a
+// young token has candles from launch, not just from when its Meteora pool was
+// made) + GMGN token info/security for the coin-selection filters. Fallback when
+// no GMGN key: Meteora pool-level 5m candles (signals only, filters INCOMPLETE).
+// GMGN free tier rate-limits hard (429 after ~3 quick calls), so: one serialized
+// queue with spacing, honor reset_at, cache filters 3 min, and only re-pull
+// candles once a new bucket has closed.
+// ===========================================================================
+const GMGN = 'https://openapi.gmgn.ai';
+const GMGN_GAP_MS = 1500;
+const PANDA_INFO_TTL_MS = 3 * 60 * 1000;
+const PANDA_KLINE_RETRY_MS = 20 * 1000;
+const PANDA_ALERT_COOLDOWN_MS = 15 * 60 * 1000;
+let gmgnChain = Promise.resolve();
+let gmgnLastAt = 0;
+let gmgnBlockedUntil = 0;
+const pandaInfoCache = new Map();   // mint -> { ts, info, security }
+const pandaKlineCache = new Map();  // mint:tf -> { fetchedAt, candles, source }
+const pandaShapes = {};             // pool -> { name, wallet, minP, maxP, ts } (filled by watchPositions)
+
+function getPandaSettings() {
+  return chrome.storage.sync.get({ gmgnApiKey: '', pandaTimeframe: '5m', pandaExitAlerts: true, webhookUrl: '' })
+    .then((s) => ({ gmgnApiKey: String(s.gmgnApiKey || '').trim(),
+      pandaTimeframe: globalThis.MQLEvilPanda.TIMEFRAMES[s.pandaTimeframe] ? s.pandaTimeframe : '5m',
+      pandaExitAlerts: s.pandaExitAlerts !== false, webhookUrl: s.webhookUrl || '' }))
+    .catch(() => ({ gmgnApiKey: '', pandaTimeframe: '5m', pandaExitAlerts: true, webhookUrl: '' }));
+}
+
+function gmgnGet(path, params, apiKey) {
+  const run = async () => {
+    if (!apiKey) return { ok: false, error: 'no GMGN key' };
+    if (Date.now() < gmgnBlockedUntil) return { ok: false, rateLimited: true, error: 'GMGN rate limited for ' + Math.ceil((gmgnBlockedUntil - Date.now()) / 1000) + 's' };
+    const wait = gmgnLastAt + GMGN_GAP_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    gmgnLastAt = Date.now();
+    const q = new URLSearchParams(Object.assign({}, params, {
+      timestamp: String(Math.floor(Date.now() / 1000)),
+      client_id: (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)) }));
+    const r = await fetchJson(GMGN + path + '?' + q.toString(), { 'X-APIKEY': apiKey });
+    const j = r && r.json;
+    if (j && (j.code === 429 || j.error === 'RATE_LIMIT_EXCEEDED' || r.status === 429)) {
+      gmgnBlockedUntil = j && j.reset_at ? Number(j.reset_at) * 1000 + 1000 : Date.now() + 60e3;
+      return { ok: false, rateLimited: true, error: 'GMGN rate limited' };
+    }
+    if (!r.ok || !j || j.code !== 0) return { ok: false, error: 'GMGN ' + path + ' ' + (r.status || '') + ' ' + ((j && (j.message || j.error)) || (r.error || '')) };
+    return { ok: true, data: j.data };
+  };
+  const p = gmgnChain.then(run, run);
+  gmgnChain = p.catch(() => {});
+  return p;
+}
+
+async function pandaCoinData(mint, apiKey) {
+  const now = Date.now();
+  const hit = pandaInfoCache.get(mint);
+  if (hit && now - hit.ts < PANDA_INFO_TTL_MS) return Object.assign({ fresh: true }, hit);
+  if (!apiKey) return hit ? Object.assign({ fresh: false }, hit) : null;
+  const info = await gmgnGet('/v1/token/info', { chain: 'sol', address: mint }, apiKey);
+  const sec = info.ok ? await gmgnGet('/v1/token/security', { chain: 'sol', address: mint }, apiKey) : { ok: false };
+  if (info.ok) {
+    const rec = { ts: now, info: info.data, security: sec.ok ? sec.data : (hit && hit.security) || null };
+    pandaInfoCache.set(mint, rec);
+    return Object.assign({ fresh: true }, rec);
+  }
+  return hit ? Object.assign({ fresh: false, error: info.error }, hit) : { error: info.error };
+}
+
+async function pandaCandles(mint, pool, tf, apiKey) {
+  const P = globalThis.MQLEvilPanda;
+  const tfSec = P.TIMEFRAMES[tf];
+  const now = Date.now();
+  const key = mint + ':' + tf;
+  const lastClosedStart = Math.floor(now / 1000 / tfSec) * tfSec - tfSec;
+  const hit = pandaKlineCache.get(key);
+  if (hit && (hit.lastTs >= lastClosedStart || now - hit.fetchedAt < PANDA_KLINE_RETRY_MS)) return hit;
+  let res = null;
+  if (apiKey) {
+    const toS = Math.floor(now / 1000);
+    const r = await gmgnGet('/v1/market/token_kline', { chain: 'sol', address: mint, resolution: tf,
+      from: String((toS - 101 * tfSec) * 1000), to: String(toS * 1000) }, apiKey);
+    if (r.ok) {
+      const c = P.normalizeCandles(r.data, tfSec, now);
+      res = { fetchedAt: now, candles: c, source: 'gmgn-token', lastTs: c.length ? c[c.length - 1].t : 0 };
+    } else if (hit) {
+      return Object.assign({}, hit, { stale: true, error: r.error });
+    } else {
+      res = { error: r.error };
+    }
+  }
+  // fallback: Meteora pool-level 5m (no 1m on datapi; <=8h per request). Pool-level
+  // only starts when the Meteora pool was created, which can be after token launch.
+  if ((!res || res.error) && tf === '5m') {
+    const nowS = Math.floor(now / 1000);
+    const r = await fetchJson(DATAPI + '/pools/' + encodeURIComponent(pool) + '/ohlcv?timeframe=5m&start_time=' + (nowS - 8 * 3600) + '&end_time=' + nowS);
+    if (r.ok) {
+      const c = P.normalizeCandles(r.json, tfSec, now);
+      res = { fetchedAt: now, candles: c, source: 'meteora-pool', lastTs: c.length ? c[c.length - 1].t : 0, gmgnError: res && res.error };
+    }
+  }
+  if (res && !res.error) pandaKlineCache.set(key, res);
+  return res || { error: 'no candle source' };
+}
+
+async function getPanda(pool, opts = {}) {
+  const P = globalThis.MQLEvilPanda;
+  const s = await getPandaSettings();
+  const tf = P.TIMEFRAMES[opts.timeframe] ? opts.timeframe : s.pandaTimeframe;
+  const pd = await getPoolData(pool, null, { deferCandle: true });
+  if (!pd || !pd.ok) return { ok: false, error: (pd && pd.error) || 'pool data unavailable' };
+  const meta = pd.pool || {};
+  const mint = meta.tokenX && meta.tokenX.address;
+  if (!mint) return { ok: false, error: 'token mint unknown' };
+  const coin = await pandaCoinData(mint, s.gmgnApiKey);
+  const kl = await pandaCandles(mint, pool, tf, s.gmgnApiKey);
+  const screen = P.screenCoin({ info: coin && coin.info, security: coin && coin.security,
+    pool: { supportedSolPair: meta.supportedSolPair, binStep: meta.binStep } });
+  const signals = kl && kl.candles ? P.evaluateSignals(kl.candles, { timeframe: tf }) : null;
+  const price = kl && kl.candles && kl.candles.length ? kl.candles[kl.candles.length - 1].c : null;
+  return {
+    ok: true, pool, mint, name: meta.name, timeframe: tf, hasKey: !!s.gmgnApiKey,
+    screen, signals, candleSource: kl && kl.source, candleError: kl && (kl.error || kl.gmgnError) || null,
+    candlesStale: !!(kl && kl.stale), coinError: coin && coin.error || null, coinStale: !!(coin && coin.fresh === false),
+    recipe: P.rangeRecipe(meta.binStep, meta.currentPrice || price),
+    lateHour: P.lateHour(Date.now()), watched: !!pandaShapes[pool],
+    ts: Date.now(),
+  };
+}
+
+async function pandaWatch() {
+  try {
+    const P = globalThis.MQLEvilPanda;
+    const s = await getPandaSettings();
+    if (!s.pandaExitAlerts) return;
+    const st = await chrome.storage.local.get({ mqlPandaPins: {}, mqlPandaAlerted: {} });
+    const pins = st.mqlPandaPins || {}, alerted = st.mqlPandaAlerted || {};
+    const now = Date.now();
+    const targets = {};
+    for (const [pool, v] of Object.entries(pandaShapes)) if (now - v.ts < 3 * 60e3) targets[pool] = { name: v.name, why: 'position' };
+    for (const [pool, v] of Object.entries(pins)) if (!targets[pool]) targets[pool] = { name: v.name, why: 'pin' };
+    let dirty = false;
+    for (const [pool, t] of Object.entries(targets).slice(0, 6)) {
+      const d = await getPanda(pool);
+      if (!d.ok || !d.signals) continue;
+      const sig = d.signals;
+      const isPos = t.why === 'position';
+      // positions: exit alerts. pins (no position yet): entry alerts.
+      const fire = isPos ? sig.exit.state === 'EXIT' : sig.entry.state === 'ENTRY' && d.screen.state !== 'FAIL';
+      if (!fire) continue;
+      const kind = isPos ? 'EXIT' : 'ENTRY';
+      const k = pool + ':' + kind;
+      const prev = alerted[k];
+      if (prev && (prev.candle === sig.lastClosedTs || now - prev.at < PANDA_ALERT_COOLDOWN_MS)) continue;
+      alerted[k] = { candle: sig.lastClosedTs, at: now }; dirty = true;
+      const name = d.name || t.name || pool.slice(0, 8);
+      const body = isPos
+        ? 'EXIT signal (' + d.timeframe + '): ' + sig.exit.legs.join(' | ') + (sig.exit.partial ? ' · ' + sig.exit.partial : '')
+        : 'ENTRY: closed above Supertrend (' + d.timeframe + ') · filters ' + d.screen.state + ' · one-sided SOL -' + d.recipe.shallow.depthPct + '%..-' + d.recipe.deep.depthPct + '%';
+      try { chrome.notifications.create('mqlpanda-' + now + '-' + pool.slice(0, 4), { type: 'basic', iconUrl: 'icon128.png', title: '🐼 Panda ' + kind + ' · ' + name, message: body, priority: 2 }); } catch (e) {}
+      if (s.webhookUrl) await postDiscord(s.webhookUrl, '**Meteora Lens** · 🐼 Evil Panda **' + kind + '** · ' + name + '\n' + body + '\nhttps://www.meteora.ag/dlmm/' + pool);
+    }
+    for (const k of Object.keys(alerted)) if (now - alerted[k].at > 24 * 3600e3) { delete alerted[k]; dirty = true; }
+    if (dirty) await chrome.storage.local.set({ mqlPandaAlerted: alerted });
+  } catch (e) {}
+}
+
 // ---- RADAR ALERTS: ping Discord when a pool passes ALL gates (a 🔥 full signal) ----
 async function radarAlertScan() {
   const cfg = await chrome.storage.sync.get({ radarAlerts: false, webhookUrl: '' });
@@ -2148,7 +2316,7 @@ async function dailyRecon() {
     await chrome.storage.local.set({ mqlTradeLog: arr.slice(-200), mqlDailyReconDone: today });
   } catch (e) {}
 }
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions(); radarAlertScan(); healthCheck(); reconcileJournal(); walletTruthPass(); dailyRecon(); } });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions().catch(() => {}).then(() => pandaWatch()); radarAlertScan(); healthCheck(); reconcileJournal(); walletTruthPass(); dailyRecon(); } });
 chrome.runtime.onInstalled.addListener(() => chrome.alarms.create('mql-watch', { periodInMinutes: 1 }));
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -2332,6 +2500,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const entryPlan = planState.mqlEntryPlan && planState.mqlEntryPlan[msg.pool];
         sendResponse(summarizePositions(merged, entryPlan));
       } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+    })();
+    return true;
+  }
+  if (msg.type === 'getPanda') {
+    (async () => {
+      try {
+        if (!msg.pool) { sendResponse({ ok: false, error: 'missing pool address' }); return; }
+        sendResponse(await getPanda(String(msg.pool), { timeframe: msg.timeframe }));
+      } catch (e) { sendResponse({ ok: false, error: (e && e.message) ? e.message : String(e) }); }
+    })();
+    return true;
+  }
+  if (msg.type === 'pandaPin') {
+    (async () => {
+      try {
+        const st = await chrome.storage.local.get({ mqlPandaPins: {} });
+        const pins = st.mqlPandaPins || {};
+        if (msg.on) pins[String(msg.pool)] = { name: msg.name || null, ts: Date.now() }; else delete pins[String(msg.pool)];
+        await chrome.storage.local.set({ mqlPandaPins: pins });
+        sendResponse({ ok: true, pinned: !!msg.on });
+      } catch (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); }
     })();
     return true;
   }

@@ -48,6 +48,24 @@
       </label>
       <p class="hint">Fires while Chrome is open, even with no Meteora tab. 2h cooldown per pool. Requires the webhook above.</p>
     </div>
+    <h2 style="margin-top:18px">🐼 Evil Panda module</h2>
+    <div class="field">
+      <label for="gmgnApiKey">GMGN API key</label>
+      <input type="password" id="gmgnApiKey" placeholder="gmgn_..." spellcheck="false" autocomplete="off" />
+      <p class="hint">From <strong>gmgn.ai</strong> API settings. Powers token-level candles from launch + the coin filters (fees, phishing, bundling, insiders, top10). Without it the module falls back to Meteora pool 5m candles and filters show INCOMPLETE.</p>
+    </div>
+    <div class="field">
+      <label for="pandaTimeframe">Panda signal timeframe</label>
+      <select id="pandaTimeframe"><option value="5m">5m (default)</option><option value="1m">1m (faster warm-up, more traps; 2-close entry confirm)</option></select>
+      <p class="hint">Source strat uses 15m; on young tokens 15m can't warm MACD for ~9h. 5m: all indicators warm in ~3h. 1m: ~35 min.</p>
+    </div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="pandaExitAlerts" style="width:auto" />
+        Panda alerts: EXIT on open deep one-sided positions, ENTRY on pinned pools
+      </label>
+      <p class="hint">Desktop notification always; Discord too if the webhook above is set. Auto-detects Panda-shaped positions (bottom ≤ 20% of top) via Position Watch.</p>
+    </div>
     <button id="testWebhook" type="button">Send test alert</button>
 
     <button id="saveBtn" type="submit">Save</button>

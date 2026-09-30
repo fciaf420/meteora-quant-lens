@@ -12,7 +12,7 @@ function showToast(text, isError) {
 
 function load() {
   try {
-    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '', radarAlerts: false, heliusApiKey: '' }, (items) => {
+    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '', radarAlerts: false, heliusApiKey: '', gmgnApiKey: '', pandaTimeframe: '5m', pandaExitAlerts: true }, (items) => {
       if (chrome.runtime.lastError) return;
       $('jupApiKey').value = (items && items.jupApiKey) ? items.jupApiKey : '';
       if ($('heliusApiKey')) $('heliusApiKey').value = items.heliusApiKey || '';
@@ -21,6 +21,9 @@ function load() {
       if ($('webhookUrl')) $('webhookUrl').value = items.webhookUrl || '';
       if ($('walletAddress')) $('walletAddress').value = items.walletAddress || '';
       if ($('radarAlerts')) $('radarAlerts').checked = !!items.radarAlerts;
+      if ($('gmgnApiKey')) $('gmgnApiKey').value = items.gmgnApiKey || '';
+      if ($('pandaTimeframe')) $('pandaTimeframe').value = items.pandaTimeframe === '1m' ? '1m' : '5m';
+      if ($('pandaExitAlerts')) $('pandaExitAlerts').checked = items.pandaExitAlerts !== false;
     });
   } catch (e) {
     showToast('Could not read settings', true);
@@ -34,10 +37,13 @@ function save(e) {
   const walletAddress = $('walletAddress') ? $('walletAddress').value.trim() : '';
   const radarAlerts = $('radarAlerts') ? $('radarAlerts').checked : false;
   const heliusApiKey = $('heliusApiKey') ? $('heliusApiKey').value.trim() : '';
+  const gmgnApiKey = $('gmgnApiKey') ? $('gmgnApiKey').value.trim() : '';
+  const pandaTimeframe = $('pandaTimeframe') && $('pandaTimeframe').value === '1m' ? '1m' : '5m';
+  const pandaExitAlerts = $('pandaExitAlerts') ? $('pandaExitAlerts').checked : true;
   let mqlWidthPct = parseFloat($('mqlWidthPct').value);
   if (!isFinite(mqlWidthPct) || mqlWidthPct <= 0) mqlWidthPct = 20;
   try {
-    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress, radarAlerts, heliusApiKey }, () => {
+    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress, radarAlerts, heliusApiKey, gmgnApiKey, pandaTimeframe, pandaExitAlerts }, () => {
       if (chrome.runtime.lastError) {
         showToast('Save failed: ' + chrome.runtime.lastError.message, true);
       } else {

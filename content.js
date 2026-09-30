@@ -176,6 +176,7 @@
         state.data = resp;
         state.lastFetchTs = Date.now();
         renderHUD(); renderPosWatch(); pollMyPosition();
+        fetchPanda();
         (function pwRetry(n) {
           if (n <= 0) return;
           setTimeout(safe(function () {
@@ -732,6 +733,119 @@
       });
       wrap.appendChild(body);
     }
+    hud.appendChild(wrap);
+  });
+
+  // ---- EVIL PANDA card (data + math live in background getPanda / evil-panda.js) ----
+  var pandaUI = { open: true, tf: null, fetching: false, pinned: {} };
+  var fetchPanda = safe(function fetchPanda() {
+    if (ctxDead || !state.pool || pandaUI.fetching) return;
+    pandaUI.fetching = true;
+    var pool = state.pool;
+    sendMessage({ type: "getPanda", pool: pool, timeframe: pandaUI.tf || undefined }).then(safe(function (r) {
+      pandaUI.fetching = false;
+      if (pool !== state.pool) return;
+      state.panda = (r && r.ok) ? r : { ok: false, error: (r && r.error) || "panda data unavailable", pool: pool };
+      state.panda.pool = pool;
+      renderHUD();
+    }));
+    try { chrome.storage.local.get({ mqlPandaPins: {} }, function (st) { pandaUI.pinned = (st && st.mqlPandaPins) || {}; }); } catch (e) {}
+  });
+
+  function pandaHeadState(p) {
+    if (!p || !p.ok) return { txt: "…", cls: "mql-rec-wait" };
+    var s = p.signals;
+    if (s && s.exit && s.exit.state === "EXIT") return { txt: "EXIT", cls: "mql-rec-scalp" };
+    var e = s && s.entry ? s.entry.state : "NO_DATA";
+    if (p.screen && p.screen.state === "FAIL") return { txt: "FILTER FAIL · " + e, cls: "mql-rec-wait" };
+    if (e === "ENTRY") return { txt: "ENTRY", cls: "mql-rec-carry" };
+    return { txt: e, cls: e === "CONFIRMING" ? "mql-rec-rev" : "mql-rec-wait" };
+  }
+
+  var renderPandaBlock = safe(function renderPandaBlock(hud) {
+    var p = state.panda;
+    if (!p || p.pool !== state.pool) { fetchPanda(); return; }
+    var wrap = el("div", "mql-accum mql-panda");
+    var head = el("div", "mql-accum-head");
+    var hs = pandaHeadState(p);
+    var title = el("span", "mql-accum-title", "🐼 EVIL PANDA · ");
+    title.appendChild(el("span", "mql-rec-pill " + hs.cls, hs.txt));
+    if (p.ok) title.appendChild(el("span", "mql-sub", " " + p.timeframe));
+    head.appendChild(title);
+    head.appendChild(el("span", "mql-accum-caret", pandaUI.open ? "▾" : "▸"));
+    head.addEventListener("click", safe(function (ev) {
+      if (ev.target && ev.target.closest && ev.target.closest("input,button")) return;
+      pandaUI.open = !pandaUI.open; renderHUD();
+    }));
+    wrap.appendChild(head);
+    if (!pandaUI.open) { hud.appendChild(wrap); return; }
+    var body = el("div", "mql-accum-body");
+    if (!p.ok) { body.appendChild(el("div", "mql-accum-note", p.error || "unavailable")); wrap.appendChild(body); hud.appendChild(wrap); return; }
+    if (!p.hasKey) body.appendChild(el("div", "mql-rec-warn", "No GMGN key (Options) — filters INCOMPLETE, candles from Meteora pool 5m only"));
+
+    // filters
+    var sc = p.screen || { gates: [] };
+    body.appendChild(el("div", "mql-accum-line", "Coin filters · " + sc.state + (p.coinStale ? " (stale)" : "")));
+    var gl = el("div", "mql-panda-gates");
+    (sc.gates || []).forEach(function (g) {
+      var mark = g.pass === true ? "✓" : (g.pass === false ? (g.hard ? "✗" : "⚠") : "?");
+      var n = el("div", "mql-accum-note mql-panda-g " + (g.pass === true ? "ok" : g.pass === false ? (g.hard ? "bad" : "soft") : "unk"), mark + " " + g.label);
+      gl.appendChild(n);
+    });
+    body.appendChild(gl);
+    var f = sc.facts || {};
+    if (f.ageMin != null) body.appendChild(el("div", "mql-accum-prior", "token age " + (f.ageMin >= 120 ? (f.ageMin / 60).toFixed(1) + "h" : f.ageMin + "m") + (f.launchpad ? " · " + f.launchpad : "") + (f.holders ? " · " + f.holders + " holders" : "")));
+
+    // entry / exit
+    var s = p.signals;
+    if (!s) {
+      body.appendChild(el("div", "mql-accum-note", "no candles: " + (p.candleError || "unknown")));
+    } else {
+      var en = s.entry || {};
+      var enTxt = "Entry (Supertrend 10,3): " + en.state + (en.why ? " — " + en.why : "") + (en.state === "WARMING" ? " (~" + en.etaMin + "m)" : "");
+      body.appendChild(el("div", "mql-accum-line", enTxt));
+      var ex = s.exit || {};
+      var bits = [
+        "RSI2 " + (ex.rsi == null ? "—" : ex.rsi) + (ex.rsiHot ? " 🔥" : ""),
+        "BB↑ " + (ex.bbReady ? (ex.bbHit ? "above ✓" : "below") : "warming " + s.warmEtaMin.bb + "m"),
+        "MACD " + (ex.macdReady ? (ex.macdFirstGreen ? "1st green ✓" : (ex.macdHist >= 0 ? "green" : "red")) : "warming " + s.warmEtaMin.macd + "m")
+      ];
+      var exRow = el("div", "mql-accum-line" + (ex.state === "EXIT" ? " mql-panda-exit" : ""), "Exit: " + ex.state + " · " + bits.join(" · "));
+      body.appendChild(exRow);
+      if (ex.legs && ex.legs.length) body.appendChild(el("div", "mql-rec-warn", "EXIT confluence: " + ex.legs.join(" | ")));
+      if (ex.partial) body.appendChild(el("div", "mql-accum-prior", ex.partial));
+      body.appendChild(el("div", "mql-accum-prior", s.candles + " closed " + s.timeframe + " candles · " +
+        (p.candleSource === "gmgn-token" ? "GMGN token-level" : "Meteora pool-level") + (p.candlesStale ? " (stale)" : "")));
+    }
+
+    // recipe
+    var rc = p.recipe;
+    if (rc && rc.shallow && rc.shallow.bins) {
+      body.appendChild(el("div", "mql-accum-line", "Recipe: one-sided SOL · " + rc.shapes.join(" or ") + " · range -" + rc.shallow.depthPct + "% → -" + rc.deep.depthPct + "%"));
+      body.appendChild(el("div", "mql-accum-prior", rc.binStep + "bps bins: " + rc.shallow.bins + " (-" + rc.shallow.depthPct + "%) … " + rc.deep.bins + " (-" + rc.deep.depthPct + "%)"));
+    }
+    if (p.lateHour) body.appendChild(el("div", "mql-rec-warn", "⏰ After 6pm — Panda rule: don't open new positions you'd babysit overnight"));
+    body.appendChild(el("div", "mql-rec-warn", "Split capital across ≥6 positions · exit when the strategy says, no revenge DLMM"));
+
+    // controls
+    var ctr = el("div", "mql-panda-ctrls");
+    ["5m", "1m"].forEach(function (tf) {
+      var b = el("button", "mql-panda-btn" + (p.timeframe === tf ? " on" : ""), tf);
+      b.addEventListener("click", safe(function () { pandaUI.tf = tf; state.panda = null; fetchPanda(); renderHUD(); }));
+      ctr.appendChild(b);
+    });
+    var pinned = !!pandaUI.pinned[state.pool];
+    var pin = el("button", "mql-panda-btn" + (pinned ? " on" : ""), pinned ? "📌 pinned (entry alerts)" : "📌 pin for entry alert");
+    pin.addEventListener("click", safe(function () {
+      sendMessage({ type: "pandaPin", pool: state.pool, name: p.name, on: !pinned }).then(safe(function () {
+        if (!pinned) pandaUI.pinned[state.pool] = { ts: Date.now() }; else delete pandaUI.pinned[state.pool];
+        renderHUD();
+      }));
+    }));
+    ctr.appendChild(pin);
+    body.appendChild(ctr);
+    body.appendChild(el("div", "mql-accum-prior", "Evil Panda strat (Bootcamp #7) · source uses 15m; young-token adaptation on " + p.timeframe + " · not calibrated on your trades"));
+    wrap.appendChild(body);
     hud.appendChild(wrap);
   });
 
@@ -1854,6 +1968,7 @@
 
     // ACCUM COMBO block (long-term accumulation recipe; priors pending calibration)
     try { renderAccumBlock(hud, d); } catch (e) {}
+    try { renderPandaBlock(hud); } catch (e) {}
 
 
     // attach hover explainers to remaining zones
