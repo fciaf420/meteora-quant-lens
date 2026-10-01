@@ -324,8 +324,6 @@
 
 /* ---- Wallet tracker ---- */
 .mql-chip-track { background: #14202e !important; color: #8fd0ff !important; border-color: #24496a !important; }
-#mql-track { position: fixed; right: 16px; bottom: 56px; width: 430px; max-height: 70vh; overflow-y: auto; z-index: 2147483000;
-  background: #12121a; border: 1px solid #2a2a3a; border-radius: 10px; padding: 10px 12px; color: #c9c9d6; font: 12px/1.45 -apple-system, system-ui, sans-serif; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
 .mql-track-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
 .mql-track-title { flex: 1; font-weight: 700; letter-spacing: .04em; color: #8fd0ff; }
 .mql-track-wallet { border-top: 1px solid #2a2a3a; padding: 6px 0; }
@@ -336,3 +334,22 @@
 .mql-track-link { color: #8fd0ff; text-decoration: none; font-weight: 600; }
 .mql-track-link:hover { text-decoration: underline; }
 .mql-track-hudline { color: #8fd0ff; font-size: 11px; }
+
+#mql-drawer { position: fixed; left: 0; right: 0; bottom: 0; height: 30px; z-index: 999998; background: rgba(14,14,20,.98);
+  border-top: 1px solid #2a2a3a; box-shadow: 0 -6px 24px rgba(0,0,0,.45); color: #c9c9d6; font: 12px/1.45 -apple-system, system-ui, sans-serif;
+  display: flex; flex-direction: column; }
+.mql-drawer-handle { flex: 0 0 30px; display: flex; align-items: center; gap: 8px; padding: 0 12px; cursor: ns-resize; user-select: none; position: relative; }
+.mql-drawer-grip { position: absolute; left: 50%; top: 3px; width: 40px; height: 4px; margin-left: -20px; border-radius: 3px; background: #3a3a4e; }
+.mql-drawer-spacer { flex: 1; }
+.mql-drawer-badge { background: #1a3a22; color: #4cf09a; border-radius: 10px; padding: 0 7px; font-size: 11px; font-weight: 700; }
+.mql-drawer-sel { background: #1c1c28; color: #c9c9d6; border: 1px solid #2a2a3a; border-radius: 6px; font-size: 11px; padding: 2px 4px; }
+.mql-drawer-body { flex: 1; overflow-y: auto; padding: 4px 14px 10px; border-top: 1px solid #22222e; }
+.mql-feed-row { display: flex; align-items: baseline; gap: 8px; padding: 3px 4px; border-bottom: 1px solid #1c1c26; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mql-feed-time { color: #6e6e80; width: 34px; text-align: right; flex: 0 0 34px; }
+.mql-feed-who { color: #e6e6f0; font-weight: 600; min-width: 90px; }
+.mql-feed-act { min-width: 78px; }
+.mql-feed-enter { color: #4cf09a; } .mql-feed-add { color: #8fd0ff; } .mql-feed-exit { color: #f0764c; } .mql-feed-opened { color: #9a9aa8; }
+.mql-drawer-table { width: 100%; border-collapse: collapse; }
+.mql-drawer-table th { text-align: left; color: #6e6e80; font-weight: 600; padding: 3px 6px; border-bottom: 1px solid #2a2a3a; }
+.mql-drawer-table td { padding: 3px 6px; border-bottom: 1px solid #1c1c26; }
+.jr-pos { color: #4cf09a; } .jr-neg { color: #f0764c; }

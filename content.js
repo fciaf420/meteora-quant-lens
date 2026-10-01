@@ -943,64 +943,161 @@
     trackUI.loading = true;
     sendMessage({ type: "getTracker", refresh: !!refresh }).then(safe(function (r) {
       trackUI.loading = false;
-      if (r && r.ok) { trackUI.data = r; if (!trackUI.open && r.seenTs > trackUI.seenTs) trackUI.seenTs = r.seenTs; renderTrackPanel(); renderRadar(null); renderTrackPoolLine(); }
+      if (r && r.ok) { trackUI.data = r; if (!trackUI.open && r.seenTs > trackUI.seenTs) trackUI.seenTs = r.seenTs; renderTrackPanel(); renderTrackPoolLine(); }
     }));
   });
   function trackUnseen() {
     var f = (trackUI.data && trackUI.data.feed) || [];
     return f.filter(function (e) { return !e.baseline && e.ts > trackUI.seenTs; }).length;
   }
-  var renderTrackPanel = safe(function renderTrackPanel() {
-    var pnl = document.getElementById("mql-track");
-    if (!trackUI.open) { if (pnl) pnl.remove(); return; }
-    if (!pnl) { pnl = el("div", ""); pnl.id = "mql-track"; document.body.appendChild(pnl); }
-    pnl.innerHTML = "";
-    var head = el("div", "mql-track-head");
-    head.appendChild(el("span", "mql-track-title", "👁 WALLET TRACKER"));
-    var rf = el("button", "mql-panda-btn", trackUI.loading ? "…" : "↻");
-    rf.title = "Check now"; rf.addEventListener("click", safe(function () { loadTracker(true); }));
-    head.appendChild(rf);
-    var x = el("button", "mql-panda-btn", "✕"); x.addEventListener("click", safe(function () { trackUI.open = false; renderTrackPanel(); }));
-    head.appendChild(x);
-    pnl.appendChild(head);
-    var d = trackUI.data;
-    if (!d || !d.wallets || !d.wallets.length) {
-      pnl.appendChild(el("div", "mql-accum-note", "No wallets yet — add addresses in the extension Options → 👁 Wallet tracker."));
-      return;
-    }
-    var link = function (pool, text) { var a = el("a", "mql-track-link", text); a.href = "/dlmm/" + pool; return a; };
-    d.wallets.forEach(function (w) {
-      var box = el("div", "mql-track-wallet");
-      var pos = w.positions ? Object.keys(w.positions).map(function (k) { return Object.assign({ positionAddress: k }, w.positions[k]); }) : [];
-      var wh = el("div", "mql-track-whead", w.label + " · " + pos.length + " open" + (w.totals && w.totals.pnlSolPctChange != null ? " · book " + Math.round(Number(w.totals.pnlSolPctChange)) + "%" : "") + (w.checkedAt ? " · " + fmtAgo(w.checkedAt) : " · not checked yet"));
-      wh.title = w.address;
-      box.appendChild(wh);
-      pos.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); }).slice(0, 12).forEach(function (p) {
-        var row = el("div", "mql-track-row");
-        row.appendChild(link(p.pool, p.pair));
-        row.appendChild(el("span", "mql-sub", " " + (p.binStep ? p.binStep + "bps · " : "") + (p.side || "?") + (p.range ? " " + p.range : "") +
-          (p.depositSol != null ? " · " + Number(p.depositSol).toFixed(2) + "◎" : "") +
-          (p.pnlSolPct != null ? " · " + (p.pnlSolPct >= 0 ? "+" : "") + Math.round(p.pnlSolPct) + "%" : "") + (p.oor ? " · OOR" : "") +
-          (p.createdAt ? " · " + fmtAgo(p.createdAt * 1000) : "")));
-        if (p.pool === state.pool) row.classList.add("mql-track-here");
-        box.appendChild(row);
+  // ---- bottom drawer: drag the handle up, Feed / Positions tabs ----
+  var DRAWER_MIN = 30, DRAWER_DEF = 300;
+  var lsGet = function (k, d) { try { var v = window.localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } };
+  var lsSet = function (k, v) { try { window.localStorage.setItem(k, String(v)); } catch (e) {} };
+  trackUI.h = Math.max(DRAWER_MIN, parseInt(lsGet("mql-drawer-h", DRAWER_DEF), 10) || DRAWER_DEF);
+  trackUI.open = lsGet("mql-drawer-open", "0") === "1";
+  trackUI.tab = lsGet("mql-drawer-tab", "feed");
+  trackUI.wallet = "all";
+  function drawerHeight() { return trackUI.open ? Math.min(Math.max(trackUI.h, 120), Math.round(window.innerHeight * 0.85)) : DRAWER_MIN; }
+  function applyDrawerLayout() {
+    var dr = document.getElementById("mql-drawer"); if (!dr) return;
+    var h = drawerHeight();
+    dr.style.height = h + "px";
+    dr.classList.toggle("mql-drawer-open", trackUI.open);
+    var rb = document.getElementById("mql-radar"); if (rb) rb.style.bottom = (h + 8) + "px";
+    try { document.body.style.paddingBottom = (DRAWER_MIN + 6) + "px"; } catch (e) {}
+  }
+  function feedItems() {
+    var d = trackUI.data; if (!d) return [];
+    var items = (d.feed || []).filter(function (e) { return !e.baseline; }).map(function (e) { return { t: e.ts, e: e, kind: e.type }; });
+    var moved = {}; items.forEach(function (it) { moved[it.e.positionAddress + it.kind] = 1; });
+    // positions that were already open when tracking started: show at their real open time
+    (d.wallets || []).forEach(function (w) {
+      Object.keys(w.positions || {}).forEach(function (k) {
+        var p = w.positions[k]; if (moved[k + "ENTER"]) return;
+        items.push({ t: p.createdAt ? p.createdAt * 1000 : (p.firstSeen || 0), kind: "OPENED", e: Object.assign({ label: w.label, wallet: w.address, positionAddress: k }, p) });
       });
-      pnl.appendChild(box);
     });
-    var evs = (d.feed || []).filter(function (e) { return !e.baseline; }).slice(0, 25);
-    pnl.appendChild(el("div", "mql-track-whead", "Recent moves" + (evs.length ? "" : " — none yet (baseline taken; new entries appear here)")));
-    evs.forEach(function (e) {
-      var row = el("div", "mql-track-row" + (e.ts > trackUI.seenTs ? " mql-track-new" : ""));
-      var ic = e.type === "ENTER" ? "🟢" : e.type === "ADD" ? "➕" : "🔴";
-      row.appendChild(el("span", "", ic + " " + fmtAgo(e.ts) + " · " + e.label + " "));
-      row.appendChild(link(e.pool, e.pair));
-      row.appendChild(el("span", "mql-sub", e.type === "EXIT"
-        ? " exit" + (e.lastPnlSolPct != null ? " · " + Math.round(e.lastPnlSolPct) + "%" : "") + (e.heldMin != null ? " · held " + (e.heldMin >= 90 ? (e.heldMin / 60).toFixed(1) + "h" : e.heldMin + "m") : "")
-        : " " + (e.type === "ADD" ? "+" + Number(e.addedSol).toFixed(2) + "◎ · " : "") + (e.side || "") + (e.range ? " " + e.range : "") + (e.depositSol != null ? " · " + Number(e.depositSol).toFixed(2) + "◎" : "")));
-      pnl.appendChild(row);
-    });
-    trackUI.seenTs = Date.now();
-    try { chrome.storage.local.set({ mqlTrackSeenTs: trackUI.seenTs }); } catch (e) {}
+    if (trackUI.wallet !== "all") items = items.filter(function (it) { return it.e.wallet === trackUI.wallet; });
+    return items.sort(function (a, b) { return b.t - a.t; }).slice(0, 200);
+  }
+  var renderTrackPanel = safe(function renderTrackPanel() {
+    var dr = document.getElementById("mql-drawer");
+    if (!dr) {
+      dr = el("div", ""); dr.id = "mql-drawer"; document.body.appendChild(dr);
+    }
+    // don't rebuild under an open wallet <select>
+    try { var ae = document.activeElement; if (ae && ae.tagName === "SELECT" && dr.contains(ae)) return; } catch (e) {}
+    dr.innerHTML = "";
+    var d = trackUI.data;
+    var unseen = trackUnseen();
+    var handle = el("div", "mql-drawer-handle");
+    handle.appendChild(el("span", "mql-drawer-grip", ""));
+    var nW = d && d.wallets ? d.wallets.length : 0;
+    handle.appendChild(el("span", "mql-track-title", "👁 WALLET FEED"));
+    handle.appendChild(el("span", "mql-sub", nW + " wallet" + (nW === 1 ? "" : "s") + (unseen ? " · " : "")));
+    if (unseen) handle.appendChild(el("span", "mql-drawer-badge", unseen + " new"));
+    var spacer = el("span", "mql-drawer-spacer", ""); handle.appendChild(spacer);
+    if (trackUI.open) {
+      ["feed", "positions"].forEach(function (t) {
+        var b = el("button", "mql-panda-btn" + (trackUI.tab === t ? " on" : ""), t === "feed" ? "Feed" : "Positions");
+        b.addEventListener("click", safe(function (ev) { ev.stopPropagation(); trackUI.tab = t; lsSet("mql-drawer-tab", t); renderTrackPanel(); }));
+        handle.appendChild(b);
+      });
+      if (nW > 1) {
+        var sel = el("select", "mql-drawer-sel");
+        [["all", "all wallets"]].concat(d.wallets.map(function (w) { return [w.address, w.label]; })).forEach(function (o) {
+          var op = el("option", "", o[1]); op.value = o[0]; if (trackUI.wallet === o[0]) op.selected = true; sel.appendChild(op); });
+        sel.addEventListener("mousedown", function (ev) { ev.stopPropagation(); });
+        sel.addEventListener("change", safe(function () { trackUI.wallet = sel.value; sel.blur(); renderTrackPanel(); }));
+        handle.appendChild(sel);
+      }
+      var rf = el("button", "mql-panda-btn", trackUI.loading ? "…" : "↻"); rf.title = "Check wallets now";
+      rf.addEventListener("click", safe(function (ev) { ev.stopPropagation(); loadTracker(true); }));
+      handle.appendChild(rf);
+    }
+    var tg = el("button", "mql-panda-btn", trackUI.open ? "▾" : "▴");
+    tg.addEventListener("click", safe(function (ev) { ev.stopPropagation(); toggleDrawer(); }));
+    handle.appendChild(tg);
+    // drag to resize (click without drag toggles)
+    handle.addEventListener("mousedown", safe(function (ev) {
+      if (ev.target.closest && ev.target.closest("button,select,a")) return;
+      ev.preventDefault();
+      var y0 = ev.clientY, h0 = drawerHeight(), moved = false;
+      var mv = function (e2) {
+        var dy = y0 - e2.clientY; if (Math.abs(dy) > 3) moved = true; if (!moved) return;
+        trackUI.open = true; trackUI.h = Math.max(120, Math.min(Math.round(window.innerHeight * 0.85), h0 + dy));
+        if (trackUI.h <= 125 && dy < 0 && h0 + dy < 90) trackUI.open = false;
+        applyDrawerLayout();
+      };
+      var up = function () {
+        document.removeEventListener("mousemove", mv, true); document.removeEventListener("mouseup", up, true);
+        if (!moved) { toggleDrawer(); return; }
+        lsSet("mql-drawer-h", trackUI.h); lsSet("mql-drawer-open", trackUI.open ? "1" : "0");
+        renderTrackPanel();
+      };
+      document.addEventListener("mousemove", mv, true); document.addEventListener("mouseup", up, true);
+    }));
+    dr.appendChild(handle);
+    if (trackUI.open) {
+      var body = el("div", "mql-drawer-body");
+      var link = function (pool, text) { var a = el("a", "mql-track-link", text); a.href = "/dlmm/" + pool; return a; };
+      var fmtPos = function (p) {
+        return (p.binStep ? p.binStep + "bps" : "") + (p.side ? " · " + p.side : "") + (p.range ? " " + p.range : "") +
+          (p.depositSol != null ? " · " + Number(p.depositSol).toFixed(2) + "◎" : "");
+      };
+      if (!d || !d.wallets || !d.wallets.length) {
+        body.appendChild(el("div", "mql-accum-note", "No wallets yet — add addresses in the extension Options → 👁 Wallet tracker."));
+      } else if (trackUI.tab === "positions") {
+        var tbl = el("table", "mql-drawer-table");
+        var hr = el("tr", ""); ["wallet", "pool", "type", "range", "size", "PnL", "status", "opened"].forEach(function (h) { hr.appendChild(el("th", "", h)); }); tbl.appendChild(hr);
+        d.wallets.filter(function (w) { return trackUI.wallet === "all" || w.address === trackUI.wallet; }).forEach(function (w) {
+          Object.keys(w.positions || {}).map(function (k) { return w.positions[k]; }).sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); }).forEach(function (p) {
+            var tr = el("tr", p.pool === state.pool ? "mql-track-here" : "");
+            var c = function (x) { var td = el("td", ""); if (x instanceof Node) td.appendChild(x); else td.textContent = x == null ? "—" : String(x); tr.appendChild(td); return td; };
+            c(w.label); c(link(p.pool, p.pair + (p.binStep ? " " + p.binStep + "bps" : ""))); c(p.side); c(p.range);
+            c(p.depositSol != null ? Number(p.depositSol).toFixed(2) + "◎" : null);
+            var pt = c(p.pnlSolPct != null ? (p.pnlSolPct >= 0 ? "+" : "") + Math.round(p.pnlSolPct) + "%" : null); if (p.pnlSolPct != null) pt.className = p.pnlSolPct >= 0 ? "jr-pos" : "jr-neg";
+            c(p.oor ? "out of range" : "in range"); c(p.createdAt ? fmtAgo(p.createdAt * 1000) + " ago" : null);
+            tbl.appendChild(tr);
+          });
+        });
+        body.appendChild(tbl);
+      } else {
+        var items = feedItems();
+        if (!items.length) body.appendChild(el("div", "mql-accum-note", "No moves yet."));
+        items.forEach(function (it) {
+          var e = it.e;
+          var row = el("div", "mql-feed-row" + (it.kind !== "OPENED" && it.t > trackUI.seenTs ? " mql-track-new" : "") + (e.pool === state.pool ? " mql-track-here" : ""));
+          var ic = { ENTER: "🟢 entered", ADD: "➕ added", EXIT: "🔴 exited", OPENED: "◽ opened" }[it.kind] || it.kind;
+          row.appendChild(el("span", "mql-feed-time", fmtAgo(it.t)));
+          row.appendChild(el("span", "mql-feed-who", e.label));
+          row.appendChild(el("span", "mql-feed-act mql-feed-" + it.kind.toLowerCase(), ic));
+          row.appendChild(link(e.pool, e.pair));
+          var tail = it.kind === "EXIT"
+            ? fmtPos(e) + (e.lastPnlSolPct != null ? " · last " + Math.round(e.lastPnlSolPct) + "%" : "") + (e.heldMin != null ? " · held " + (e.heldMin >= 90 ? (e.heldMin / 60).toFixed(1) + "h" : e.heldMin + "m") : "")
+            : (it.kind === "ADD" ? "+" + Number(e.addedSol).toFixed(2) + "◎ · " : "") + fmtPos(e) + (e.pnlSolPct != null && it.kind === "OPENED" ? " · now " + Math.round(e.pnlSolPct) + "%" : "");
+          row.appendChild(el("span", "mql-sub", " " + tail));
+          body.appendChild(row);
+        });
+        if (items.some(function (it) { return it.kind === "OPENED"; })) body.appendChild(el("div", "mql-accum-prior", "◽ = already open when tracking started (shown at its real open time). 🟢/➕/🔴 = moves seen live."));
+      }
+      dr.appendChild(body);
+      trackUI.seenTs = Date.now();
+      try { chrome.storage.local.set({ mqlTrackSeenTs: trackUI.seenTs }); } catch (e) {}
+    }
+    applyDrawerLayout();
+  });
+  function toggleDrawer() {
+    trackUI.open = !trackUI.open; lsSet("mql-drawer-open", trackUI.open ? "1" : "0");
+    if (trackUI.open) loadTracker(false);
+    renderTrackPanel();
+  }
+  var startTrackDrawer = safe(function startTrackDrawer() {
+    renderTrackPanel();
+    loadTracker(false);
+    setInterval(safe(function () { if (document.visibilityState === "visible") loadTracker(false); }), 30000);
+    window.addEventListener("resize", safe(applyDrawerLayout));
   });
   // one line on the pool HUD when a tracked wallet is LPing this pool
   var renderTrackPoolLine = safe(function renderTrackPoolLine() {
@@ -1867,16 +1964,12 @@
       document.body.appendChild(bar);
     }
     bar.innerHTML = "";
+    try { applyDrawerLayout(); } catch (e) {}
     var head = el("span", "mql-radar-title", "📡 RADAR");
     tipify(head, "radar");
     head.style.cursor = "pointer";
     head.addEventListener("click", function () { radarCollapsed = !radarCollapsed; bar.classList.toggle("mql-radar-min", radarCollapsed); renderRadar(null); });
     bar.appendChild(head);
-    var trkN = trackUnseen();
-    var trk = el("button", "mql-chip mql-chip-track", "👁 Wallets" + (trkN ? " · " + trkN + " new" : ""));
-    trk.title = "Tracked wallets: open positions + recent DLMM moves";
-    trk.addEventListener("click", safe(function (ev) { ev.stopPropagation(); trackUI.open = !trackUI.open; renderTrackPanel(); if (trackUI.open) loadTracker(false); renderRadar(null); }));
-    bar.appendChild(trk);
     if (radarCollapsed) {
       var n = (r && r.items) ? r.items.length : 0;
       var full = (r && r.items) ? r.items.filter(function(i){return i.kind==="FULL" || i.kind==="BID_ASK" || i.kind==="PANDA";}).length : 0;
@@ -2669,6 +2762,7 @@
       }
     }));
     startObserver();
+    try { startTrackDrawer(); } catch (e) {}
     // restore persisted combo total for the ACCUM block
     try {
       chrome.storage.local.get({ mqlComboTotal: 1.0 }, function (st) {
