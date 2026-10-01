@@ -321,3 +321,18 @@
 .mql-panda-btn { background: #1c1c28; color: #c9c9d6; border: 1px solid #2a2a3a; border-radius: 6px; padding: 3px 8px; font-size: 11px; cursor: pointer; }
 .mql-panda-btn.on { border-color: #4cd7f0; color: #4cd7f0; }
 .mql-chip-panda { background: #1e2a14 !important; color: #b8f04c !important; border-color: #4a6a20 !important; }
+
+/* ---- Wallet tracker ---- */
+.mql-chip-track { background: #14202e !important; color: #8fd0ff !important; border-color: #24496a !important; }
+#mql-track { position: fixed; right: 16px; bottom: 56px; width: 430px; max-height: 70vh; overflow-y: auto; z-index: 2147483000;
+  background: #12121a; border: 1px solid #2a2a3a; border-radius: 10px; padding: 10px 12px; color: #c9c9d6; font: 12px/1.45 -apple-system, system-ui, sans-serif; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+.mql-track-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.mql-track-title { flex: 1; font-weight: 700; letter-spacing: .04em; color: #8fd0ff; }
+.mql-track-wallet { border-top: 1px solid #2a2a3a; padding: 6px 0; }
+.mql-track-whead { font-weight: 600; color: #e6e6f0; margin: 4px 0 2px; }
+.mql-track-row { padding: 1px 0; }
+.mql-track-row.mql-track-new { background: #1a2a1a; }
+.mql-track-row.mql-track-here { background: #14202e; }
+.mql-track-link { color: #8fd0ff; text-decoration: none; font-weight: 600; }
+.mql-track-link:hover { text-decoration: underline; }
+.mql-track-hudline { color: #8fd0ff; font-size: 11px; }

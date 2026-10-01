@@ -2184,6 +2184,119 @@ async function pandaWatch() {
   } catch (e) {}
 }
 
+// ===========================================================================
+// WALLET TRACKER — follow other wallets' DLMM moves (read-only).
+// Every alarm tick: /portfolio/open per tracked wallet -> diff against the last
+// snapshot -> ENTER (new position), ADD (pool deposit up >10%), EXIT (position
+// gone). New positions get one /positions/{pool}/pnl call for range + side.
+// First sight of a wallet is a silent baseline (no alert storm).
+// ===========================================================================
+const TRACK_MAX_WALLETS = 10;
+const TRACK_FEED_MAX = 300;
+let trackRunning = false;
+
+function parseTrackWallets(s) {
+  return String(s || '').split(/[\n,]+/).map((l) => l.trim()).filter(Boolean).map((l) => {
+    const m = l.match(/^([1-9A-HJ-NP-Za-km-z]{32,44})\s*(.*)$/);
+    return m ? { address: m[1], label: (m[2] || '').trim() || (m[1].slice(0, 4) + '…' + m[1].slice(-4)) } : null;
+  }).filter(Boolean).slice(0, TRACK_MAX_WALLETS);
+}
+
+function classifyEntry(pos) {
+  const dx = num(pick(pos, 'allTimeDeposits.tokenX.amountSol'), 0), dy = num(pick(pos, 'allTimeDeposits.tokenY.amountSol'), 0);
+  const minP = Number(pos.minPrice), maxP = Number(pos.maxPrice);
+  const tot = dx + dy;
+  let side = 'TWO-SIDED';
+  if (tot > 0 && dy / tot > 0.97) side = 'SOL BID';
+  else if (tot > 0 && dx / tot > 0.97) side = 'TOKEN ASK';
+  let range = null;
+  if (minP > 0 && maxP > 0) {
+    if (side === 'SOL BID') range = '0 → -' + Math.round((1 - minP / maxP) * 100) + '%';
+    else if (side === 'TOKEN ASK') range = '0 → +' + Math.round((maxP / minP - 1) * 100) + '%';
+    else range = '±' + Math.round(((maxP - minP) / 2) / ((maxP + minP) / 2) * 100) + '%';
+  }
+  return { side, range, bins: (pos.upperBinId != null && pos.lowerBinId != null) ? pos.upperBinId - pos.lowerBinId + 1 : null,
+    depositSol: tot, minPrice: minP, maxPrice: maxP, createdAt: Number(pos.createdAt) || null };
+}
+
+async function trackWalletsTick(force) {
+  if (trackRunning) return { ok: false, error: 'busy' };
+  trackRunning = true;
+  try {
+    const cfg = await chrome.storage.sync.get({ trackWallets: '', trackAlerts: true, webhookUrl: '' });
+    const wallets = parseTrackWallets(cfg.trackWallets);
+    const st = await chrome.storage.local.get({ mqlTrackSnap: {}, mqlTrackFeed: [] });
+    const snap = st.mqlTrackSnap || {}, feed = st.mqlTrackFeed || [];
+    const now = Date.now();
+    const alerts = [];
+    for (const w of wallets) {
+      const prev = snap[w.address];
+      const r = await fetchJson(DATAPI + '/portfolio/open?user=' + w.address);
+      if (!r.ok || !r.json) { if (prev) prev.error = r.error || 'fetch failed'; continue; }
+      const pools = r.json.pools || [];
+      const positions = {};
+      for (const p of pools) {
+        for (const pa of (p.listPositions || [])) {
+          positions[pa] = { pool: p.poolAddress, pair: (p.tokenX || '?') + '-' + (p.tokenY || '?'), mint: p.tokenXMint, icon: p.tokenXIcon || null,
+            binStep: p.binStep, poolDepositSol: num(p.totalDepositSol, 0), pnlSolPct: num(p.pnlSolPctChange, null), oor: (p.positionsOutOfRange || []).includes(pa),
+            poolPositions: p.openPositionCount };
+        }
+      }
+      const baseline = !prev || !prev.positions;
+      const prevPos = (prev && prev.positions) || {};
+      // ENTER: new position -> one detail call for side/range/size
+      for (const [pa, info] of Object.entries(positions)) {
+        const old = prevPos[pa];
+        if (old) { Object.assign(info, { side: old.side, range: old.range, bins: old.bins, depositSol: old.depositSol, createdAt: old.createdAt, firstSeen: old.firstSeen });
+          if (info.poolDepositSol > (old.poolDepositSol || 0) * 1.1 + 0.01 && !baseline) {
+            const ev = { ts: now, type: 'ADD', wallet: w.address, label: w.label, positionAddress: pa, pool: info.pool, pair: info.pair, mint: info.mint, binStep: info.binStep,
+              side: info.side, range: info.range, depositSol: info.poolDepositSol, addedSol: info.poolDepositSol - (old.poolDepositSol || 0), pnlSolPct: info.pnlSolPct };
+            feed.push(ev); alerts.push(ev);
+          }
+          continue; }
+        info.firstSeen = now;
+        try {
+          const d = await fetchJson(DATAPI + '/positions/' + info.pool + '/pnl?user=' + w.address + '&status=open');
+          const pos = d.ok && d.json && (d.json.positions || []).find((x) => x.positionAddress === pa);
+          if (pos) Object.assign(info, classifyEntry(pos));
+        } catch (e) {}
+        const ev = { ts: now, type: baseline ? 'OPEN' : 'ENTER', baseline, wallet: w.address, label: w.label, positionAddress: pa, pool: info.pool, pair: info.pair,
+          mint: info.mint, binStep: info.binStep, side: info.side || null, range: info.range || null, bins: info.bins || null,
+          depositSol: info.depositSol != null ? info.depositSol : info.poolDepositSol, createdAt: info.createdAt || null, pnlSolPct: info.pnlSolPct };
+        feed.push(ev);
+        if (!baseline) alerts.push(ev);
+      }
+      // EXIT: position gone
+      if (!baseline) {
+        for (const [pa, old] of Object.entries(prevPos)) {
+          if (positions[pa]) continue;
+          const ev = { ts: now, type: 'EXIT', wallet: w.address, label: w.label, positionAddress: pa, pool: old.pool, pair: old.pair, mint: old.mint, binStep: old.binStep,
+            side: old.side, range: old.range, depositSol: old.depositSol, lastPnlSolPct: old.pnlSolPct,
+            heldMin: old.createdAt ? Math.round((now / 1000 - old.createdAt) / 60) : (old.firstSeen ? Math.round((now - old.firstSeen) / 60000) : null) };
+          feed.push(ev); alerts.push(ev);
+        }
+      }
+      snap[w.address] = { label: w.label, positions, checkedAt: now, totals: r.json.total || null };
+    }
+    for (const a of Object.keys(snap)) if (!wallets.some((w) => w.address === a)) delete snap[a];
+    await chrome.storage.local.set({ mqlTrackSnap: snap, mqlTrackFeed: feed.slice(-TRACK_FEED_MAX) });
+    if (cfg.trackAlerts) {
+      for (const ev of alerts.slice(0, 8)) {
+        const icon = ev.type === 'ENTER' ? '🟢' : ev.type === 'ADD' ? '➕' : '🔴';
+        const what = ev.type === 'EXIT'
+          ? 'exited ' + ev.pair + (ev.lastPnlSolPct != null ? ' · last PnL ' + Math.round(ev.lastPnlSolPct) + '%' : '') + (ev.heldMin != null ? ' · held ' + (ev.heldMin >= 90 ? (ev.heldMin / 60).toFixed(1) + 'h' : ev.heldMin + 'm') : '')
+          : (ev.type === 'ADD' ? 'added +' + ev.addedSol.toFixed(2) + ' SOL to ' : 'entered ') + ev.pair + (ev.binStep ? ' (' + ev.binStep + 'bps)' : '')
+            + (ev.side ? ' · ' + ev.side : '') + (ev.range ? ' ' + ev.range : '') + (ev.depositSol != null ? ' · ' + Number(ev.depositSol).toFixed(2) + ' SOL' : '');
+        try { chrome.notifications.create('mqltrk-' + ev.ts + '-' + ev.positionAddress.slice(0, 4), { type: 'basic', iconUrl: 'icon128.png', title: '👁 ' + ev.label, message: icon + ' ' + what, priority: 1 }); } catch (e) {}
+        if (cfg.webhookUrl) await postDiscord(cfg.webhookUrl, '**Meteora Lens** · 👁 **' + ev.label + '** ' + icon + ' ' + what + '\nhttps://www.meteora.ag/dlmm/' + ev.pool);
+      }
+    }
+    return { ok: true, wallets: wallets.length, events: alerts.length };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  } finally { trackRunning = false; }
+}
+
 // ---- RADAR ALERTS: ping Discord when a pool passes ALL gates (a 🔥 full signal) ----
 async function radarAlertScan() {
   const cfg = await chrome.storage.sync.get({ radarAlerts: false, webhookUrl: '' });
@@ -2399,7 +2512,7 @@ async function dailyRecon() {
     await chrome.storage.local.set({ mqlTradeLog: arr.slice(-200), mqlDailyReconDone: today });
   } catch (e) {}
 }
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions().catch(() => {}).then(() => pandaWatch()); radarAlertScan(); healthCheck(); reconcileJournal(); walletTruthPass(); dailyRecon(); } });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === 'mql-watch') { watchPositions().catch(() => {}).then(() => pandaWatch()); radarAlertScan(); trackWalletsTick(); healthCheck(); reconcileJournal(); walletTruthPass(); dailyRecon(); } });
 chrome.runtime.onInstalled.addListener(() => chrome.alarms.create('mql-watch', { periodInMinutes: 1 }));
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -2582,6 +2695,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const planState = await chrome.storage.local.get({ mqlEntryPlan: {} });
         const entryPlan = planState.mqlEntryPlan && planState.mqlEntryPlan[msg.pool];
         sendResponse(summarizePositions(merged, entryPlan));
+      } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+    })();
+    return true;
+  }
+  if (msg.type === 'getTracker') {
+    (async () => {
+      try {
+        if (msg.refresh) await trackWalletsTick(true);
+        const cfg = await chrome.storage.sync.get({ trackWallets: '' });
+        const st = await chrome.storage.local.get({ mqlTrackSnap: {}, mqlTrackFeed: [], mqlTrackSeenTs: 0 });
+        const wallets = parseTrackWallets(cfg.trackWallets).map((w) => Object.assign({}, w, st.mqlTrackSnap[w.address] || {}));
+        sendResponse({ ok: true, wallets, feed: (st.mqlTrackFeed || []).slice(-150).reverse(), seenTs: st.mqlTrackSeenTs || 0 });
       } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
     })();
     return true;

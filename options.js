@@ -12,7 +12,7 @@ function showToast(text, isError) {
 
 function load() {
   try {
-    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '', radarAlerts: false, heliusApiKey: '', gmgnApiKey: '', pandaTimeframe: '5m', pandaExitAlerts: true }, (items) => {
+    chrome.storage.sync.get({ jupApiKey: '', mqlWidthPct: 20, webhookUrl: '', walletAddress: '', radarAlerts: false, heliusApiKey: '', gmgnApiKey: '', pandaTimeframe: '5m', pandaExitAlerts: true, trackWallets: '', trackAlerts: true }, (items) => {
       if (chrome.runtime.lastError) return;
       $('jupApiKey').value = (items && items.jupApiKey) ? items.jupApiKey : '';
       if ($('heliusApiKey')) $('heliusApiKey').value = items.heliusApiKey || '';
@@ -22,6 +22,8 @@ function load() {
       if ($('walletAddress')) $('walletAddress').value = items.walletAddress || '';
       if ($('radarAlerts')) $('radarAlerts').checked = !!items.radarAlerts;
       if ($('gmgnApiKey')) $('gmgnApiKey').value = items.gmgnApiKey || '';
+      if ($('trackWallets')) $('trackWallets').value = items.trackWallets || '';
+      if ($('trackAlerts')) $('trackAlerts').checked = items.trackAlerts !== false;
       if ($('pandaTimeframe')) $('pandaTimeframe').value = items.pandaTimeframe === '1m' ? '1m' : '5m';
       if ($('pandaExitAlerts')) $('pandaExitAlerts').checked = items.pandaExitAlerts !== false;
     });
@@ -38,12 +40,14 @@ function save(e) {
   const radarAlerts = $('radarAlerts') ? $('radarAlerts').checked : false;
   const heliusApiKey = $('heliusApiKey') ? $('heliusApiKey').value.trim() : '';
   const gmgnApiKey = $('gmgnApiKey') ? $('gmgnApiKey').value.trim() : '';
+  const trackWallets = $('trackWallets') ? $('trackWallets').value.trim() : '';
+  const trackAlerts = $('trackAlerts') ? $('trackAlerts').checked : true;
   const pandaTimeframe = $('pandaTimeframe') && $('pandaTimeframe').value === '1m' ? '1m' : '5m';
   const pandaExitAlerts = $('pandaExitAlerts') ? $('pandaExitAlerts').checked : true;
   let mqlWidthPct = parseFloat($('mqlWidthPct').value);
   if (!isFinite(mqlWidthPct) || mqlWidthPct <= 0) mqlWidthPct = 20;
   try {
-    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress, radarAlerts, heliusApiKey, gmgnApiKey, pandaTimeframe, pandaExitAlerts }, () => {
+    chrome.storage.sync.set({ jupApiKey, mqlWidthPct, webhookUrl, walletAddress, radarAlerts, heliusApiKey, gmgnApiKey, pandaTimeframe, pandaExitAlerts, trackWallets, trackAlerts }, () => {
       if (chrome.runtime.lastError) {
         showToast('Save failed: ' + chrome.runtime.lastError.message, true);
       } else {

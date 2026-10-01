@@ -48,6 +48,18 @@
       </label>
       <p class="hint">Fires while Chrome is open, even with no Meteora tab. 2h cooldown per pool. Requires the webhook above.</p>
     </div>
+    <h2 style="margin-top:18px">👁 Wallet tracker</h2>
+    <div class="field">
+      <label for="trackWallets">Wallets to track (one per line: address, optional label)</label>
+      <textarea id="trackWallets" rows="4" spellcheck="false" placeholder="7kdvnajHv4CcXgDSbjfRY7VLi8shYYTshkSHqVYLcX8d whale-1"></textarea>
+      <p class="hint">Up to 10. Checked every minute while Chrome runs: new DLMM positions (pool, token, SOL bid / token ask / two-sided, range, size), adds, and exits. Open the 👁 button on the Meteora radar bar to see them.</p>
+    </div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="trackAlerts" style="width:auto" />
+        Alert on tracked-wallet entries / adds / exits (desktop + Discord webhook)
+      </label>
+    </div>
     <h2 style="margin-top:18px">🐼 Evil Panda module</h2>
     <div class="field">
       <label for="gmgnApiKey">GMGN API key</label>
