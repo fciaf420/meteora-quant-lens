@@ -349,6 +349,9 @@
 .mql-feed-who { color: #e6e6f0; font-weight: 600; min-width: 90px; }
 .mql-feed-act { min-width: 78px; }
 .mql-feed-enter { color: #4cf09a; } .mql-feed-add { color: #8fd0ff; } .mql-feed-exit { color: #f0764c; } .mql-feed-opened { color: #9a9aa8; }
+.mql-tok { color: #c3b4f0; background: #1b1a2a; border: 1px solid #2c2a44; border-radius: 6px; padding: 0 6px; font-size: 11px; }
+.mql-gmgn { color: #7ee0b0; text-decoration: none; font-weight: 600; font-size: 11px; }
+.mql-gmgn:hover { text-decoration: underline; }
 .mql-drawer-table { width: 100%; border-collapse: collapse; }
 .mql-drawer-table th { text-align: left; color: #6e6e80; font-weight: 600; padding: 3px 6px; border-bottom: 1px solid #2a2a3a; }
 .mql-drawer-table td { padding: 3px 6px; border-bottom: 1px solid #1c1c26; }

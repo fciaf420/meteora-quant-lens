@@ -938,6 +938,20 @@
   // ========================================================================
   var trackUI = { open: false, data: null, seenTs: 0, loading: false };
   function fmtAgo(ms) { var m = Math.round((Date.now() - ms) / 60000); return m < 1 ? "now" : m < 90 ? m + "m" : m < 2880 ? Math.round(m / 60) + "h" : Math.round(m / 1440) + "d"; }
+  function fmtTokAge(ms) {
+    if (!ms) return null;
+    var m = Math.max(0, (Date.now() - ms) / 60000);
+    return m < 60 ? Math.round(m) + "m" : m < 2880 ? Math.round(m / 60) + "h" : m < 525600 ? Math.round(m / 1440) + "d" : (m / 525600).toFixed(1) + "y";
+  }
+  function fmtUsdShort(v) {
+    if (v == null || !isFinite(v)) return null;
+    var a = Math.abs(v);
+    return "$" + (a >= 1e9 ? (v / 1e9).toFixed(2) + "B" : a >= 1e6 ? (v / 1e6).toFixed(a >= 1e7 ? 1 : 2) + "M" : a >= 1e3 ? Math.round(v / 1e3) + "k" : Math.round(v));
+  }
+  function fmtCount(v) {
+    if (v == null || !isFinite(v)) return null;
+    return v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e4 ? Math.round(v / 1e3) + "k" : v >= 1e3 ? (v / 1e3).toFixed(1) + "k" : String(Math.round(v));
+  }
   var loadTracker = safe(function loadTracker(refresh) {
     if (ctxDead || trackUI.loading) return;
     trackUI.loading = true;
@@ -1046,16 +1060,43 @@
         return (p.binStep ? p.binStep + "bps" : "") + (p.side ? " · " + p.side : "") + (p.range ? " " + p.range : "") +
           (p.depositSol != null ? " · " + Number(p.depositSol).toFixed(2) + "◎" : "");
       };
+      // token info for the pair's non-SOL / non-USDC side (background: Jupiter, 2-min cache)
+      var toks = (d && d.tokens) || {};
+      var tokOf = function (o) { return o && o.tokMint ? toks[o.tokMint] || null : null; };
+      var gmgnLink = function (mint) {
+        var a = el("a", "mql-gmgn", "GMGN↗"); a.href = "https://gmgn.ai/sol/token/" + mint; a.target = "_blank"; a.rel = "noopener noreferrer";
+        a.title = "Open on GMGN · " + mint; a.addEventListener("click", function (ev) { ev.stopPropagation(); });
+        return a;
+      };
+      var tokChip = function (e, live) {
+        if (!e || !e.tokMint) return null;
+        var t = tokOf(e), span = el("span", "mql-tok");
+        var parts = [];
+        if (t) {
+          var age = fmtTokAge(t.createdAt); if (age) parts.push(age + " old");
+          var mc = fmtUsdShort(t.mcap), mcAt = live && e.mcapAt != null ? fmtUsdShort(e.mcapAt) : null;
+          if (mcAt && mc && mcAt !== mc) parts.push("mcap " + mcAt + "→" + mc); else if (mc || mcAt) parts.push("mcap " + (mc || mcAt));
+          var h = fmtCount(t.holders); if (h) parts.push(h + " holders");
+          if (t.launchpad) span.title = "launchpad: " + t.launchpad + (t.organic != null ? " · organic " + Math.round(t.organic) : "");
+        }
+        if (parts.length) span.appendChild(el("span", "", parts.join(" · ") + " "));
+        span.appendChild(gmgnLink(e.tokMint));
+        return span;
+      };
       if (!d || !d.wallets || !d.wallets.length) {
         body.appendChild(el("div", "mql-accum-note", "No wallets yet — add addresses in the extension Options → 👁 Wallet tracker."));
       } else if (trackUI.tab === "positions") {
         var tbl = el("table", "mql-drawer-table");
-        var hr = el("tr", ""); ["wallet", "pool", "type", "range", "size", "PnL", "status", "opened"].forEach(function (h) { hr.appendChild(el("th", "", h)); }); tbl.appendChild(hr);
+        var hr = el("tr", ""); ["wallet", "pool", "token age", "mcap", "holders", "", "type", "range", "size", "PnL", "status", "opened"].forEach(function (h) { hr.appendChild(el("th", "", h)); }); tbl.appendChild(hr);
         d.wallets.filter(function (w) { return trackUI.wallet === "all" || w.address === trackUI.wallet; }).forEach(function (w) {
           Object.keys(w.positions || {}).map(function (k) { return w.positions[k]; }).sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); }).forEach(function (p) {
             var tr = el("tr", p.pool === state.pool ? "mql-track-here" : "");
             var c = function (x) { var td = el("td", ""); if (x instanceof Node) td.appendChild(x); else td.textContent = x == null ? "—" : String(x); tr.appendChild(td); return td; };
-            c(w.label); c(link(p.pool, p.pair + (p.binStep ? " " + p.binStep + "bps" : ""))); c(p.side); c(p.range);
+            c(w.label); c(link(p.pool, p.pair + (p.binStep ? " " + p.binStep + "bps" : "")));
+            var tk = tokOf(p);
+            c(tk ? fmtTokAge(tk.createdAt) : null); c(tk ? fmtUsdShort(tk.mcap) : null); c(tk ? fmtCount(tk.holders) : null);
+            c(p.tokMint ? gmgnLink(p.tokMint) : null);
+            c(p.side); c(p.range);
             c(p.depositSol != null ? Number(p.depositSol).toFixed(2) + "◎" : null);
             var pt = c(p.pnlSolPct != null ? (p.pnlSolPct >= 0 ? "+" : "") + Math.round(p.pnlSolPct) + "%" : null); if (p.pnlSolPct != null) pt.className = p.pnlSolPct >= 0 ? "jr-pos" : "jr-neg";
             c(p.oor ? "out of range" : "in range"); c(p.createdAt ? fmtAgo(p.createdAt * 1000) + " ago" : null);
@@ -1074,6 +1115,7 @@
           row.appendChild(el("span", "mql-feed-who", e.label));
           row.appendChild(el("span", "mql-feed-act mql-feed-" + it.kind.toLowerCase(), ic));
           row.appendChild(link(e.pool, e.pair));
+          var chip = tokChip(e, it.kind !== "OPENED"); if (chip) row.appendChild(chip);
           var tail = it.kind === "EXIT"
             ? fmtPos(e) + (e.lastPnlSolPct != null ? " · last " + Math.round(e.lastPnlSolPct) + "%" : "") + (e.heldMin != null ? " · held " + (e.heldMin >= 90 ? (e.heldMin / 60).toFixed(1) + "h" : e.heldMin + "m") : "")
             : (it.kind === "ADD" ? "+" + Number(e.addedSol).toFixed(2) + "◎ · " : "") + fmtPos(e) + (e.pnlSolPct != null && it.kind === "OPENED" ? " · now " + Math.round(e.pnlSolPct) + "%" : "");

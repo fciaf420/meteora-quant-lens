@@ -85,6 +85,11 @@ function loadBackground({ sync = {}, local = {}, session = {}, fetch } = {}) {
     ,computeBreakeven: typeof computeBreakeven === "function" ? computeBreakeven : null
     ,computeRecipeEdges: typeof computeRecipeEdges === "function" ? computeRecipeEdges : null
     ,ilPerDayForRange: typeof ilPerDayForRange === "function" ? ilPerDayForRange : null
+    ,trackTokenMint: typeof trackTokenMint === "function" ? trackTokenMint : null
+    ,trackTokMintOf: typeof trackTokMintOf === "function" ? trackTokMintOf : null
+    ,trackTokenInfo: typeof trackTokenInfo === "function" ? trackTokenInfo : null
+    ,trackWalletsTick: typeof trackWalletsTick === "function" ? trackWalletsTick : null
+    ,trkTokLine: typeof trkTokLine === "function" ? trkTokLine : null
   };`;
   vm.runInContext(source + exports, context, { filename: 'background.js' });
   return { api: context.__mql, sync: syncArea.data, local: localArea.data, session: sessionArea.data };
@@ -664,4 +669,84 @@ test('Evil Panda: radar keeps a Panda chip visible and treats PANDA ENTRY as act
   const watch = api.selectRadarPayload(near.concat([{ address: 'pw', kind: 'PANDA_WATCH', dataTs: now }]), now);
   assert.ok(watch.items.some((it) => it.kind === 'PANDA_WATCH'));
   assert.ok(!watch.alertItems.some((it) => it.kind === 'PANDA_WATCH'));
+});
+
+// ---- wallet feed token info ----
+const SOL_M = 'So11111111111111111111111111111111111111112';
+const USDC_M = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+test('wallet feed: token side is the non-SOL / non-USDC mint (null for SOL-USDC)', () => {
+  const { api } = loadBackground();
+  assert.deepEqual(JSON.parse(JSON.stringify(api.trackTokenMint({ tokenX: 'BONK', tokenXMint: 'BonkMint', tokenY: 'SOL', tokenYMint: SOL_M }))), { mint: 'BonkMint', sym: 'BONK' });
+  assert.deepEqual(JSON.parse(JSON.stringify(api.trackTokenMint({ tokenX: 'SOL', tokenXMint: SOL_M, tokenY: 'JUP', tokenYMint: 'JupMint' }))), { mint: 'JupMint', sym: 'JUP' });
+  assert.deepEqual(JSON.parse(JSON.stringify(api.trackTokenMint({ tokenX: 'WIF', tokenXMint: 'WifMint', tokenY: 'USDC', tokenYMint: USDC_M }))), { mint: 'WifMint', sym: 'WIF' });
+  assert.equal(api.trackTokenMint({ tokenX: 'SOL', tokenXMint: SOL_M, tokenY: 'USDC', tokenYMint: USDC_M }), null);
+  // legacy rows: only tokenXMint stored as `mint`
+  assert.equal(api.trackTokMintOf({ mint: 'BonkMint' }), 'BonkMint');
+  assert.equal(api.trackTokMintOf({ mint: SOL_M }), null);
+  assert.equal(api.trackTokMintOf({ mint: SOL_M, tokMint: 'JupMint' }), 'JupMint');
+});
+
+test('wallet feed: one batched Jupiter call, cached, keyless lite host without a key', async () => {
+  const calls = [];
+  const fetch = async (url) => {
+    calls.push(url);
+    return { ok: true, json: async () => [
+      { id: 'MintA', symbol: 'AAA', mcap: 596711, holderCount: 3169, firstPool: { createdAt: new Date(Date.now() - 5 * 3600e3).toISOString() }, launchpad: 'pump.fun', organicScore: 71 },
+      { id: 'MintB', symbol: 'BBB', fdv: 1.5e6, holderCount: 12000 }
+    ] };
+  };
+  const { api, local } = loadBackground({ fetch });
+  const out = await api.trackTokenInfo(['MintA', 'MintB', 'MintC', null, 'MintA']);
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].startsWith('https://lite-api.jup.ag/tokens/v2/search?query='));
+  assert.ok(calls[0].includes('MintA') && calls[0].includes('MintB') && calls[0].includes('MintC'));
+  assert.equal(out.MintA.mcap, 596711);
+  assert.equal(out.MintA.holders, 3169);
+  assert.ok(Math.abs(Date.now() - out.MintA.createdAt - 5 * 3600e3) < 60e3);
+  assert.equal(out.MintB.mcap, 1.5e6, 'falls back to fdv when mcap is absent');
+  assert.equal(out.MintC, undefined, 'unknown mint is a cached miss, not an entry');
+  assert.ok(local.mqlTrackTok.MintC.missing);
+  assert.match(api.trkTokLine(out.MintA), /^age 5h · mcap \$597k · 3\.2k holders$/);
+  await api.trackTokenInfo(['MintA', 'MintB', 'MintC']);
+  assert.equal(calls.length, 1, 'second lookup inside the TTL hits the cache');
+});
+
+test('wallet feed: uses api.jup.ag with the configured key', async () => {
+  const calls = [];
+  const fetch = async (url, opts) => { calls.push({ url, headers: (opts && opts.headers) || {} }); return { ok: true, json: async () => [] }; };
+  const { api } = loadBackground({ fetch, sync: { jupApiKey: 'k123' } });
+  await api.trackTokenInfo(['MintZ']);
+  assert.ok(calls[0].url.startsWith('https://api.jup.ag/tokens/v2/search?query=MintZ'));
+  assert.equal(calls[0].headers['x-api-key'], 'k123');
+});
+
+test('wallet feed: live ENTER is stamped with the token mint and mcap at the move', async () => {
+  const W = '7kdvnajHv4CcXgDSbjfRY7VLi8shYYTshkSHqVYLcX8d';
+  let round = 0;
+  const pool = (addr, pos, x, xm) => ({ poolAddress: addr, binStep: 100, tokenX: x, tokenXMint: xm, tokenY: 'SOL', tokenYMint: SOL_M,
+    totalDepositSol: '2', pnlSolPctChange: '1', listPositions: [pos], positionsOutOfRange: [], openPositionCount: 1 });
+  const fetch = async (url) => {
+    const body = (j) => ({ ok: true, json: async () => j });
+    if (url.includes('/portfolio/open')) {
+      const pools = [pool('PoolA', 'PosA', 'AAA', 'MintA')];
+      if (round > 0) pools.push(pool('PoolB', 'PosB', 'BBB', 'MintB'));
+      return body({ pools, total: null });
+    }
+    if (url.includes('/positions/')) return body({ positions: [] });
+    if (url.includes('/tokens/v2/search')) return body([
+      { id: 'MintA', mcap: 1e6, holderCount: 900 }, { id: 'MintB', mcap: 250000, holderCount: 1500, firstPool: { createdAt: new Date().toISOString() } }]);
+    throw new Error('unexpected ' + url);
+  };
+  const { api, local } = loadBackground({ fetch, sync: { trackWallets: W + ' whale', trackAlerts: false } });
+  const r1 = await api.trackWalletsTick();
+  assert.equal(r1.ok, true);
+  assert.equal(local.mqlTrackSnap[W].positions.PosA.tokMint, 'MintA');
+  round = 1;
+  const r2 = await api.trackWalletsTick();
+  assert.equal(r2.events, 1);
+  const ev = local.mqlTrackFeed.find((e) => e.type === 'ENTER');
+  assert.equal(ev.tokMint, 'MintB');
+  assert.equal(ev.mcapAt, 250000);
+  assert.equal(ev.holdersAt, 1500);
 });

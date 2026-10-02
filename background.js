@@ -2195,6 +2195,98 @@ const TRACK_MAX_WALLETS = 10;
 const TRACK_FEED_MAX = 300;
 let trackRunning = false;
 
+// ---- token info for the feed: the pool's non-SOL / non-USDC side ----
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const TRACK_SKIP_MINTS = new Set([SUPPORTED_SOL_MINT, USDC_MINT]);
+const TRACK_TOKEN_TTL_MS = 2 * 60 * 1000;
+const JUP_LITE = 'https://lite-api.jup.ag';
+
+// which side of the pair is the "token" (null for e.g. SOL-USDC)
+function trackTokenMint(p) {
+  const x = p && p.tokenXMint, y = p && p.tokenYMint;
+  if (x && !TRACK_SKIP_MINTS.has(x)) return { mint: x, sym: p.tokenX || null };
+  if (y && !TRACK_SKIP_MINTS.has(y)) return { mint: y, sym: p.tokenY || null };
+  return null;
+}
+// older snapshots/feed rows only carry tokenXMint as `mint`
+function trackTokMintOf(o) {
+  if (!o) return null;
+  if (o.tokMint) return o.tokMint;
+  return o.mint && !TRACK_SKIP_MINTS.has(o.mint) ? o.mint : null;
+}
+function jupFirstSeenMs(t) {
+  const c = pick(t, 'firstPool.createdAt', 'createdAt', 'created_at');
+  if (c == null) return null;
+  const ms = typeof c === 'number' ? (c < 1e12 ? c * 1000 : c) : Date.parse(c);
+  return isFinite(ms) ? ms : null;
+}
+
+// One batched Jupiter Tokens v2 call (<=100 mints) -> mcap, holders, age (first
+// pool), launchpad, organic score. Cached 2 min in storage.local so the 30s
+// drawer poll + 1-min alarm don't hammer it. Uses the configured Jupiter key
+// when present, else the keyless lite host.
+async function trackTokenInfoRun(mints) {
+  const want = [...new Set((mints || []).filter(Boolean))];
+  const st = await chrome.storage.local.get({ mqlTrackTok: {} });
+  const cache = st.mqlTrackTok || {};
+  const now = Date.now();
+  const stale = want.filter((m) => !cache[m] || now - cache[m].ts > TRACK_TOKEN_TTL_MS);
+  if (stale.length) {
+    const cfg = await chrome.storage.sync.get({ jupApiKey: '' });
+    for (let i = 0; i < stale.length; i += 100) {
+      const chunk = stale.slice(i, i + 100);
+      const url = (cfg.jupApiKey ? JUP : JUP_LITE) + '/tokens/v2/search?query=' + chunk.join(',');
+      const r = await fetchJson(url, cfg.jupApiKey ? { 'x-api-key': cfg.jupApiKey } : {});
+      if (!r.ok) continue;  // keep last good values rather than blanking the feed
+      const arr = Array.isArray(r.json) ? r.json : ((r.json && (r.json.tokens || r.json.data)) || []);
+      const seen = new Set();
+      for (const t of arr) {
+        const id = t && (t.id || t.address);
+        if (!id || !chunk.includes(id)) continue;
+        seen.add(id);
+        cache[id] = { ts: now, sym: t.symbol || null, mcap: num(t.mcap, null) != null ? num(t.mcap, null) : num(t.fdv, null),
+          holders: num(t.holderCount, null), createdAt: jupFirstSeenMs(t), launchpad: t.launchpad || null, organic: num(t.organicScore, null) };
+      }
+      // Jupiter doesn't know it: remember the miss for one TTL instead of refetching every tick
+      for (const m of chunk) if (!seen.has(m) && !cache[m]) cache[m] = { ts: now, missing: true };
+    }
+  }
+  for (const m of Object.keys(cache)) if (now - cache[m].ts > 86400e3 && !want.includes(m)) delete cache[m];
+  if (stale.length) await chrome.storage.local.set({ mqlTrackTok: cache });
+  const out = {};
+  for (const m of want) if (cache[m] && !cache[m].missing) out[m] = cache[m];
+  return out;
+}
+let trackTokChain = Promise.resolve();
+function trackTokenInfo(mints) {  // serialized: a second caller hits the fresh cache
+  const p = trackTokChain.then(() => trackTokenInfoRun(mints));
+  trackTokChain = p.catch(() => {});
+  return p;
+}
+function trkUsd(v) {
+  if (v == null || !isFinite(v)) return null;
+  const a = Math.abs(v);
+  return '$' + (a >= 1e9 ? (v / 1e9).toFixed(2) + 'B' : a >= 1e6 ? (v / 1e6).toFixed(a >= 1e7 ? 1 : 2) + 'M' : a >= 1e3 ? Math.round(v / 1e3) + 'k' : Math.round(v));
+}
+function trkCount(v) {
+  if (v == null || !isFinite(v)) return null;
+  return v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e4 ? Math.round(v / 1e3) + 'k' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'k' : String(Math.round(v));
+}
+function trkAge(createdMs, now) {
+  if (!createdMs) return null;
+  const m = Math.max(0, ((now || Date.now()) - createdMs) / 60000);
+  return m < 60 ? Math.round(m) + 'm' : m < 2880 ? Math.round(m / 60) + 'h' : m < 525600 ? Math.round(m / 1440) + 'd' : (m / 525600).toFixed(1) + 'y';
+}
+// "age 5h · mcap $597k · 3.2k holders" (alerts)
+function trkTokLine(tok, mcapAt) {
+  if (!tok) return '';
+  const parts = [];
+  const age = trkAge(tok.createdAt); if (age) parts.push('age ' + age);
+  const mc = trkUsd(mcapAt != null ? mcapAt : tok.mcap); if (mc) parts.push('mcap ' + mc);
+  const h = trkCount(tok.holders); if (h) parts.push(h + ' holders');
+  return parts.join(' · ');
+}
+
 function parseTrackWallets(s) {
   return String(s || '').split(/[\n,]+/).map((l) => l.trim()).filter(Boolean).map((l) => {
     const m = l.match(/^([1-9A-HJ-NP-Za-km-z]{32,44})\s*(.*)$/);
@@ -2237,7 +2329,9 @@ async function trackWalletsTick(force) {
       const positions = {};
       for (const p of pools) {
         for (const pa of (p.listPositions || [])) {
+          const tk = trackTokenMint(p);
           positions[pa] = { pool: p.poolAddress, pair: (p.tokenX || '?') + '-' + (p.tokenY || '?'), mint: p.tokenXMint, icon: p.tokenXIcon || null,
+            tokMint: tk ? tk.mint : null, tokSym: tk ? tk.sym : null,
             binStep: p.binStep, poolDepositSol: num(p.totalDepositSol, 0), pnlSolPct: num(p.pnlSolPctChange, null), oor: (p.positionsOutOfRange || []).includes(pa),
             poolPositions: p.openPositionCount };
         }
@@ -2249,7 +2343,7 @@ async function trackWalletsTick(force) {
         const old = prevPos[pa];
         if (old) { Object.assign(info, { side: old.side, range: old.range, bins: old.bins, depositSol: old.depositSol, createdAt: old.createdAt, firstSeen: old.firstSeen });
           if (info.poolDepositSol > (old.poolDepositSol || 0) * 1.1 + 0.01 && !baseline) {
-            const ev = { ts: now, type: 'ADD', wallet: w.address, label: w.label, positionAddress: pa, pool: info.pool, pair: info.pair, mint: info.mint, binStep: info.binStep,
+            const ev = { ts: now, type: 'ADD', wallet: w.address, label: w.label, positionAddress: pa, pool: info.pool, pair: info.pair, mint: info.mint, tokMint: info.tokMint, binStep: info.binStep,
               side: info.side, range: info.range, depositSol: info.poolDepositSol, addedSol: info.poolDepositSol - (old.poolDepositSol || 0), pnlSolPct: info.pnlSolPct };
             feed.push(ev); alerts.push(ev);
           }
@@ -2261,7 +2355,7 @@ async function trackWalletsTick(force) {
           if (pos) Object.assign(info, classifyEntry(pos));
         } catch (e) {}
         const ev = { ts: now, type: baseline ? 'OPEN' : 'ENTER', baseline, wallet: w.address, label: w.label, positionAddress: pa, pool: info.pool, pair: info.pair,
-          mint: info.mint, binStep: info.binStep, side: info.side || null, range: info.range || null, bins: info.bins || null,
+          mint: info.mint, tokMint: info.tokMint, binStep: info.binStep, side: info.side || null, range: info.range || null, bins: info.bins || null,
           depositSol: info.depositSol != null ? info.depositSol : info.poolDepositSol, createdAt: info.createdAt || null, pnlSolPct: info.pnlSolPct };
         feed.push(ev);
         if (!baseline) alerts.push(ev);
@@ -2270,7 +2364,7 @@ async function trackWalletsTick(force) {
       if (!baseline) {
         for (const [pa, old] of Object.entries(prevPos)) {
           if (positions[pa]) continue;
-          const ev = { ts: now, type: 'EXIT', wallet: w.address, label: w.label, positionAddress: pa, pool: old.pool, pair: old.pair, mint: old.mint, binStep: old.binStep,
+          const ev = { ts: now, type: 'EXIT', wallet: w.address, label: w.label, positionAddress: pa, pool: old.pool, pair: old.pair, mint: old.mint, tokMint: trackTokMintOf(old), binStep: old.binStep,
             side: old.side, range: old.range, depositSol: old.depositSol, lastPnlSolPct: old.pnlSolPct,
             heldMin: old.createdAt ? Math.round((now / 1000 - old.createdAt) / 60) : (old.firstSeen ? Math.round((now - old.firstSeen) / 60000) : null) };
           feed.push(ev); alerts.push(ev);
@@ -2279,6 +2373,14 @@ async function trackWalletsTick(force) {
       snap[w.address] = { label: w.label, positions, checkedAt: now, totals: r.json.total || null };
     }
     for (const a of Object.keys(snap)) if (!wallets.some((w) => w.address === a)) delete snap[a];
+    // token info: stamp mcap at the moment of each live move (feed shows at-move -> now)
+    let toks = {};
+    try {
+      const mints = alerts.map(trackTokMintOf);
+      for (const a of Object.keys(snap)) for (const p of Object.values(snap[a].positions || {})) mints.push(p.tokMint);
+      toks = await trackTokenInfo(mints);
+      for (const ev of alerts) { const t = toks[trackTokMintOf(ev)]; if (t) { ev.mcapAt = t.mcap; ev.holdersAt = t.holders; } }
+    } catch (e) {}
     await chrome.storage.local.set({ mqlTrackSnap: snap, mqlTrackFeed: feed.slice(-TRACK_FEED_MAX) });
     if (cfg.trackAlerts) {
       for (const ev of alerts.slice(0, 8)) {
@@ -2287,8 +2389,11 @@ async function trackWalletsTick(force) {
           ? 'exited ' + ev.pair + (ev.lastPnlSolPct != null ? ' · last PnL ' + Math.round(ev.lastPnlSolPct) + '%' : '') + (ev.heldMin != null ? ' · held ' + (ev.heldMin >= 90 ? (ev.heldMin / 60).toFixed(1) + 'h' : ev.heldMin + 'm') : '')
           : (ev.type === 'ADD' ? 'added +' + ev.addedSol.toFixed(2) + ' SOL to ' : 'entered ') + ev.pair + (ev.binStep ? ' (' + ev.binStep + 'bps)' : '')
             + (ev.side ? ' · ' + ev.side : '') + (ev.range ? ' ' + ev.range : '') + (ev.depositSol != null ? ' · ' + Number(ev.depositSol).toFixed(2) + ' SOL' : '');
-        try { chrome.notifications.create('mqltrk-' + ev.ts + '-' + ev.positionAddress.slice(0, 4), { type: 'basic', iconUrl: 'icon128.png', title: '👁 ' + ev.label, message: icon + ' ' + what, priority: 1 }); } catch (e) {}
-        if (cfg.webhookUrl) await postDiscord(cfg.webhookUrl, '**Meteora Lens** · 👁 **' + ev.label + '** ' + icon + ' ' + what + '\nhttps://www.meteora.ag/dlmm/' + ev.pool);
+        const tm = trackTokMintOf(ev);
+        const tokLine = trkTokLine(toks[tm], ev.mcapAt);
+        try { chrome.notifications.create('mqltrk-' + ev.ts + '-' + ev.positionAddress.slice(0, 4), { type: 'basic', iconUrl: 'icon128.png', title: '👁 ' + ev.label, message: icon + ' ' + what + (tokLine ? '\n' + tokLine : ''), priority: 1 }); } catch (e) {}
+        if (cfg.webhookUrl) await postDiscord(cfg.webhookUrl, '**Meteora Lens** · 👁 **' + ev.label + '** ' + icon + ' ' + what + (tokLine ? '\n' + tokLine : '')
+          + '\nhttps://www.meteora.ag/dlmm/' + ev.pool + (tm ? '\nGMGN: <https://gmgn.ai/sol/token/' + tm + '>' : ''));
       }
     }
     return { ok: true, wallets: wallets.length, events: alerts.length };
@@ -2706,7 +2811,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const cfg = await chrome.storage.sync.get({ trackWallets: '' });
         const st = await chrome.storage.local.get({ mqlTrackSnap: {}, mqlTrackFeed: [], mqlTrackSeenTs: 0 });
         const wallets = parseTrackWallets(cfg.trackWallets).map((w) => Object.assign({}, w, st.mqlTrackSnap[w.address] || {}));
-        sendResponse({ ok: true, wallets, feed: (st.mqlTrackFeed || []).slice(-150).reverse(), seenTs: st.mqlTrackSeenTs || 0 });
+        const feed = (st.mqlTrackFeed || []).slice(-150).reverse();
+        // normalize the token mint (older rows only have tokenXMint) and attach token info
+        const mints = [];
+        for (const e of feed) { e.tokMint = trackTokMintOf(e); if (e.tokMint && !e.baseline) mints.push(e.tokMint); }
+        for (const w of wallets) for (const p of Object.values(w.positions || {})) { p.tokMint = trackTokMintOf(p); mints.push(p.tokMint); }
+        let tokens = {};
+        try { tokens = await trackTokenInfo(mints); } catch (e) {}
+        sendResponse({ ok: true, wallets, feed, seenTs: st.mqlTrackSeenTs || 0, tokens });
       } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
     })();
     return true;
